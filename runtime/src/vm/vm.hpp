@@ -79,7 +79,6 @@ public:
     // The class representing java/lang/String (interned at startup).
     ClassDef*    string_class()  { return m_string_class; }
     ClassDef*    object_class()  { return m_object_class; }
-    const std::deque<Frame>& call_stack() const { return m_call_stack; }
 
     // ── Native method registry ────────────────────────────────────────────────
     // Called before run() to register MIDP implementations.

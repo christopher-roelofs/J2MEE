@@ -98,31 +98,6 @@ bool Display::flush() {
                 enqueue_key(ev.key.keysym.sym);
         } else if (ev.type == SDL_KEYUP) {
             enqueue_release(ev.key.keysym.sym);
-        } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
-            float lx = 0, ly = 0;
-            SDL_RenderWindowToLogical(m_renderer, ev.button.x, ev.button.y, &lx, &ly);
-            int ix = (int)lx, iy = (int)ly;
-            if (ix >= 0 && iy >= 0 && ix < m_logical_w && iy < m_logical_h) {
-                m_pointer_down = true;
-                m_pending_pointers.push_back({PointerKind::Pressed, ix, iy});
-            }
-        } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
-            if (m_pointer_down) {
-                float lx = 0, ly = 0;
-                SDL_RenderWindowToLogical(m_renderer, ev.button.x, ev.button.y, &lx, &ly);
-                int ix = (int)lx, iy = (int)ly;
-                if (ix < 0) ix = 0; else if (ix >= m_logical_w) ix = m_logical_w - 1;
-                if (iy < 0) iy = 0; else if (iy >= m_logical_h) iy = m_logical_h - 1;
-                m_pending_pointers.push_back({PointerKind::Released, ix, iy});
-                m_pointer_down = false;
-            }
-        } else if (ev.type == SDL_MOUSEMOTION && m_pointer_down) {
-            float lx = 0, ly = 0;
-            SDL_RenderWindowToLogical(m_renderer, ev.motion.x, ev.motion.y, &lx, &ly);
-            int ix = (int)lx, iy = (int)ly;
-            if (ix < 0) ix = 0; else if (ix >= m_logical_w) ix = m_logical_w - 1;
-            if (iy < 0) iy = 0; else if (iy >= m_logical_h) iy = m_logical_h - 1;
-            m_pending_pointers.push_back({PointerKind::Dragged, ix, iy});
         }
     }
 

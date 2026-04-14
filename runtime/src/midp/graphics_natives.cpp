@@ -972,36 +972,6 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             f.push_ref(gfxRef);
         });
 
-    // Helper: deliver pending pointer events to a Canvas object
-    auto deliver_pointer_events = [](VM& v, ObjRef canvas_ref) {
-        Display& d = Display::instance();
-        auto events = d.take_pointer_events();
-        if (events.empty()) return;
-        HeapObject* canvas_obj = v.heap().deref(canvas_ref);
-        if (!canvas_obj || !canvas_obj->klass) return;
-        MethodDef* pp = canvas_obj->klass->resolve_virtual("pointerPressed",  "(II)V");
-        MethodDef* pr = canvas_obj->klass->resolve_virtual("pointerReleased", "(II)V");
-        MethodDef* pd = canvas_obj->klass->resolve_virtual("pointerDragged",  "(II)V");
-        for (auto& e : events) {
-            MethodDef* m = nullptr;
-            switch (e.kind) {
-                case Display::PointerKind::Pressed:  m = pp; break;
-                case Display::PointerKind::Released: m = pr; break;
-                case Display::PointerKind::Dragged:  m = pd; break;
-            }
-            if (!m) continue;
-            try {
-                v.invoke(m, canvas_obj->klass, {
-                    Slot::from_ref(canvas_ref),
-                    Slot::from_int(e.x),
-                    Slot::from_int(e.y)
-                });
-            } catch (const QuitRequest&) { throw;
-            } catch (...) {}
-        }
-    };
-
-
     // Helper: deliver pending key press/release events to a GameCanvas/Canvas object
     auto deliver_key_events = [](VM& v, ObjRef canvas_ref) {
         Display& d = Display::instance();

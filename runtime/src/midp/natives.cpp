@@ -2136,11 +2136,25 @@ void register_natives(VM& vm, const JarFile& jar) {
             ObjRef player_ref = args[0].as_ref();
             ObjRef listener_ref = args[1].as_ref();
             g_player_listeners[player_ref] = listener_ref;
-            // Do NOT fire "deviceAvailable" here — per JSR-135 this event is
-            // only sent when the device recovers from being taken by another
-            // MIDlet. Firing it at registration causes Age of Empires II to
-            // enter a Chinese "resume game?" pause dialog (b.a/playerUpdate
-            // sets g.ck=true on this event).
+            // Fire "deviceAvailable" immediately — in real J2ME this is a system event
+            if (listener_ref != NULL_REF) {
+                HeapObject* lobj = v.heap().deref(listener_ref);
+                if (lobj && lobj->klass) {
+                    MethodDef* pu = lobj->klass->resolve_virtual(
+                        "playerUpdate",
+                        "(Ljavax/microedition/media/Player;Ljava/lang/String;Ljava/lang/Object;)V");
+                    if (pu) {
+                        try {
+                            v.invoke(pu, lobj->klass, {
+                                Slot::from_ref(listener_ref),
+                                Slot::from_ref(player_ref),
+                                Slot::from_ref(v.new_string("deviceAvailable")),
+                                Slot::from_ref(NULL_REF)
+                            });
+                        } catch (...) {}
+                    }
+                }
+            }
         });
 
     vm.register_native("javax/microedition/media/Player",
@@ -2152,8 +2166,28 @@ void register_natives(VM& vm, const JarFile& jar) {
 
     vm.register_native("javax/microedition/media/Player",
         "realize", "()V",
-        [](VM&, Frame&, std::span<Slot>) {
-            // No-op: deviceAvailable is not part of realize() per JSR-135.
+        [](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef player_ref = args[0].as_ref();
+            // Fire "deviceAvailable" on any registered listener
+            auto lit = g_player_listeners.find(player_ref);
+            if (lit != g_player_listeners.end() && lit->second != NULL_REF) {
+                HeapObject* lobj = v.heap().deref(lit->second);
+                if (lobj && lobj->klass) {
+                    MethodDef* pu = lobj->klass->resolve_virtual(
+                        "playerUpdate",
+                        "(Ljavax/microedition/media/Player;Ljava/lang/String;Ljava/lang/Object;)V");
+                    if (pu) {
+                        try {
+                            v.invoke(pu, lobj->klass, {
+                                Slot::from_ref(lit->second),
+                                Slot::from_ref(player_ref),
+                                Slot::from_ref(v.new_string("deviceAvailable")),
+                                Slot::from_ref(NULL_REF)
+                            });
+                        } catch (...) {}
+                    }
+                }
+            }
         });
 
     vm.register_native("javax/microedition/media/Player",

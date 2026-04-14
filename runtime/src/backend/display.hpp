@@ -40,15 +40,6 @@ public:
         return out;
     }
 
-    // Pointer events (x,y in logical/game coordinates)
-    enum class PointerKind { Pressed, Released, Dragged };
-    struct PointerEvent { PointerKind kind; int x; int y; };
-    std::vector<PointerEvent> take_pointer_events() {
-        std::vector<PointerEvent> out;
-        std::swap(out, m_pending_pointers);
-        return out;
-    }
-
     int width()  const { return m_logical_w; }
     int height() const { return m_logical_h; }
 
@@ -70,8 +61,6 @@ private:
     int m_key_states = 0;
     std::vector<int> m_pending_keys;
     std::vector<int> m_pending_releases;
-    std::vector<PointerEvent> m_pending_pointers;
-    bool m_pointer_down = false;
 
     void update_key_states();
     void enqueue_key(SDL_Keycode sym);
