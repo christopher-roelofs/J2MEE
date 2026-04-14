@@ -28,7 +28,6 @@ void VM::initialize_class(ClassDef* klass) {
 
     MethodDef* clinit = klass->find_method("<clinit>", "()V");
     if (!clinit) return;
-
     invoke(clinit, klass, {});
 }
 
