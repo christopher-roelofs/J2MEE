@@ -34,15 +34,36 @@ void Display::open(int w, int h, const std::string& title) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) < 0)
         throw std::runtime_error(std::string("SDL_Init: ") + SDL_GetError());
 
-    // Scale the window to ~75% of screen height, maintaining aspect ratio
+    // Scale the window to ~75% of screen height, maintaining aspect ratio.
+    // Compositor-scale compensation: on GNOME/KDE Wayland with HiDPI scaling
+    // (including XWayland), the compositor draws the window at
+    // (requested_size × scale) physical pixels, but mouse events arrive in
+    // the un-scaled coordinate space. To keep clicks mapping 1:1 with the
+    // rendering, we divide the target window size by the compositor scale.
+    //
+    // Override: set J2ME_SCALE=<float> to force a specific scale (e.g. 1 to
+    // disable, 2 for 200% HiDPI).
     SDL_DisplayMode dm;
     int win_w = w * 2, win_h = h * 2;  // default 2x
     if (SDL_GetCurrentDisplayMode(0, &dm) == 0) {
+        double compositor_scale = 1.0;
+        if (const char* env = std::getenv("J2ME_SCALE")) {
+            double v = std::atof(env);
+            if (v > 0.1) compositor_scale = v;
+        } else {
+            // Heuristic: Wayland compositors with fractional scaling typically
+            // set WAYLAND_DISPLAY even for XWayland clients. Assume 2× when
+            // we're under Wayland (works for 200% scale, the most common
+            // HiDPI setup on GNOME).
+            if (std::getenv("WAYLAND_DISPLAY")) compositor_scale = 2.0;
+        }
         int max_h = (dm.h * 3) / 4;  // target 75% of screen height
         int max_w = dm.w - 80;
         double scale_h = (double)max_h / h;
         double scale_w = (double)max_w / w;
         double scale = std::min(scale_h, scale_w);
+        if (scale < 1.0) scale = 1.0;
+        scale /= compositor_scale;
         if (scale < 1.0) scale = 1.0;
         win_w = (int)(w * scale);
         win_h = (int)(h * scale);
@@ -98,6 +119,31 @@ bool Display::flush() {
                 enqueue_key(ev.key.keysym.sym);
         } else if (ev.type == SDL_KEYUP) {
             enqueue_release(ev.key.keysym.sym);
+        } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
+            float lx = 0, ly = 0;
+            SDL_RenderWindowToLogical(m_renderer, ev.button.x, ev.button.y, &lx, &ly);
+            int ix = (int)lx, iy = (int)ly;
+            if (ix >= 0 && iy >= 0 && ix < m_logical_w && iy < m_logical_h) {
+                m_pointer_down = true;
+                m_pending_pointers.push_back({PointerKind::Pressed, ix, iy});
+            }
+        } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
+            if (m_pointer_down) {
+                float lx = 0, ly = 0;
+                SDL_RenderWindowToLogical(m_renderer, ev.button.x, ev.button.y, &lx, &ly);
+                int ix = (int)lx, iy = (int)ly;
+                if (ix < 0) ix = 0; else if (ix >= m_logical_w) ix = m_logical_w - 1;
+                if (iy < 0) iy = 0; else if (iy >= m_logical_h) iy = m_logical_h - 1;
+                m_pending_pointers.push_back({PointerKind::Released, ix, iy});
+                m_pointer_down = false;
+            }
+        } else if (ev.type == SDL_MOUSEMOTION && m_pointer_down) {
+            float lx = 0, ly = 0;
+            SDL_RenderWindowToLogical(m_renderer, ev.motion.x, ev.motion.y, &lx, &ly);
+            int ix = (int)lx, iy = (int)ly;
+            if (ix < 0) ix = 0; else if (ix >= m_logical_w) ix = m_logical_w - 1;
+            if (iy < 0) iy = 0; else if (iy >= m_logical_h) iy = m_logical_h - 1;
+            m_pending_pointers.push_back({PointerKind::Dragged, ix, iy});
         }
     }
 
