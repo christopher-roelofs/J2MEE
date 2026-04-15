@@ -20,6 +20,11 @@ enum Opcode : uint8_t {
     ICONST_5        = 0x08,
     LCONST_0        = 0x09,
     LCONST_1        = 0x0a,
+    FCONST_0        = 0x0b,
+    FCONST_1        = 0x0c,
+    FCONST_2        = 0x0d,
+    DCONST_0        = 0x0e,
+    DCONST_1        = 0x0f,
     BIPUSH          = 0x10,
     SIPUSH          = 0x11,
     LDC             = 0x12,
@@ -27,6 +32,8 @@ enum Opcode : uint8_t {
     LDC2_W          = 0x14,
     ILOAD           = 0x15,
     LLOAD           = 0x16,
+    FLOAD           = 0x17,
+    DLOAD           = 0x18,
     ALOAD           = 0x19,
     ILOAD_0         = 0x1a,
     ILOAD_1         = 0x1b,
@@ -36,6 +43,14 @@ enum Opcode : uint8_t {
     LLOAD_1         = 0x1f,
     LLOAD_2         = 0x20,
     LLOAD_3         = 0x21,
+    FLOAD_0         = 0x22,
+    FLOAD_1         = 0x23,
+    FLOAD_2         = 0x24,
+    FLOAD_3         = 0x25,
+    DLOAD_0         = 0x26,
+    DLOAD_1         = 0x27,
+    DLOAD_2         = 0x28,
+    DLOAD_3         = 0x29,
     ALOAD_0         = 0x2a,
     ALOAD_1         = 0x2b,
     ALOAD_2         = 0x2c,
@@ -49,6 +64,8 @@ enum Opcode : uint8_t {
     SALOAD          = 0x35,
     ISTORE          = 0x36,
     LSTORE          = 0x37,
+    FSTORE          = 0x38,
+    DSTORE          = 0x39,
     ASTORE          = 0x3a,
     ISTORE_0        = 0x3b,
     ISTORE_1        = 0x3c,
@@ -58,6 +75,14 @@ enum Opcode : uint8_t {
     LSTORE_1        = 0x40,
     LSTORE_2        = 0x41,
     LSTORE_3        = 0x42,
+    FSTORE_0        = 0x43,
+    FSTORE_1        = 0x44,
+    FSTORE_2        = 0x45,
+    FSTORE_3        = 0x46,
+    DSTORE_0        = 0x47,
+    DSTORE_1        = 0x48,
+    DSTORE_2        = 0x49,
+    DSTORE_3        = 0x4a,
     ASTORE_0        = 0x4b,
     ASTORE_1        = 0x4c,
     ASTORE_2        = 0x4d,
@@ -274,6 +299,11 @@ dispatch_loop:
         case ICONST_5:     f.push_int(5);  break;
         case LCONST_0:     f.push_long(0); break;
         case LCONST_1:     f.push_long(1); break;
+        case FCONST_0:     f.push_float(0.0f); break;
+        case FCONST_1:     f.push_float(1.0f); break;
+        case FCONST_2:     f.push_float(2.0f); break;
+        case DCONST_0:     f.push_double(0.0); break;
+        case DCONST_1:     f.push_double(1.0); break;
 
         case BIPUSH:  f.push_int(bc_s1(code, f.pc)); f.pc += 1; break;
         case SIPUSH:  f.push_int(bc_s2(code, f.pc)); f.pc += 2; break;
@@ -287,22 +317,22 @@ dispatch_loop:
             f.pc += 2; break;
 
         // ── Loads ─────────────────────────────────────────────────────────────
-        case ILOAD: f.push(f.locals[bc_u1(code,f.pc)]); f.pc+=1; break;
-        case LLOAD: {
+        case ILOAD: case FLOAD: f.push(f.locals[bc_u1(code,f.pc)]); f.pc+=1; break;
+        case LLOAD: case DLOAD: {
             uint8_t idx = bc_u1(code,f.pc); f.pc+=1;
             f.push_long(f.get_long(idx)); break;
         }
         case ALOAD: f.push(f.locals[bc_u1(code,f.pc)]); f.pc+=1; break;
 
-        case ILOAD_0: f.push(f.locals[0]); break;
-        case ILOAD_1: f.push(f.locals[1]); break;
-        case ILOAD_2: f.push(f.locals[2]); break;
-        case ILOAD_3: f.push(f.locals[3]); break;
+        case ILOAD_0: case FLOAD_0: f.push(f.locals[0]); break;
+        case ILOAD_1: case FLOAD_1: f.push(f.locals[1]); break;
+        case ILOAD_2: case FLOAD_2: f.push(f.locals[2]); break;
+        case ILOAD_3: case FLOAD_3: f.push(f.locals[3]); break;
 
-        case LLOAD_0: f.push_long(f.get_long(0)); break;
-        case LLOAD_1: f.push_long(f.get_long(1)); break;
-        case LLOAD_2: f.push_long(f.get_long(2)); break;
-        case LLOAD_3: f.push_long(f.get_long(3)); break;
+        case LLOAD_0: case DLOAD_0: f.push_long(f.get_long(0)); break;
+        case LLOAD_1: case DLOAD_1: f.push_long(f.get_long(1)); break;
+        case LLOAD_2: case DLOAD_2: f.push_long(f.get_long(2)); break;
+        case LLOAD_3: case DLOAD_3: f.push_long(f.get_long(3)); break;
 
         case ALOAD_0: f.push(f.locals[0]); break;
         case ALOAD_1: f.push(f.locals[1]); break;
@@ -360,22 +390,22 @@ dispatch_loop:
         }
 
         // ── Stores ────────────────────────────────────────────────────────────
-        case ISTORE: f.locals[bc_u1(code,f.pc)] = f.pop(); f.pc+=1; break;
-        case LSTORE: {
+        case ISTORE: case FSTORE: f.locals[bc_u1(code,f.pc)] = f.pop(); f.pc+=1; break;
+        case LSTORE: case DSTORE: {
             uint8_t idx = bc_u1(code,f.pc); f.pc+=1;
             f.set_long(idx, f.pop_long()); break;
         }
         case ASTORE: f.locals[bc_u1(code,f.pc)] = f.pop(); f.pc+=1; break;
 
-        case ISTORE_0: f.locals[0] = f.pop(); break;
-        case ISTORE_1: f.locals[1] = f.pop(); break;
-        case ISTORE_2: f.locals[2] = f.pop(); break;
-        case ISTORE_3: f.locals[3] = f.pop(); break;
+        case ISTORE_0: case FSTORE_0: f.locals[0] = f.pop(); break;
+        case ISTORE_1: case FSTORE_1: f.locals[1] = f.pop(); break;
+        case ISTORE_2: case FSTORE_2: f.locals[2] = f.pop(); break;
+        case ISTORE_3: case FSTORE_3: f.locals[3] = f.pop(); break;
 
-        case LSTORE_0: f.set_long(0, f.pop_long()); break;
-        case LSTORE_1: f.set_long(1, f.pop_long()); break;
-        case LSTORE_2: f.set_long(2, f.pop_long()); break;
-        case LSTORE_3: f.set_long(3, f.pop_long()); break;
+        case LSTORE_0: case DSTORE_0: f.set_long(0, f.pop_long()); break;
+        case LSTORE_1: case DSTORE_1: f.set_long(1, f.pop_long()); break;
+        case LSTORE_2: case DSTORE_2: f.set_long(2, f.pop_long()); break;
+        case LSTORE_3: case DSTORE_3: f.set_long(3, f.pop_long()); break;
 
         case ASTORE_0: f.locals[0] = f.pop(); break;
         case ASTORE_1: f.locals[1] = f.pop(); break;

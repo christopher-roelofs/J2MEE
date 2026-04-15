@@ -873,6 +873,21 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         return ref;
     };
 
+    // Image.createImage(InputStream) — read remaining bytes then decode as PNG
+    vm.register_native("javax/microedition/lcdui/Image",
+        "createImage", "(Ljava/io/InputStream;)Ljavax/microedition/lcdui/Image;",
+        [make_image_ref](VM& v, Frame& f, std::span<Slot> args) {
+            extern StreamEntry* find_stream(ObjRef ref);
+            StreamEntry* s = find_stream(args[0].as_ref());
+            if (!s || s->pos >= (int32_t)s->data.size()) { f.push_ref(NULL_REF); return; }
+            const uint8_t* bytes = s->data.data() + s->pos;
+            size_t len = s->data.size() - s->pos;
+            SDL_Surface* surf = load_png_from_bytes(bytes, (int)len);
+            s->pos = (int32_t)s->data.size();
+            if (!surf) { f.push_ref(NULL_REF); return; }
+            f.push_ref(make_image_ref(v, surf));
+        });
+
     // Image.createImage(byte[], int, int)
     vm.register_native("javax/microedition/lcdui/Image",
         "createImage", "([BII)Ljavax/microedition/lcdui/Image;",

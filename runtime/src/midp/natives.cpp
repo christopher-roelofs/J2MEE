@@ -90,6 +90,10 @@ static std::string utf8_substring(const std::string& s, int32_t from, int32_t to
 // keyed by ObjRef.
 
 static std::unordered_map<ObjRef, StreamEntry>   g_streams;
+StreamEntry* find_stream(ObjRef ref) {
+    auto it = g_streams.find(ref);
+    return it == g_streams.end() ? nullptr : &it->second;
+}
 static std::unordered_map<ObjRef, std::string>   g_string_buffers;
 static std::unordered_map<ObjRef, int32_t>       g_integers;
 // Hashtable: key ObjRef -> (map of key_hash -> pair<ObjRef,ObjRef>)
