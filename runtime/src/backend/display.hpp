@@ -67,11 +67,14 @@ private:
 
     int m_logical_w = 240;
     int m_logical_h = 320;
+    int m_mouse_range_w = 0;
+    int m_mouse_range_h = 0;
     int m_key_states = 0;
     std::vector<int> m_pending_keys;
     std::vector<int> m_pending_releases;
     std::vector<PointerEvent> m_pending_pointers;
     bool m_pointer_down = false;
+    double m_mouse_scale = 1.0;  // multiply SDL mouse coords by this before window-to-logical mapping
 
     void update_key_states();
     void enqueue_key(SDL_Keycode sym);
