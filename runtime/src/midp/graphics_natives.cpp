@@ -73,11 +73,21 @@ static bool has_cjk(const std::string& utf8) {
     return false;
 }
 
+extern int g_screen_w, g_screen_h;
 static int midp_size_to_px(int midp_size) {
+    // Pick font pixel sizes based on minimum screen dimension, matching
+    // freej2me-plus's PlatformFont.fontSizes table. Bucket is the smaller of
+    // width and height to match their "minimum px dimension" logic.
+    int min_dim = std::min(g_screen_w, g_screen_h);
+    int small, medium, large;
+    if (min_dim < 128)      { small = 8;  medium = 10; large = 12; }
+    else if (min_dim < 176) { small = 11; medium = 13; large = 14; }
+    else if (min_dim < 220) { small = 12; medium = 13; large = 15; }
+    else                    { small = 13; medium = 15; large = 17; }
     switch (midp_size) {
-        case 8:  return 9;   // SIZE_SMALL
-        case 16: return 14;  // SIZE_LARGE
-        default: return 11;  // SIZE_MEDIUM (0)
+        case 8:  return small;   // SIZE_SMALL
+        case 16: return large;   // SIZE_LARGE
+        default: return medium;  // SIZE_MEDIUM (0)
     }
 }
 
