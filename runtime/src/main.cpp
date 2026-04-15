@@ -49,6 +49,12 @@ int main(int argc, char* argv[]) {
                 "(Ljavax/microedition/midlet/MIDlet;Ljava/util/Hashtable;)V",
                 [](VM& v2, Frame&, std::span<Slot> args) {
                     ObjRef midlet = args[1].as_ref();
+                    // Only bypass the FIRST VServ instance (initial game
+                    // launch). Mid-game ads re-create VservManager — those
+                    // become no-ops (constructor doesn't reinitialize).
+                    static bool bypassed_once = false;
+                    if (bypassed_once) return;
+                    bypassed_once = true;
                     v2.set_static("VservManager", "startMainApp", "Z",
                                   Slot::from_int(1));
                     HeapObject* mobj = v2.heap().deref(midlet);
