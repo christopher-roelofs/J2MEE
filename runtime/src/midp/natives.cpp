@@ -1319,28 +1319,91 @@ void register_natives(VM& vm, const JarFile& jar) {
         [](VM&, Frame&, std::span<Slot>) {});
 
     // ── javax.microedition.io.Connector ─────────────────────────────────────────
-    // Network not implemented — throw IOException immediately so games fail fast
+    // No real network. Return a fake HttpConnection that responds with HTTP 200
+    // and "vserv:" headers — matches freej2me-plus's approach. Games using the
+    // VServ ad SDK then think the ad fetch succeeded with no ad and proceed.
+    auto make_fake_http = [](VM& v, std::span<Slot> args) {
+        std::string url = v.string_value(args[0].as_ref());
+        fprintf(stderr, "[net] Connector.open(%s) → fake HTTP 200\n", url.c_str());
+        ClassDef* httpKlass = v.loader().find_or_stub(
+            "javax/microedition/io/HttpConnection");
+        ObjRef ref = v.heap().alloc_object(httpKlass, 0);
+        return ref;
+    };
     vm.register_native("javax/microedition/io/Connector", "open",
         "(Ljava/lang/String;)Ljavax/microedition/io/Connection;",
-        [](VM& v, Frame&, std::span<Slot> args) {
-            std::string url = v.string_value(args[0].as_ref());
-            fprintf(stderr, "[net] Connector.open(%s) → IOException\n", url.c_str());
-            throw JvmException{NULL_REF, "IOException"};
+        [make_fake_http](VM& v, Frame& f, std::span<Slot> args) {
+            f.push_ref(make_fake_http(v, args));
         });
     vm.register_native("javax/microedition/io/Connector", "open",
         "(Ljava/lang/String;I)Ljavax/microedition/io/Connection;",
-        [](VM& v, Frame&, std::span<Slot> args) {
-            std::string url = v.string_value(args[0].as_ref());
-            fprintf(stderr, "[net] Connector.open(%s) → IOException\n", url.c_str());
-            throw JvmException{NULL_REF, "IOException"};
+        [make_fake_http](VM& v, Frame& f, std::span<Slot> args) {
+            f.push_ref(make_fake_http(v, args));
         });
     vm.register_native("javax/microedition/io/Connector", "open",
         "(Ljava/lang/String;IZ)Ljavax/microedition/io/Connection;",
-        [](VM& v, Frame&, std::span<Slot> args) {
-            std::string url = v.string_value(args[0].as_ref());
-            fprintf(stderr, "[net] Connector.open(%s) → IOException\n", url.c_str());
-            throw JvmException{NULL_REF, "IOException"};
+        [make_fake_http](VM& v, Frame& f, std::span<Slot> args) {
+            f.push_ref(make_fake_http(v, args));
         });
+
+    // Fake HttpConnection methods.
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "setRequestMethod", "(Ljava/lang/String;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getResponseCode", "()I",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(200); });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getResponseMessage", "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) { f.push_ref(v.new_string("OK")); });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getHeaderField", "(Ljava/lang/String;)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            std::string name = v.string_value(args[1].as_ref());
+            // Match freej2me-plus's vserv-bypass values.
+            if (name == "location" || name == "Location")
+                f.push_ref(v.new_string("vserv:"));
+            else if (name == "X-VSERV-CONTEXT")
+                f.push_ref(v.new_string("asd"));
+            else
+                f.push_ref(NULL_REF);
+        });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getLength", "()J",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_long(0); });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "openInputStream", "()Ljava/io/InputStream;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            // Return an empty InputStream
+            ClassDef* isKlass = v.loader().find_or_stub("java/io/InputStream");
+            ObjRef ref = v.heap().alloc_object(isKlass, 0);
+            // Note: g_streams entry not added → reads return -1 (EOF)
+            f.push_ref(ref);
+        });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "openOutputStream", "()Ljava/io/OutputStream;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* osKlass = v.loader().find_or_stub("java/io/OutputStream");
+            f.push_ref(v.heap().alloc_object(osKlass, 0));
+        });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "close", "()V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("java/io/OutputStream",
+        "write", "([B)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("java/io/OutputStream",
+        "write", "([BII)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("java/io/OutputStream",
+        "flush", "()V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("java/io/OutputStream",
+        "close", "()V",
+        [](VM&, Frame&, std::span<Slot>) {});
 
     // ── String.toString() ──────────────────────────────────────────────────────
     vm.register_native("java/lang/String", "toString", "()Ljava/lang/String;",

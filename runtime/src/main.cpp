@@ -40,25 +40,36 @@ int main(int argc, char* argv[]) {
         // which spins up an ad-fetch thread that hangs (no network, slow
         // timeouts). With startMainApp=true, the MIDlet skips ad fetch and
         // goes directly into the game.
+        // VServ ad-SDK bypass: override the constructor so that creating a
+        // VservManager just sets startMainApp=true and immediately calls
+        // MIDlet.startMainApp() / startApp() to launch the game. Without this
+        // the VServ thread tries to fetch ad data from the network and hangs.
         if (jar.has("VservManager.class")) {
-            // Override VServ entry points so any ad-fetch is a no-op:
-            // <clinit> sets startMainApp=true (so the MIDlet skips the ad
-            // path on its first startApp), and the constructor + showAtStart
-            // / showAtEnd become no-ops in case the game instantiates the
-            // ad manager directly (e.g. between levels).
-            auto vserv_skip = [](VM&, Frame&, std::span<Slot>) {};
-            vm.register_native("VservManager", "<clinit>", "()V",
-                [](VM& v2, Frame&, std::span<Slot>) {
-                    v2.set_static("VservManager", "startMainApp", "Z",
-                                  Slot::from_int(1));
-                });
             vm.register_native("VservManager", "<init>",
                 "(Ljavax/microedition/midlet/MIDlet;Ljava/util/Hashtable;)V",
-                vserv_skip);
-            vm.register_native("VservManager", "showAtStart", "()V", vserv_skip);
-            vm.register_native("VservManager", "showAtEnd", "()V", vserv_skip);
-            std::cerr << "[vserv] override VservManager.<clinit> "
-                         "to set startMainApp=true\n";
+                [](VM& v2, Frame&, std::span<Slot> args) {
+                    ObjRef midlet = args[1].as_ref();
+                    v2.set_static("VservManager", "startMainApp", "Z",
+                                  Slot::from_int(1));
+                    HeapObject* mobj = v2.heap().deref(midlet);
+                    if (!mobj || !mobj->klass) return;
+                    // Run the BoxAL game's main-app constructor first (creates
+                    // game canvas and other state), then call startMainApp.
+                    auto invoke_if = [&](const char* name) {
+                        MethodDef* m = mobj->klass->resolve_virtual(name, "()V");
+                        if (!m) return;
+                        try {
+                            v2.invoke(m, mobj->klass, {Slot::from_ref(midlet)});
+                        } catch (const QuitRequest&) { throw; }
+                        catch (...) {}
+                    };
+                    invoke_if("constructorMainApp");
+                    invoke_if("startMainApp");
+                });
+            vm.register_native("VservManager", "showAtStart", "()V",
+                [](VM&, Frame&, std::span<Slot>) {});
+            vm.register_native("VservManager", "showAtEnd", "()V",
+                [](VM&, Frame&, std::span<Slot>) {});
         }
 
         std::cout << "Starting MIDlet: " << argv[2] << "\n";
