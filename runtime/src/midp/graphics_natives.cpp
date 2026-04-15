@@ -28,6 +28,7 @@ static std::unordered_map<ObjRef, SDL_Point>    g_translate; // Graphics ref →
 static std::unordered_map<ObjRef, ObjRef>       g_thread_runnable; // Thread ref → Runnable ref
 static std::unordered_map<ObjRef, int>          g_font_size;  // Font ref → MIDP size constant
 static std::unordered_map<ObjRef, int>          g_font_style; // Font ref → MIDP style constant
+static std::unordered_map<ObjRef, int>          g_font_face;  // Font ref → MIDP face constant
 static std::unordered_map<ObjRef, ObjRef>       g_gfx_font;   // Graphics ref → current Font ref
 
 // ─── Font backend ────────────────────────────────────────────────────────────
@@ -40,8 +41,10 @@ static bool g_ttf_inited = false;
 static std::unordered_map<int, TTF_Font*> g_ttf_cache;
 static std::unordered_map<int, TTF_Font*> g_ttf_bold_cache;
 
-static constexpr const char* FONT_PATH      = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-static constexpr const char* FONT_BOLD_PATH  = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+static constexpr const char* FONT_PATH       = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+static constexpr const char* FONT_BOLD_PATH   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+static constexpr const char* FONT_MONO_PATH   = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
+static constexpr const char* FONT_MONO_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf";
 static constexpr const char* FONT_CJK_PATH   = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
 
 // CJK font cache (uses TCC index 0 for JP which covers most common CJK)
@@ -78,15 +81,19 @@ static int midp_size_to_px(int midp_size) {
     }
 }
 
-TTF_Font* get_ttf_font(int px_size, bool bold) {
+TTF_Font* get_ttf_font(int px_size, bool bold, bool mono) {
     if (!g_ttf_inited) { TTF_Init(); g_ttf_inited = true; }
-    auto& cache = bold ? g_ttf_bold_cache : g_ttf_cache;
-    auto it = cache.find(px_size);
+    // Cache key: px_size with a bit for bold + mono combination
+    int key = px_size * 4 + (bold ? 1 : 0) + (mono ? 2 : 0);
+    auto& cache = g_ttf_cache;  // unified cache using combined key
+    auto it = cache.find(key);
     if (it != cache.end()) return it->second;
-    const char* path = bold ? FONT_BOLD_PATH : FONT_PATH;
+    const char* path;
+    if (mono) path = bold ? FONT_MONO_BOLD_PATH : FONT_MONO_PATH;
+    else      path = bold ? FONT_BOLD_PATH      : FONT_PATH;
     TTF_Font* f = TTF_OpenFont(path, px_size);
     if (!f) f = TTF_OpenFont(FONT_PATH, px_size);  // fallback
-    cache[px_size] = f;
+    cache[key] = f;
     return f;
 }
 
@@ -102,17 +109,21 @@ static TTF_Font* get_cjk_font(int px_size) {
 static TTF_Font* font_for_obj(ObjRef font_ref) {
     int midp_size = 0;  // SIZE_MEDIUM
     int midp_style = 0; // STYLE_PLAIN
+    int midp_face = 0;  // FACE_SYSTEM
     auto si = g_font_size.find(font_ref);
     if (si != g_font_size.end()) midp_size = si->second;
     auto st = g_font_style.find(font_ref);
     if (st != g_font_style.end()) midp_style = st->second;
-    return get_ttf_font(midp_size_to_px(midp_size), (midp_style & 1) != 0);
+    auto fc = g_font_face.find(font_ref);
+    if (fc != g_font_face.end()) midp_face = fc->second;
+    bool mono = (midp_face == 32);  // FACE_MONOSPACE
+    return get_ttf_font(midp_size_to_px(midp_size), (midp_style & 1) != 0, mono);
 }
 
 static TTF_Font* font_for_gfx(ObjRef gfx_ref) {
     auto it = g_gfx_font.find(gfx_ref);
     if (it != g_gfx_font.end()) return font_for_obj(it->second);
-    return get_ttf_font(midp_size_to_px(0), false); // default medium plain
+    return get_ttf_font(midp_size_to_px(0), false, false); // default medium plain
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -700,10 +711,10 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             int face  = args[0].as_int();  // FACE_SYSTEM=0, FACE_MONOSPACE=32, FACE_PROPORTIONAL=64
             int style = args[1].as_int();  // STYLE_PLAIN=0, BOLD=1, ITALIC=2
             int size  = args[2].as_int();  // SIZE_SMALL=8, SIZE_MEDIUM=0, SIZE_LARGE=16
-            (void)face;
             ObjRef ref = v.new_object(v.loader().find_or_stub("javax/microedition/lcdui/Font"));
             g_font_size[ref]  = size;
             g_font_style[ref] = style;
+            g_font_face[ref]  = face;
             f.push_ref(ref);
         });
 
@@ -729,6 +740,56 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             } else {
                 f.push_int(0);
             }
+        });
+
+    vm.register_native("javax/microedition/lcdui/Font",
+        "substringWidth", "(Ljava/lang/String;II)I",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            std::string full = v.string_value(args[1].as_ref());
+            int offset = args[2].as_int();
+            int len    = args[3].as_int();
+            TTF_Font* ttf = font_for_obj(self);
+            if (!ttf || len <= 0) { f.push_int(0); return; }
+            if (offset < 0) offset = 0;
+            if (offset >= (int)full.size()) { f.push_int(0); return; }
+            if (offset + len > (int)full.size()) len = (int)full.size() - offset;
+            std::string sub = full.substr(offset, len);
+            int w = 0;
+            TTF_SizeUTF8(ttf, sub.c_str(), &w, nullptr);
+            f.push_int(w);
+        });
+
+    vm.register_native("javax/microedition/lcdui/Font",
+        "charsWidth", "([CII)I",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            ObjRef arr_ref = args[1].as_ref();
+            int offset = args[2].as_int();
+            int len    = args[3].as_int();
+            TTF_Font* ttf = font_for_obj(self);
+            HeapObject* arr = v.heap().deref(arr_ref);
+            if (!ttf || !arr || len <= 0) { f.push_int(0); return; }
+            int alen = arr->array_length();
+            if (offset < 0) offset = 0;
+            if (offset + len > alen) len = alen - offset;
+            std::string s;
+            s.reserve(len);
+            for (int i = 0; i < len; ++i) {
+                int c = arr->array_shorts()[offset + i] & 0xFFFF;
+                if (c < 0x80) s.push_back((char)c);
+                else if (c < 0x800) {
+                    s.push_back((char)(0xC0 | (c >> 6)));
+                    s.push_back((char)(0x80 | (c & 0x3F)));
+                } else {
+                    s.push_back((char)(0xE0 | (c >> 12)));
+                    s.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
+                    s.push_back((char)(0x80 | (c & 0x3F)));
+                }
+            }
+            int w = 0;
+            TTF_SizeUTF8(ttf, s.c_str(), &w, nullptr);
+            f.push_int(w);
         });
 
     vm.register_native("javax/microedition/lcdui/Font",

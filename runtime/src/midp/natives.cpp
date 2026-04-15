@@ -20,7 +20,7 @@ namespace fs = std::filesystem;
 
 // Defined in graphics_natives.cpp
 extern int g_screen_w, g_screen_h;
-TTF_Font* get_ttf_font(int px_size, bool bold);  // defined in graphics_natives.cpp
+TTF_Font* get_ttf_font(int px_size, bool bold, bool mono = false);  // defined in graphics_natives.cpp
 
 // ─── UTF-8 ↔ character-index helpers ─────────────────────────────────────────
 // Java strings are UTF-16 character-indexed.  We store UTF-8 internally, so we
