@@ -119,6 +119,124 @@ non-scaled X11).
   a specific pixel-width bitmap font (AoE tutorial scroll, 365 Puzzle Club
   selection bar) render with minor edge bleed since we use a TTF fallback.
 
+## Performance notes & possible enhancements
+
+Current performance is comfortable on a modern machine — these CLDC games
+are tiny by today's standards. If a future game needs more headroom, here's
+the rough order of work, cheapest first.
+
+### Render-side wins (likely biggest ROI)
+
+The hot path on a modern CPU isn't bytecode dispatch, it's our SDL2 work
+and TTF text rendering. Free wins:
+
+- **Glyph cache**: `TTF_RenderUTF8_Blended` is allocated/freed every
+  `drawString` call. Cache rendered glyph surfaces by `(font_size, char,
+  color)` and blit per-glyph instead of per-string.
+- **Image surface cache**: convert PNGs to display format once at load and
+  hold them; avoid re-decoding `Image` instances.
+- **SDL_Texture instead of SDL_Surface**: keep the framebuffer on the GPU
+  and present via `SDL_RenderCopy`, skip the per-frame `SDL_UpdateTexture`.
+
+These probably give a 2–3× speedup on text-heavy or sprite-heavy frames
+with very little code.
+
+### Interpreter wins (~2–3× over current `switch`)
+
+- **Direct-threaded dispatch**: replace the giant `switch (op)` with a
+  computed-goto table (GCC `&&label` extension). Each opcode handler
+  ends with `goto *dispatch_table[*pc++]` instead of falling out to the
+  switch jump. Removes the dispatch indirection — usually 1.3–2× on
+  bytecode interpreters.
+- **Pre-decoded bytecode**: walk a method's `code` array once and emit a
+  flat array of `{handler_addr, operand}` pairs. The dispatch loop
+  becomes `goto *cur->h;` with no per-instruction operand parsing.
+- **Hoist `pc`/`sp`/`code` into register locals**: encourage the compiler
+  to keep them in CPU registers across opcodes instead of reloading
+  through the `Frame` struct on every step.
+- **Inline-cache for `invokevirtual`**: most call sites resolve to the
+  same `(klass, method)` every call. A single-entry cache per call site
+  skips `resolve_virtual` after the first hit.
+- **Fast-path frequent natives**: inline `String.length`,
+  `Math.min/max/abs`, `Integer.parseInt`, `System.currentTimeMillis`,
+  `Object.<init>` directly in the dispatcher instead of going through
+  the `std::function` lookup.
+- **Smaller `Slot`**: if the tagged-union `Slot` can become a plain
+  `int32_t`, push/pop/copy gets cheaper. Floats and refs already fit.
+- **Heap fast-path**: bump alloc is cheap; the per-deref handle table
+  lookup is the lingering cost. A non-handle heap (raw pointers + write
+  barrier for GC) removes one indirection per `getfield`/`getstatic`.
+
+### JIT / AOT (5–10× over current interpreter)
+
+If interpreter tweaks aren't enough:
+
+- **Template JIT**: emit a fixed sequence of x86_64 instructions per
+  opcode into a code buffer at method-compile time. No optimization, but
+  zero dispatch overhead. ~3–5× over a switch interpreter; this is what
+  early HotSpot and the original Sun KVM did. Maybe 2–3k LOC.
+- **Tracing JIT (LuaJIT-style)**: profile hot loops, record one trace
+  through, compile straight-line specialized native code. CLDC games are
+  dominated by tight per-frame paint loops which trace beautifully.
+  Highest perf-per-effort if you only care about hot paths.
+- **AOT to C**: walk every loaded class once, emit a `<game>.c` with one
+  C function per Java method, compile with `gcc -O2`, link against the
+  existing native runtime library. Build time per game is slower (30s–2
+  min); runtime should be near-native. Closed-world assumption holds for
+  these games (no reflection / dynamic class loading), and our existing
+  C++ heap + natives are directly callable from generated C.
+
+#### AOT-to-C feasibility for *this* codebase
+
+Tractable. The translator would walk our existing parsed `ClassFile`s
+and emit straight-line C using the same operations the interpreter
+already implements. Rough sketch:
+
+```c
+// ICONST_3; ISTORE_1
+locals[1] = 3;
+
+// GETSTATIC f.b; IFNE L60
+if (Cf_b != 0) goto L60;
+
+// INVOKEVIRTUAL j.f()V (resolves to k.f at this site)
+vt_k[K_F_IDX](this);
+```
+
+Stack slots become numbered C locals (`s0`, `s1`, …) sized from the
+method's `max_stack` so the C compiler keeps them in registers. Object
+refs stay as `int32_t` heap handles. Native bindings become direct C
+function calls into the existing runtime.
+
+The thorny parts:
+
+- **Exceptions**: `athrow` + per-method exception tables. Either map
+  to C++ `try`/`catch` or `setjmp`/`longjmp`. Need to preserve a
+  notion of "current PC" so the exception table can find the right
+  handler.
+- **Virtual dispatch**: precompute vtables per class at translation
+  time; `invokevirtual` becomes `vt[idx](args)`.
+- **GC roots**: C locals aren't introspectable. Either restrict GC to
+  safepoints (method entry / loop back-edge), or skip GC entirely for
+  short-running games (J2ME workloads are tiny).
+- **`<clinit>` ordering**: keep the lazy first-touch check at every
+  static field access, or hoist init eagerly at jar load.
+
+Estimated effort: 1500–2500 LOC of translator, 1–2 weeks of focused
+work for a working prototype. Probably overkill for these games on
+modern hardware — the render-side wins alone should be enough.
+
+### Recommended order
+
+1. Glyph + image cache, SDL_Texture framebuffer (a few hundred LOC,
+   ~2–3× total).
+2. Direct-threaded dispatch + invokevirtual inline cache (~1 day,
+   ~2× more on top of #1).
+3. Profile. If still not enough, template JIT or AOT-to-C.
+
+For the games we care about you'd hit "renders faster than a real
+phone" well before getting to step 3.
+
 ## Layout
 
 ```
