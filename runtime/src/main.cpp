@@ -34,6 +34,23 @@ int main(int argc, char* argv[]) {
         register_natives(vm, jar);
         register_graphics_natives(vm, jar);
 
+        // Workaround for VServ ad SDK: if the JAR ships VservManager (used by
+        // 365 Puzzle Club, 3D Bomberman, etc.), override its <clinit> to set
+        // startMainApp=true. Without this, the MIDlet creates a VservManager,
+        // which spins up an ad-fetch thread that hangs (no network, slow
+        // timeouts). With startMainApp=true, the MIDlet skips ad fetch and
+        // goes directly into the game.
+        if (jar.has("VservManager.class")) {
+            vm.register_native("VservManager", "<clinit>", "()V",
+                [](VM& v2, Frame&, std::span<Slot>) {
+                    v2.set_static("VservManager", "startMainApp", "Z",
+                                  Slot::from_int(1));
+                    fprintf(stderr, "[vserv] clinit fired, startMainApp=true\n");
+                });
+            std::cerr << "[vserv] override VservManager.<clinit> "
+                         "to set startMainApp=true\n";
+        }
+
         std::cout << "Starting MIDlet: " << argv[2] << "\n";
         vm.run(argv[2]);
         std::cout << "MIDlet exited cleanly.\n";

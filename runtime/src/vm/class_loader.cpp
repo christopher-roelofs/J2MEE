@@ -161,8 +161,11 @@ void ClassLoader::register_native(const std::string& class_name,
     ClassDef* klass = find_or_stub(class_name);
 
     // If the method already exists (from a loaded class file), bind to it
+    // and force the NATIVE flag so the interpreter dispatches to native_impl
+    // instead of the original bytecode.
     if (auto* md = klass->find_method(method_name, descriptor)) {
-        md->native_impl = std::move(fn);
+        md->native_impl   = std::move(fn);
+        md->access_flags  = md->access_flags | AccessFlags::NATIVE;
         return;
     }
 
