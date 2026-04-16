@@ -353,12 +353,14 @@ void VM::exec_frame(Frame& f) {
 dispatch_loop:
     try {
     while (true) {
+#ifdef J2ME_TRACE
         if (__builtin_expect(g_trace, 0)) {
             fprintf(stderr, "  [%-30s %-20s] pc=%4u sp=%2u op=0x%02x\n",
                 f.klass  ? f.klass->name.c_str()  : "?",
                 f.method ? f.method->name.c_str() : "?",
                 f.pc, f.sp, code[f.pc]);
         }
+#endif
         op = code[f.pc++];
 
         switch (op) {
@@ -826,11 +828,13 @@ dispatch_loop:
                 throw JvmException{NULL_REF, "NullPointerException"};
             auto* obj = m_heap.deref(this_ref);
             ClassDef* actual = obj ? obj->klass : klass;
-            // Inline cache disabled temporarily — was dispatching wrong method
-            // in some path. Re-enable after narrowing down.
-            (void)call_site_pc;
-            MethodDef* vmd = actual ? actual->resolve_virtual(md->name, md->descriptor) : md;
-            if (!vmd) vmd = md;
+            // XOR the PC (rotated) with the method pointer so every call
+            // site gets a unique key. A left shift would discard the low
+            // bits of the pointer, which collide across MethodDefs in the
+            // same std::vector.
+            uint64_t ic_key = reinterpret_cast<uintptr_t>(f.method) ^
+                              (static_cast<uint64_t>(call_site_pc) * 0x9E3779B97F4A7C15ULL);
+            MethodDef* vmd = vi_lookup(ic_key, actual, md);
             do_invoke(*this, f, vmd, actual ? actual : klass, nslots);
             break;
         }
