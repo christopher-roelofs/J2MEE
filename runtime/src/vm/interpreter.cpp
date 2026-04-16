@@ -2,6 +2,7 @@
 #include "frame.hpp"
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <stdexcept>
 #include <iostream>
 
@@ -242,9 +243,82 @@ static void exec_ldc(VM& vm, Frame& f, const ClassFile& cf, uint16_t cp_idx) {
 // Pop (arg_count) slots from f.stack into a vector, then call vm.invoke().
 // Returns the optional return slot which the caller pushes.
 
+// Fast-path for hot natives: avoids std::function dispatch + Frame construction
+// + args vector allocation. Returns true if handled in-place on f's stack.
+// The stack already has args pushed; we read them directly and replace with
+// return value (if any).
+static inline bool fast_path_native(VM& vm, Frame& f,
+                                    MethodDef* method, ClassDef* klass,
+                                    uint32_t total_slots) {
+    if (!method->is_native()) return false;
+    const std::string& cn = klass->name;
+    const std::string& mn = method->name;
+    const std::string& d  = method->descriptor;
+
+    // java/lang/Object.<init>()V — most common: just pop `this`, nothing else.
+    if (total_slots == 1 && mn == "<init>" && d == "()V" &&
+        (cn == "java/lang/Object")) {
+        f.sp -= 1;
+        return true;
+    }
+
+    // java/lang/System.currentTimeMillis()J — no-arg, called every frame
+    if (total_slots == 0 && cn == "java/lang/System" &&
+        mn == "currentTimeMillis" && d == "()J") {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        f.push_long((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+        return true;
+    }
+
+    // java/lang/Math.min/max/abs (II)I and (JJ)J and (I)I and (J)J
+    if (cn == "java/lang/Math") {
+        if (mn == "min" && d == "(II)I") {
+            int32_t b = f.pop_int(), a = f.pop_int();
+            f.push_int(a < b ? a : b);
+            return true;
+        }
+        if (mn == "max" && d == "(II)I") {
+            int32_t b = f.pop_int(), a = f.pop_int();
+            f.push_int(a > b ? a : b);
+            return true;
+        }
+        if (mn == "abs" && d == "(I)I") {
+            int32_t a = f.pop_int();
+            f.push_int(a < 0 ? -a : a);
+            return true;
+        }
+        if (mn == "abs" && d == "(J)J") {
+            int64_t a = f.pop_long();
+            f.push_long(a < 0 ? -a : a);
+            return true;
+        }
+        if (mn == "min" && d == "(JJ)J") {
+            int64_t b = f.pop_long(), a = f.pop_long();
+            f.push_long(a < b ? a : b);
+            return true;
+        }
+        if (mn == "max" && d == "(JJ)J") {
+            int64_t b = f.pop_long(), a = f.pop_long();
+            f.push_long(a > b ? a : b);
+            return true;
+        }
+    }
+
+    // NOTE: String.length() / String.charAt() fast-paths disabled — they
+    // broke Bejeweled because our String layout has field(1) mismatched
+    // with the UTF-8-byte length stored in the char array for non-ASCII text.
+    // The slow path uses utf8_char_count which is semantically correct.
+
+    return false;
+}
+
 static void do_invoke(VM& vm, Frame& f,
                       MethodDef* method, ClassDef* klass,
                       uint32_t total_slots) {
+    if (fast_path_native(vm, f, method, klass, total_slots))
+        return;
+
     // Collect args from operand stack (they were pushed left→right, so
     // the last arg is on top; we pop in reverse then flip).
     std::vector<Slot> args(total_slots);

@@ -136,6 +136,118 @@ static TTF_Font* font_for_gfx(ObjRef gfx_ref) {
     return get_ttf_font(midp_size_to_px(0), false, false); // default medium plain
 }
 
+// ─── Glyph cache ─────────────────────────────────────────────────────────────
+// TTF_RenderUTF8_Blended allocates+frees a surface per drawString — hot path on
+// sprite/text heavy frames (Bejeweled score updates, AoE text etc). Cache per-
+// glyph surfaces keyed by (font*, codepoint, color); rebuild the full string
+// render as a sequence of cached glyph blits.
+
+struct GlyphKey {
+    TTF_Font* font;
+    uint32_t  cp;
+    uint32_t  argb;
+    bool operator==(const GlyphKey& o) const noexcept {
+        return font == o.font && cp == o.cp && argb == o.argb;
+    }
+};
+struct GlyphKeyHash {
+    size_t operator()(const GlyphKey& k) const noexcept {
+        size_t h = reinterpret_cast<uintptr_t>(k.font);
+        h ^= (size_t)k.cp   * 0x9E3779B97F4A7C15ULL;
+        h ^= (size_t)k.argb * 0xC2B2AE3D27D4EB4FULL;
+        return h;
+    }
+};
+
+struct CachedGlyph {
+    SDL_Surface* surf;   // nullable (e.g. missing glyph)
+    int          w;
+    int          h;
+    int          advance;
+};
+
+static std::unordered_map<GlyphKey, CachedGlyph, GlyphKeyHash> g_glyph_cache;
+
+static CachedGlyph* get_glyph(TTF_Font* font, uint32_t cp, uint32_t argb,
+                              SDL_Color color) {
+    GlyphKey key{font, cp, argb};
+    auto it = g_glyph_cache.find(key);
+    if (it != g_glyph_cache.end()) return &it->second;
+
+    CachedGlyph g{nullptr, 0, 0, 0};
+    if (font) {
+        int adv = 0;
+        TTF_GlyphMetrics(font, (uint16_t)cp, nullptr, nullptr, nullptr, nullptr, &adv);
+        g.advance = adv;
+        SDL_Surface* s = TTF_RenderGlyph_Blended(font, (uint16_t)cp, color);
+        if (s) {
+            // Convert to display format once, owned by cache.
+            SDL_Surface* opt = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+            SDL_FreeSurface(s);
+            if (opt) {
+                SDL_SetSurfaceBlendMode(opt, SDL_BLENDMODE_BLEND);
+                g.surf = opt;
+                g.w = opt->w;
+                g.h = opt->h;
+            }
+        }
+    }
+    auto [ins, _] = g_glyph_cache.emplace(key, g);
+    return &ins->second;
+}
+
+// Draw `text` at (x, y) using `font` and color `argb`, honouring MIDP anchor bits.
+// Returns the total x-advance drawn (not including descent).
+static void draw_text_cached(SDL_Surface* target, TTF_Font* font,
+                             const std::string& text,
+                             int x, int y, int anchor,
+                             uint32_t argb, SDL_Rect* clip, SDL_Point tx) {
+    if (!target || !font || text.empty()) return;
+    SDL_Color color{
+        (uint8_t)((argb >> 16) & 0xFF),
+        (uint8_t)((argb >> 8)  & 0xFF),
+        (uint8_t)( argb        & 0xFF),
+        255
+    };
+
+    // First pass: compute total width and max height for anchor correction.
+    int total_w = 0, total_h = TTF_FontHeight(font);
+    std::vector<CachedGlyph*> glyphs;
+    glyphs.reserve(text.size());
+    for (size_t off = 0; off < text.size(); ) {
+        uint16_t cp;
+        uint8_t c = (uint8_t)text[off];
+        if (c < 0x80)          { cp = c;                                                    off += 1; }
+        else if (c < 0xE0)     { cp = ((c & 0x1F) << 6) | (text[off+1] & 0x3F);             off += 2; }
+        else if (c < 0xF0)     { cp = ((c & 0x0F) << 12) | ((text[off+1] & 0x3F) << 6) |
+                                      (text[off+2] & 0x3F);                                 off += 3; }
+        else                   { cp = 0xFFFD;                                               off += 4; }
+
+        CachedGlyph* g = get_glyph(font, cp, argb, color);
+        glyphs.push_back(g);
+        total_w += g->advance;
+    }
+
+    // Apply anchor bits (HCENTER=1, RIGHT=8, BOTTOM=32, BASELINE=64)
+    int draw_x = x, draw_y = y;
+    if (anchor & 1)       draw_x -= total_w / 2;
+    else if (anchor & 8)  draw_x -= total_w;
+    if (anchor & 32)      draw_y -= total_h;
+    else if (anchor & 64) draw_y -= TTF_FontAscent(font);
+
+    draw_x += tx.x;
+    draw_y += tx.y;
+
+    for (CachedGlyph* g : glyphs) {
+        if (g->surf) {
+            SDL_Rect dst{draw_x, draw_y, g->w, g->h};
+            SDL_BlitSurface(g->surf, nullptr, target, &dst);
+        }
+        draw_x += g->advance;
+    }
+    (void)clip;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 static uint32_t j2me_color(int rgb) {
@@ -457,7 +569,6 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             if (!target) return;
             TTF_Font* font = font_for_gfx(self);
             if (!font) return;
-            // Use CJK fallback font if text contains CJK chars
             if (has_cjk(text)) {
                 int px = TTF_FontHeight(font) - 2;
                 if (px < 9) px = 9;
@@ -468,25 +579,9 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             uint32_t argb = 0xFF000000u;
             auto cit = g_colors.find(self);
             if (cit != g_colors.end()) argb = cit->second;
-            SDL_Color color = {
-                (uint8_t)((argb >> 16) & 0xFF),
-                (uint8_t)((argb >> 8)  & 0xFF),
-                (uint8_t)( argb        & 0xFF),
-                255
-            };
 
-            SDL_Surface* rendered = TTF_RenderUTF8_Blended(font, text.c_str(), color);
-            if (!rendered) return;
-
-            if (anchor & 1)       x -= rendered->w / 2;
-            else if (anchor & 8)  x -= rendered->w;
-            if (anchor & 32)      y -= rendered->h;
-            else if (anchor & 64) y -= TTF_FontAscent(font);
-
-            auto t = gfx_tx(self);
-            SDL_Rect dst = {x + t.x, y + t.y, rendered->w, rendered->h};
-            SDL_BlitSurface(rendered, nullptr, target, &dst);
-            SDL_FreeSurface(rendered);
+            draw_text_cached(target, font, text, x, y, anchor, argb,
+                             nullptr, gfx_tx(self));
         });
 
     vm.register_native("javax/microedition/lcdui/Graphics",
@@ -509,29 +604,19 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             if (!target) return;
             TTF_Font* font = font_for_gfx(self);
             if (!font) return;
+            if (has_cjk(text)) {
+                int px = TTF_FontHeight(font) - 2;
+                if (px < 9) px = 9;
+                TTF_Font* cjk = get_cjk_font(px);
+                if (cjk) font = cjk;
+            }
 
             uint32_t argb = 0xFF000000u;
             auto cit = g_colors.find(self);
             if (cit != g_colors.end()) argb = cit->second;
-            SDL_Color color = {
-                (uint8_t)((argb >> 16) & 0xFF),
-                (uint8_t)((argb >> 8)  & 0xFF),
-                (uint8_t)( argb        & 0xFF),
-                255
-            };
 
-            SDL_Surface* rendered = TTF_RenderUTF8_Blended(font, text.c_str(), color);
-            if (!rendered) return;
-
-            if (anchor & 1)       x -= rendered->w / 2;
-            else if (anchor & 8)  x -= rendered->w;
-            if (anchor & 32)      y -= rendered->h;
-            else if (anchor & 64) y -= TTF_FontAscent(font);
-
-            auto t = gfx_tx(self);
-            SDL_Rect dst = {x + t.x, y + t.y, rendered->w, rendered->h};
-            SDL_BlitSurface(rendered, nullptr, target, &dst);
-            SDL_FreeSurface(rendered);
+            draw_text_cached(target, font, text, x, y, anchor, argb,
+                             nullptr, gfx_tx(self));
         });
 
     vm.register_native("javax/microedition/lcdui/Graphics",

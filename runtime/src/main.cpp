@@ -85,7 +85,9 @@ int main(int argc, char* argv[]) {
     } catch (const QuitRequest&) {
         std::cout << "User closed the window.\n";
     } catch (const JvmException& e) {
-        std::cerr << "JVM exception: " << e.message << "\n";
+        std::cerr << "JVM exception: " << e.message;
+        if (!e.location.empty()) std::cerr << " at " << e.location;
+        std::cerr << "\n";
         return 1;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

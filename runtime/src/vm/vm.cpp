@@ -1,4 +1,5 @@
 #include "vm.hpp"
+#include <algorithm>
 #include <stdexcept>
 #include <variant>
 
@@ -11,6 +12,8 @@ VM::VM(const std::string& jar_path)
 {
     m_object_class = m_loader.find_or_stub("java/lang/Object");
     m_string_class = m_loader.find_or_stub("java/lang/String");
+    if (m_string_class->instance_slot_count < 2)
+        m_string_class->instance_slot_count = 2;
 }
 
 // ─── Class initialization ─────────────────────────────────────────────────────
@@ -259,7 +262,9 @@ void VM::set_static(const std::string& class_name, const std::string& field_name
 // ─── run ─────────────────────────────────────────────────────────────────────
 
 void VM::run(const std::string& midlet_class) {
-    ClassDef* klass = m_loader.find(midlet_class);
+    std::string class_name = midlet_class;
+    std::replace(class_name.begin(), class_name.end(), '.', '/');
+    ClassDef* klass = m_loader.find(class_name);
     if (!klass) throw std::runtime_error("MIDlet class not found: " + midlet_class);
 
     initialize_class(klass);

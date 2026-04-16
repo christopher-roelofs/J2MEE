@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(j2me_runtime CXX)
+project(j2me_runtime CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Vendored Sonivox EAS synthesizer (Apache-2.0). Defines sonivox_eas target.
+add_subdirectory(third_party/sonivox)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
@@ -24,6 +27,7 @@ set(SOURCES
     src/util/jar.cpp
     src/midp/natives.cpp
     src/midp/graphics_natives.cpp
+    src/midp/audio_eas.cpp
     src/backend/display.cpp
 )
 
@@ -74,3 +78,5 @@ else()
     target_include_directories(j2me PRIVATE ${SDL2_MIXER_INCLUDE_DIRS})
     target_link_libraries(j2me PRIVATE ${SDL2_MIXER_LIBRARIES})
 endif()
+
+target_link_libraries(j2me PRIVATE sonivox_eas)

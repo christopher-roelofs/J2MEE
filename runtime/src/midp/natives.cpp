@@ -242,6 +242,14 @@ void register_natives(VM& vm, const JarFile& jar) {
     vm.register_native("java/lang/Throwable", "printStackTrace", "()V",                    [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/lang/Throwable", "getMessage",      "()Ljava/lang/String;",
         [](VM& v, Frame& f, std::span<Slot>) { f.push_ref(v.new_string("")); });
+    vm.register_native("java/lang/Throwable", "toString",        "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            ClassDef* k = v.heap().deref(args[0].as_ref()) ?
+                          v.heap().deref(args[0].as_ref())->klass : nullptr;
+            std::string name = k ? k->name : "java/lang/Throwable";
+            std::replace(name.begin(), name.end(), '/', '.');
+            f.push_ref(v.new_string(name));
+        });
     vm.register_native("java/lang/Exception", "<init>",          "()V",                    [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/lang/Exception", "<init>",          "(Ljava/lang/String;)V",  [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/lang/Exception", "printStackTrace", "()V",                    [](VM&, Frame&, std::span<Slot>) {});
@@ -295,12 +303,34 @@ void register_natives(VM& vm, const JarFile& jar) {
             f.push_ref(v.new_string(name));
         });
 
+    vm.register_native("java/lang/Class", "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            std::string name = v.string_value(args[0].as_ref());
+            std::replace(name.begin(), name.end(), '.', '/');
+            ClassDef* klass = v.loader().find(name);
+            if (!klass || klass->source == nullptr) {
+                ClassDef* exk = v.loader().find_or_stub("java/lang/ClassNotFoundException");
+                ObjRef ex = v.heap().alloc_object(exk, 0);
+                throw JvmException{ex, "ClassNotFoundException: " + name, {}};
+            }
+            f.push_ref(get_class_object(v, klass));
+        });
+
     vm.register_native("java/lang/Class", "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         [&jar](VM& v, Frame& f, std::span<Slot> args) {
             std::string path = v.string_value(args[1].as_ref());
             if (!path.empty() && path[0] == '/') path = path.substr(1);
 
+            if (!jar.has(path)) {
+                // Strip locale prefix fallback: "en/foo.str" -> "foo.str"
+                auto slash = path.find('/');
+                if (slash != std::string::npos) {
+                    std::string stripped = path.substr(slash + 1);
+                    if (jar.has(stripped)) path = stripped;
+                }
+            }
             if (!jar.has(path)) {
                 fprintf(stderr, "[native] getResourceAsStream: not found: %s\n",
                         path.c_str());
@@ -597,6 +627,44 @@ void register_natives(VM& vm, const JarFile& jar) {
             }
         });
 
+    // String from char array: chars[off..off+count)
+    auto string_init_chars = [](VM& v, Frame&, std::span<Slot> args,
+                                int32_t off, int32_t count) {
+        ObjRef self = args[0].as_ref();
+        ObjRef src_arr = args[1].as_ref();
+        HeapObject* dobj = v.heap().deref(self);
+        if (!dobj || dobj->data_words < 2) return;
+        if (src_arr == NULL_REF || count < 0) {
+            dobj->field(0) = Slot::from_ref(NULL_REF);
+            dobj->field(1) = Slot::from_int(0);
+            return;
+        }
+        HeapObject* src = v.heap().deref(src_arr);
+        int32_t src_len = src ? src->array_length() : 0;
+        if (off < 0 || off > src_len || off + count > src_len) {
+            off = 0;
+            if (count > src_len) count = src_len;
+        }
+        ObjRef new_arr = v.heap().alloc_prim_array(
+            ArrayType::Char, count, v.loader().find_or_stub("[C"));
+        HeapObject* narr = v.heap().deref(new_arr);
+        uint16_t* dst = narr->array_shorts();
+        uint16_t* ss  = src->array_shorts();
+        for (int32_t i = 0; i < count; ++i) dst[i] = ss[off + i];
+        dobj->field(0) = Slot::from_ref(new_arr);
+        dobj->field(1) = Slot::from_int(count);
+    };
+    vm.register_native("java/lang/String", "<init>", "([C)V",
+        [string_init_chars](VM& v, Frame& f, std::span<Slot> args) {
+            HeapObject* src = v.heap().deref(args[1].as_ref());
+            int32_t len = src ? src->array_length() : 0;
+            string_init_chars(v, f, args, 0, len);
+        });
+    vm.register_native("java/lang/String", "<init>", "([CII)V",
+        [string_init_chars](VM& v, Frame& f, std::span<Slot> args) {
+            string_init_chars(v, f, args, args[2].as_int(), args[3].as_int());
+        });
+
     vm.register_native("java/lang/String", "length", "()I",
         [](VM& v, Frame& f, std::span<Slot> args) {
             f.push_int(utf8_char_count(v.string_value(args[0].as_ref())));
@@ -626,6 +694,50 @@ void register_natives(VM& vm, const JarFile& jar) {
         "(Ljava/lang/Object;)Ljava/lang/String;",
         [](VM& v, Frame& f, std::span<Slot> args) {
             f.push_ref(v.new_string(v.string_value(args[0].as_ref())));
+        });
+
+    vm.register_native("java/lang/String", "valueOf", "(C)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            std::string s;
+            s += static_cast<char>(args[0].as_int() & 0xFF);
+            f.push_ref(v.new_string(s));
+        });
+    vm.register_native("java/lang/String", "valueOf", "(Z)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            f.push_ref(v.new_string(args[0].as_int() ? "true" : "false"));
+        });
+    vm.register_native("java/lang/String", "valueOf", "(J)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            int64_t lo = (uint32_t)args[0].as_int();
+            int64_t hi = args[1].as_int();
+            f.push_ref(v.new_string(std::to_string((hi << 32) | lo)));
+        });
+vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            HeapObject* arr = v.heap().deref(args[0].as_ref());
+            std::string s;
+            if (arr) {
+                int32_t len = arr->array_length();
+                uint16_t* chars = arr->array_shorts();
+                for (int32_t i = 0; i < len; ++i)
+                    s += static_cast<char>(chars[i] & 0xFF);
+            }
+            f.push_ref(v.new_string(s));
+        });
+    vm.register_native("java/lang/String", "valueOf", "([CII)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            HeapObject* arr = v.heap().deref(args[0].as_ref());
+            int32_t off = args[1].as_int(), count = args[2].as_int();
+            std::string s;
+            if (arr) {
+                int32_t len = arr->array_length();
+                if (off < 0) off = 0;
+                if (off + count > len) count = len - off;
+                uint16_t* chars = arr->array_shorts();
+                for (int32_t i = 0; i < count; ++i)
+                    s += static_cast<char>(chars[off + i] & 0xFF);
+            }
+            f.push_ref(v.new_string(s));
         });
 
     vm.register_native("java/lang/String", "indexOf", "(I)I",
@@ -935,6 +1047,16 @@ void register_natives(VM& vm, const JarFile& jar) {
             f.push_ref(self);
         });
 
+    vm.register_native("java/lang/StringBuffer", "setLength", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            int32_t len = args[1].as_int();
+            if (len < 0) len = 0;
+            auto& s = g_string_buffers[self];
+            if ((int32_t)s.size() > len) s.resize(len);
+            else while ((int32_t)s.size() < len) s += '\0';
+        });
+
     vm.register_native("java/lang/StringBuffer", "setCharAt", "(IC)V",
         [](VM&, Frame&, std::span<Slot> args) {
             auto it = g_string_buffers.find(args[0].as_ref());
@@ -1200,6 +1322,32 @@ void register_natives(VM& vm, const JarFile& jar) {
             f.push_ref(vec.empty() ? NULL_REF : vec.front());
         });
 
+    vm.register_native("java/util/Vector", "ensureCapacity", "(I)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("java/util/Vector", "capacity", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto& vec = g_vectors[args[0].as_ref()];
+            f.push_int(static_cast<int32_t>(vec.capacity()));
+        });
+    vm.register_native("java/util/Vector", "setSize", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto& vec = g_vectors[args[0].as_ref()];
+            int32_t sz = args[1].as_int();
+            if (sz < 0) sz = 0;
+            vec.resize(sz, NULL_REF);
+        });
+    vm.register_native("java/util/Vector", "copyInto",
+        "([Ljava/lang/Object;)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            auto& vec = g_vectors[args[0].as_ref()];
+            ObjRef arr_ref = args[1].as_ref();
+            HeapObject* arr = v.heap().deref(arr_ref);
+            if (!arr) return;
+            int32_t len = arr->array_length();
+            Slot* slots = arr->array_slots();
+            for (int32_t i = 0; i < std::min((int32_t)vec.size(), len); ++i)
+                slots[i] = Slot::from_ref(vec[i]);
+        });
     vm.register_native("java/util/Vector", "setElementAt",
         "(Ljava/lang/Object;I)V",
         [](VM&, Frame&, std::span<Slot> args) {
@@ -1528,6 +1676,12 @@ void register_natives(VM& vm, const JarFile& jar) {
         "isColor", "()Z",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(1); });
     vm.register_native("javax/microedition/lcdui/Display",
+        "vibrate", "(I)Z",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+    vm.register_native("javax/microedition/lcdui/Display",
+        "flashBacklight", "(I)Z",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+    vm.register_native("javax/microedition/lcdui/Display",
         "numColors", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(65536); });
 
@@ -1827,6 +1981,36 @@ void register_natives(VM& vm, const JarFile& jar) {
     vm.register_native("javax/microedition/lcdui/Canvas",
         "setFullScreenMode", "(Z)V",
         [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Canvas",
+        "showNotify", "()V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Canvas",
+        "hideNotify", "()V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Canvas",
+        "sizeChanged", "(II)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // Alert — stub dialogs as no-ops (games use these for info/error popups)
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "<init>", "(Ljava/lang/String;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "setType", "(Ljavax/microedition/lcdui/AlertType;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "setTimeout", "(I)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "setString", "(Ljava/lang/String;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "getDefaultTimeout", "()I",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(2000); });
     vm.register_native("javax/microedition/lcdui/Canvas",
         "getWidth", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(240); });
