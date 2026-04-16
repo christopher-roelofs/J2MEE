@@ -31,7 +31,7 @@ void VM::initialize_class(ClassDef* klass) {
 
     MethodDef* clinit = klass->find_method("<clinit>", "()V");
     if (!clinit) return;
-    invoke(clinit, klass, {});
+    invoke(clinit, klass, std::span<const Slot>{});
 }
 
 // ─── Object creation ──────────────────────────────────────────────────────────
@@ -100,14 +100,28 @@ std::string VM::string_value(ObjRef ref) {
 
 // ─── Constant pool resolution ─────────────────────────────────────────────────
 
+static inline uint64_t cp_cache_key(const ClassFile& cf, uint16_t idx) {
+    return (reinterpret_cast<uintptr_t>(&cf) << 16) | idx;
+}
+
 ClassDef* VM::resolve_class(const ClassFile& cf, uint16_t idx) {
+    uint64_t k = cp_cache_key(cf, idx);
+    auto it = m_class_cache.find(k);
+    if (it != m_class_cache.end()) return it->second;
+
     const auto& entry = cf.constant_pool.at(idx);
     const auto* cls   = std::get_if<CpClass>(&entry);
     if (!cls) throw std::runtime_error("Expected CpClass at cp[" + std::to_string(idx) + "]");
-    return m_loader.find_or_stub(cf.utf8(cls->name_index));
+    ClassDef* result = m_loader.find_or_stub(cf.utf8(cls->name_index));
+    m_class_cache[k] = result;
+    return result;
 }
 
 VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
+    uint64_t k = cp_cache_key(cf, idx);
+    auto it = m_field_cache.find(k);
+    if (it != m_field_cache.end()) return it->second;
+
     const auto& entry = cf.constant_pool.at(idx);
 
     uint16_t class_idx, nat_idx;
@@ -120,14 +134,17 @@ VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
 
     ClassDef* klass = resolve_class(cf, class_idx);
     const auto& nat = cf.cp<CpNameAndType>(nat_idx);
-    std::string name = cf.utf8(nat.name_index);
-    std::string desc = cf.utf8(nat.descriptor_index);
+    const std::string& name = cf.utf8(nat.name_index);
+    const std::string& desc = cf.utf8(nat.descriptor_index);
 
     // Walk the class hierarchy to find the field (it may be in a super).
     ClassDef* cur = klass;
     while (cur) {
-        if (auto* fd = cur->find_field(name, desc))
-            return {cur, fd};
+        if (auto* fd = cur->find_field(name, desc)) {
+            FieldRef r{cur, fd};
+            m_field_cache[k] = r;
+            return r;
+        }
         cur = cur->super;
     }
 
@@ -139,10 +156,16 @@ VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
     stub.slot_index   = static_cast<uint32_t>(klass->static_fields.size());
     klass->static_fields.push_back(stub);
     klass->static_values.push_back(Slot{});
-    return {klass, &klass->static_fields.back()};
+    FieldRef r{klass, &klass->static_fields.back()};
+    m_field_cache[k] = r;
+    return r;
 }
 
 VM::MethodRef VM::resolve_method(const ClassFile& cf, uint16_t idx) {
+    uint64_t k = cp_cache_key(cf, idx);
+    auto it = m_method_cache.find(k);
+    if (it != m_method_cache.end()) return it->second;
+
     const auto& entry = cf.constant_pool.at(idx);
 
     uint16_t class_idx, nat_idx;
@@ -158,11 +181,14 @@ VM::MethodRef VM::resolve_method(const ClassFile& cf, uint16_t idx) {
 
     ClassDef* klass = resolve_class(cf, class_idx);
     const auto& nat = cf.cp<CpNameAndType>(nat_idx);
-    std::string name = cf.utf8(nat.name_index);
-    std::string desc = cf.utf8(nat.descriptor_index);
+    const std::string& name = cf.utf8(nat.name_index);
+    const std::string& desc = cf.utf8(nat.descriptor_index);
 
-    if (auto* md = klass->resolve_virtual(name, desc))
-        return {klass, md};
+    if (auto* md = klass->resolve_virtual(name, desc)) {
+        MethodRef r{klass, md};
+        m_method_cache[k] = r;
+        return r;
+    }
 
     // Stub: add a native method that returns a zero/null value of the right
     // type so the caller's stack stays consistent even before we implement it.
@@ -179,7 +205,9 @@ VM::MethodRef VM::resolve_method(const ClassFile& cf, uint16_t idx) {
                 default: break;  // Void, Double
             }
         });
-    return {klass, klass->find_method(name, desc)};
+    MethodRef r{klass, klass->find_method(name, desc)};
+    m_method_cache[k] = r;
+    return r;
 }
 
 // ─── Invocation ───────────────────────────────────────────────────────────────
@@ -213,12 +241,20 @@ static std::vector<Slot> slots_from_frame(Frame& fr, MethodDef* method) {
 
 std::vector<Slot> VM::invoke(MethodDef* method, ClassDef* klass,
                              std::vector<Slot> args) {
+    return invoke(method, klass, std::span<const Slot>(args));
+}
+
+std::vector<Slot> VM::invoke(MethodDef* method, ClassDef* klass,
+                             std::span<const Slot> args) {
     if (method->is_native()) {
         if (!method->native_impl)
             throw std::runtime_error("Unimplemented native: " +
                                      klass->name + "." + method->name + method->descriptor);
         Frame tmp(method, klass);
-        method->native_impl(*this, tmp, std::span<Slot>(args));
+        // native_impl takes span<Slot>; cast away const — natives may reuse
+        // the buffer but our interpreter owns the backing memory.
+        method->native_impl(*this, tmp,
+                            std::span<Slot>(const_cast<Slot*>(args.data()), args.size()));
         return slots_from_frame(tmp, method);
     }
 

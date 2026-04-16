@@ -7,6 +7,7 @@
 
 #include <deque>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,6 +42,10 @@ public:
     // virtual). Returns 0, 1, or 2 slots (2 for long/double).
     std::vector<Slot> invoke(MethodDef* method, ClassDef* klass,
                              std::vector<Slot> args);
+    // Hot-path overload: args already contiguous in memory (typically the
+    // caller's operand stack). Avoids per-call std::vector allocation.
+    std::vector<Slot> invoke(MethodDef* method, ClassDef* klass,
+                             std::span<const Slot> args);
 
     // ── Class lifecycle ───────────────────────────────────────────────────────
 
@@ -104,6 +109,33 @@ private:
 
     // Classes whose <clinit> has been started (to prevent re-entry)
     std::unordered_set<ClassDef*> m_clinit_started;
+
+    // Resolution caches — hot path, avoid per-invoke CP walks + utf8 lookups.
+    // Keyed by (ClassFile*, cp_idx) packed into 64 bits.
+    std::unordered_map<uint64_t, MethodRef> m_method_cache;
+    std::unordered_map<uint64_t, FieldRef>  m_field_cache;
+    std::unordered_map<uint64_t, ClassDef*> m_class_cache;
+
+    // Monomorphic inline cache for invokevirtual. Key = (cf_ptr, cp_idx).
+    // Value = (last_seen_this_klass, resolved_method). On hit, we skip the
+    // linear resolve_virtual walk.
+    struct VICacheEntry { ClassDef* klass; MethodDef* method; };
+    std::unordered_map<uint64_t, VICacheEntry> m_vi_cache;
+
+public:
+    // Accessor for the inline cache (used by interpreter hot path).
+    MethodDef* vi_lookup(uint64_t key, ClassDef* actual, MethodDef* fallback) {
+        auto it = m_vi_cache.find(key);
+        if (it != m_vi_cache.end() && it->second.klass == actual)
+            return it->second.method;
+        MethodDef* resolved = actual ? actual->resolve_virtual(
+                                         fallback->name, fallback->descriptor)
+                                     : fallback;
+        if (!resolved) resolved = fallback;
+        m_vi_cache[key] = {actual, resolved};
+        return resolved;
+    }
+private:
 
     // Active call stack (frames).
     // std::deque: push_back never invalidates references to existing elements,

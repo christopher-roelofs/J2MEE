@@ -319,13 +319,15 @@ static void do_invoke(VM& vm, Frame& f,
     if (fast_path_native(vm, f, method, klass, total_slots))
         return;
 
-    // Collect args from operand stack (they were pushed left→right, so
-    // the last arg is on top; we pop in reverse then flip).
-    std::vector<Slot> args(total_slots);
-    for (int32_t i = static_cast<int32_t>(total_slots) - 1; i >= 0; --i)
-        args[i] = f.pop();
-    // Returns 0, 1, or 2 slots (2 for long/double return types).
-    auto result = vm.invoke(method, klass, std::move(args));
+    // Args are already contiguous on the operand stack at positions
+    // [sp - total_slots .. sp). Pass as a span, skip the std::vector alloc.
+    Slot* args_ptr = &f.stack[f.sp - total_slots];
+    // vm.invoke may re-enter the interpreter and push new frames, but our
+    // caller's frame won't be relocated (m_call_stack uses std::deque which
+    // keeps pointers stable across push_back/pop_back).
+    auto result = vm.invoke(method, klass,
+                            std::span<const Slot>(args_ptr, total_slots));
+    f.sp -= total_slots;
     for (auto& s : result) f.push(s);
 }
 
@@ -351,7 +353,7 @@ void VM::exec_frame(Frame& f) {
 dispatch_loop:
     try {
     while (true) {
-        if (g_trace) {
+        if (__builtin_expect(g_trace, 0)) {
             fprintf(stderr, "  [%-30s %-20s] pc=%4u sp=%2u op=0x%02x\n",
                 f.klass  ? f.klass->name.c_str()  : "?",
                 f.method ? f.method->name.c_str() : "?",
@@ -804,7 +806,9 @@ dispatch_loop:
         }
         case INVOKEVIRTUAL:
         case INVOKEINTERFACE: {
-            auto [klass, md] = resolve_method(*cf_ptr, bc_u2(code, f.pc));
+            uint16_t cp_idx = bc_u2(code, f.pc);
+            auto [klass, md] = resolve_method(*cf_ptr, cp_idx);
+            uint32_t call_site_pc = f.pc - 1;  // pc was already past the opcode
             f.pc += 2;
             if (op == INVOKEINTERFACE) f.pc += 2;  // count + 0 bytes
             // +1 for 'this'
@@ -822,9 +826,11 @@ dispatch_loop:
                 throw JvmException{NULL_REF, "NullPointerException"};
             auto* obj = m_heap.deref(this_ref);
             ClassDef* actual = obj ? obj->klass : klass;
-            MethodDef* vmd = actual ? actual->resolve_virtual(md->name, md->descriptor)
-                                    : md;
-            if (!vmd) vmd = md;  // fallback
+            // Inline cache disabled temporarily — was dispatching wrong method
+            // in some path. Re-enable after narrowing down.
+            (void)call_site_pc;
+            MethodDef* vmd = actual ? actual->resolve_virtual(md->name, md->descriptor) : md;
+            if (!vmd) vmd = md;
             do_invoke(*this, f, vmd, actual ? actual : klass, nslots);
             break;
         }
