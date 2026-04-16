@@ -353,14 +353,12 @@ void VM::exec_frame(Frame& f) {
 dispatch_loop:
     try {
     while (true) {
-#ifdef J2ME_TRACE
         if (__builtin_expect(g_trace, 0)) {
             fprintf(stderr, "  [%-30s %-20s] pc=%4u sp=%2u op=0x%02x\n",
                 f.klass  ? f.klass->name.c_str()  : "?",
                 f.method ? f.method->name.c_str() : "?",
                 f.pc, f.sp, code[f.pc]);
         }
-#endif
         op = code[f.pc++];
 
         switch (op) {
