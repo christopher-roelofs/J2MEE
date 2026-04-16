@@ -1,10 +1,18 @@
 #include "vm.hpp"
 #include "frame.hpp"
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
 #include <iostream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// Shared global state from natives.cpp — accessed here for fast-path natives.
+extern std::unordered_map<ObjRef, std::string> g_string_buffers;
+extern std::unordered_map<ObjRef, std::vector<ObjRef>> g_vectors;
 
 // ─── Opcode table ─────────────────────────────────────────────────────────────
 // Only the opcodes we actually see in CLDC 1.1 games.
@@ -309,6 +317,82 @@ static inline bool fast_path_native(VM& vm, Frame& f,
     // broke Bejeweled because our String layout has field(1) mismatched
     // with the UTF-8-byte length stored in the char array for non-ASCII text.
     // The slow path uses utf8_char_count which is semantically correct.
+
+    // java/lang/Math.sqrt (D)D — single arg takes 2 slots
+    if (cn == "java/lang/Math") {
+        if (mn == "sqrt" && d == "(D)D") {
+            double a = f.pop_double();
+            f.push_double(std::sqrt(a));
+            return true;
+        }
+        if (mn == "sin" && d == "(D)D") {
+            double a = f.pop_double();
+            f.push_double(std::sin(a));
+            return true;
+        }
+        if (mn == "cos" && d == "(D)D") {
+            double a = f.pop_double();
+            f.push_double(std::cos(a));
+            return true;
+        }
+    }
+
+    // java/util/Vector.size()I and .elementAt(I)Ljava/lang/Object;
+    if (cn == "java/util/Vector") {
+        if (mn == "size" && d == "()I") {
+            ObjRef self = f.pop_ref();
+            auto it = g_vectors.find(self);
+            f.push_int(it == g_vectors.end() ? 0 : (int32_t)it->second.size());
+            return true;
+        }
+        if (mn == "elementAt" && d == "(I)Ljava/lang/Object;") {
+            int32_t idx = f.pop_int();
+            ObjRef self = f.pop_ref();
+            auto it = g_vectors.find(self);
+            if (it != g_vectors.end() && idx >= 0 && idx < (int32_t)it->second.size())
+                f.push_ref(it->second[idx]);
+            else
+                f.push_ref(NULL_REF);
+            return true;
+        }
+        if (mn == "isEmpty" && d == "()Z") {
+            ObjRef self = f.pop_ref();
+            auto it = g_vectors.find(self);
+            f.push_int(it == g_vectors.end() || it->second.empty() ? 1 : 0);
+            return true;
+        }
+        if (mn == "addElement" && d == "(Ljava/lang/Object;)V") {
+            ObjRef elem = f.pop_ref();
+            ObjRef self = f.pop_ref();
+            g_vectors[self].push_back(elem);
+            return true;
+        }
+    }
+
+    // java/lang/StringBuffer.length()I and .toString()Ljava/lang/String;
+    if (cn == "java/lang/StringBuffer") {
+        if (mn == "length" && d == "()I") {
+            ObjRef self = f.pop_ref();
+            auto it = g_string_buffers.find(self);
+            // Note: this returns byte length, not UTF-8 char count. Matches
+            // the slow-path behaviour which uses utf8_char_count(...) — but
+            // for games sticking to ASCII, these are the same. Keep the
+            // slow path for correctness on non-ASCII.
+            if (it != g_string_buffers.end()) {
+                // Quick ASCII check: if any high byte, fall back.
+                for (char c : it->second) {
+                    if ((uint8_t)c & 0x80) {
+                        f.push_ref(self);  // re-push
+                        return false;
+                    }
+                }
+                f.push_int((int32_t)it->second.size());
+                return true;
+            }
+            f.push_int(0);
+            return true;
+        }
+    }
 
     return false;
 }

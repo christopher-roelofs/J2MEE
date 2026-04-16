@@ -94,13 +94,13 @@ StreamEntry* find_stream(ObjRef ref) {
     auto it = g_streams.find(ref);
     return it == g_streams.end() ? nullptr : &it->second;
 }
-static std::unordered_map<ObjRef, std::string>   g_string_buffers;
+std::unordered_map<ObjRef, std::string>   g_string_buffers;
 static std::unordered_map<ObjRef, int32_t>       g_integers;
 // Hashtable: key ObjRef -> (map of key_hash -> pair<ObjRef,ObjRef>)
 // For simplicity we use a vector of pairs and do linear search on equals.
 using KVPair = std::pair<ObjRef, ObjRef>;
 static std::unordered_map<ObjRef, std::vector<KVPair>> g_hashtables;
-static std::unordered_map<ObjRef, std::vector<ObjRef>> g_vectors;
+std::unordered_map<ObjRef, std::vector<ObjRef>> g_vectors;
 static std::unordered_map<ClassDef*, ObjRef>           g_class_objects;
 // Command listener storage (for all Displayables including List)
 std::unordered_map<ObjRef, ObjRef> g_command_listeners;

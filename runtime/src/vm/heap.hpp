@@ -36,9 +36,23 @@ public:
     ObjRef alloc_long_array(int32_t length, ClassDef* arr_klass);
 
     // ── Access ───────────────────────────────────────────────────────────────
+    // Inlined hot-path: every getfield/putfield/arraystore funnels through
+    // deref. Definition in the header so the compiler can inline the check.
+    // Out-of-range refs throw — rare in correct code, so the slow path is
+    // fine in a non-inline helper.
 
-    HeapObject* deref(ObjRef ref);
-    const HeapObject* deref(ObjRef ref) const;
+    [[gnu::always_inline]] HeapObject* deref(ObjRef ref) {
+        if (__builtin_expect(ref == NULL_REF, 0)) return nullptr;
+        if (__builtin_expect(ref >= m_table.size(), 0))
+            return deref_slow(ref);
+        return m_table[ref];
+    }
+    [[gnu::always_inline]] const HeapObject* deref(ObjRef ref) const {
+        if (__builtin_expect(ref == NULL_REF, 0)) return nullptr;
+        if (__builtin_expect(ref >= m_table.size(), 0))
+            return deref_slow(ref);
+        return m_table[ref];
+    }
 
     bool is_null(ObjRef ref) const { return ref == NULL_REF; }
     bool valid(ObjRef ref)   const { return ref != NULL_REF && ref < m_table.size(); }
@@ -52,6 +66,10 @@ public:
     size_t total_bytes() const { return m_max; }
 
 private:
+    // Out-of-range deref: throws. Non-inlined so the hot path stays small.
+    HeapObject* deref_slow(ObjRef ref);
+    const HeapObject* deref_slow(ObjRef ref) const;
+
     // Internal allocation from raw storage
     HeapObject* raw_alloc(size_t bytes);
 

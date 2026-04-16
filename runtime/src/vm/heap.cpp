@@ -134,18 +134,12 @@ ObjRef Heap::alloc_long_array(int32_t length, ClassDef* arr_klass) {
 
 // ─── Access ───────────────────────────────────────────────────────────────────
 
-HeapObject* Heap::deref(ObjRef ref) {
-    if (ref == NULL_REF) return nullptr;
-    if (ref >= m_table.size())
-        throw std::runtime_error("InvalidRef:" + std::to_string(ref));
-    return m_table[ref];
+HeapObject* Heap::deref_slow(ObjRef ref) {
+    throw std::runtime_error("InvalidRef:" + std::to_string(ref));
 }
 
-const HeapObject* Heap::deref(ObjRef ref) const {
-    if (ref == NULL_REF) return nullptr;
-    if (ref >= m_table.size())
-        throw std::runtime_error("InvalidRef:" + std::to_string(ref));
-    return m_table[ref];
+const HeapObject* Heap::deref_slow(ObjRef ref) const {
+    throw std::runtime_error("InvalidRef:" + std::to_string(ref));
 }
 
 // ─── GC: mark-sweep ──────────────────────────────────────────────────────────
