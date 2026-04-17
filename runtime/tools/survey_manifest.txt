@@ -1,0 +1,43 @@
+# j2me regression manifest — one row per title.
+#
+# Fields, pipe-separated:
+#   path            JAR path relative to the repo root (what lives under games/)
+#   midlet          main MIDlet class, e.g. ca.jamdat.flight.J2MEApp
+#   flags           extra args passed verbatim (WxH, --keys, env-prefixed tweaks)
+#                   leave empty for defaults (240x320, no key script)
+#   min_level       expected minimum milestone: init | startApp | paint | flush | pix
+#   note            free-text, ignored by the runner
+#
+# Milestones (greatest reached wins):
+#   init       MIDlet class loaded & <init> ran         [survey] midlet-constructed
+#   startApp  startApp() invoked                        [survey] startApp-entered
+#   paint     first Canvas.paint() fired                [survey] first-paint
+#   flush     first GameCanvas.flushGraphics()          [survey] first-flush
+#   pix       non-zero pixels present in final frame    PPM body has non-NUL bytes
+#
+# Missing ROMs skip (the games/ tree may be gitignored). Regressions exit 1.
+
+games/bejeweled_240x320-16705.jar             | ca.jamdat.flight.J2MEApp | --keys FIRE,FIRE,FIRE                          | pix     | playable end-to-end
+games/bejeweled_3_259076.jar                  | com.ea.sdk.SDKMIDlet     |                                                | paint   | Jamdat SDK splash
+games/bejeweled_twist_260878.jar              | Game                     |                                                | paint   |
+games/new_bejeweled_twist_255052.jar          | Game                     |                                                | pix     | 2D menus render; in-game uses M3G (not implemented) → NPE at d.b@57
+games/365-Puzzle-Club_J2ME_EN_v666.jar        | BoxALMidlet              |                                                | pix     | VServ bypass path
+games/Age-of-Empires-II-Mobile_J2ME_EN_v110.jar | AgeOfEmpires.AgeOfEmpires | --keys FIRE,FIRE                             | pix     | menu + gameplay
+games/Final-Fantasy_J2ME_EN_v100.jar          | FinalFantasy             |                                                | paint   |
+games/gamekimcng_94hn157m.jar                 | KimCuong2                |                                                | pix     | bejeweled-twist clone; premium-SMS gate faked via fake MessageConnection
+games/Lumines-Mobile_J2ME_EN_v124.jar         | LuminesMIDlet            |                                                | pix     | surface drawn (was "black screen" interactively)
+games/puzzlebobb_q4tekjop.jar                 | com.whkjava.popo.KMPoPoMIDlet |                                           | pix     | MIDlet ctor drives setCurrent; startApp is empty
+games/Spore-Origins_J2ME_EN_v4206.jar         | Spore                    |                                                | pix     |
+games/superpuzzl_qpi6k5ra.jar                 | Init                     |                                                | pix     | Motorola FullCanvas via com/hellomoto/fullscreen/game/GAMECANVAS
+games/Tetris-Pop_J2ME_EN_v1849.jar            | tetrispop                |                                                | paint   |
+games/Uno_J2ME_EN_v113.jar                    | GloftUNOG                |                                                | paint   |
+games/Wolfenstein-RPG_J2ME_EN_v489.jar        | App                      |                                                | init    |
+
+# ── Dir-based titles ───────────────────────────────────────────────────────
+games/365-Solitaire-Club_J2ME_EN_v023/365 Solitaire (2017)(Connect2Media)(v0.2.3).jar | BoxALMidlet | | pix | BoxAL framework, VServ path
+games/3D-Bomberman-Atomic_J2ME_EN_v200/3DBombermanAtomic (2011)(Sun Microsystem)(v2.0.0).jar | GMIDlet | | pix | reaches pix headlessly; interactively README notes M3G crash
+games/Absolute-Puzzle_J2ME_EN_v1213/Absolute Puzzle (2005)(GlobalFun)(v1.2.13).jar | common_games.CommonMidlet | | paint | first-paint fires but no non-white pixels — investigate
+games/Denki-Blocks_J2ME_EN_v113/Denki Blocks! (2002)(dbi)(v1.1.3).jar | uk.co.denki.denkiblocks.DenkiBlocks | | pix | MANIFEST.MF had a 72-byte line continuation on the MIDlet class
+games/Doom-RPG_J2ME_EN_v1998/Doom RPG (2009)(JAMDAT Mobile Inc.)(v1.9.98).jar | DoomRPG | | pix | Jamdat framework — title/menu render
+games/The-Oregon-Trail_J2ME_EN_v122/The Oregon Trail (2008)(Gameloft SA)(v1.2.2).jar | GloftORTR | | pix | Gameloft
+games/pack mas 1000 juegos java Kevtech/1916_Dogfight.jar | root.PlaneMidlet | | flush | GameCanvas path; needs input to advance past splash
