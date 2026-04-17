@@ -347,3 +347,24 @@ void VM::run(const std::string& midlet_class) {
         // be ready to proceed (e.g., ad SDK set a flag during its thread)
     }
 }
+
+bool VM::run_next_pending_thread() {
+    if (m_pending_threads.empty()) return false;
+    PendingThread pt = m_pending_threads.front();
+    m_pending_threads.erase(m_pending_threads.begin());
+    ObjRef prev_thread = current_thread;
+    current_thread = pt.thread_ref;
+    try {
+        invoke(pt.run_method, pt.run_klass, {Slot::from_ref(pt.runnable)});
+    } catch (const QuitRequest&) {
+        current_thread = prev_thread;
+        throw;
+    } catch (const JvmException& e) {
+        fprintf(stderr, "[thread] yielded run() threw: %s\n  at %s\n",
+                e.message.c_str(), e.location.c_str());
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[thread] yielded run() threw: %s\n", e.what());
+    }
+    current_thread = prev_thread;
+    return true;
+}

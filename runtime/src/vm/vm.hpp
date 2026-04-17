@@ -159,6 +159,11 @@ public:
         m_pending_threads.push_back({run_method, run_klass, runnable, thread_ref});
     }
 
+    // Pop and run one pending thread's run() synchronously. Used by
+    // Object.wait() to yield to a waiter-notifier thread in our cooperative
+    // single-threaded model. Returns true if a thread ran.
+    bool run_next_pending_thread();
+
     // The ObjRef of the thread currently executing (set by the drain loop).
     ObjRef current_thread = NULL_REF;
 

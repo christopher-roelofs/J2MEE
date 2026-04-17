@@ -98,6 +98,12 @@ void Display::open(int w, int h, const std::string& title) {
     // Fill with white (J2ME default background)
     SDL_FillRect(m_screen, nullptr, SDL_MapRGBA(m_screen->format, 255, 255, 255, 255));
 
+    // Disable text-input mode. On Wayland, SDL enables text input by default
+    // after window creation which suppresses SDL_KEYDOWN for some keys (the
+    // compositor routes them to an IME text-editing stream instead). Games
+    // want raw key events, not IME text — stop it up front.
+    SDL_StopTextInput();
+
     // Streaming texture for efficient surface→GPU upload
     m_texture = SDL_CreateTexture(m_renderer,
                     SDL_PIXELFORMAT_ARGB8888,
@@ -116,9 +122,11 @@ bool Display::flush() {
     // Poll events
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) return false;
+        if (std::getenv("J2ME_TRACE_KEYS"))
+            fprintf(stderr, "[sdl] event type=0x%x\n", ev.type);
+        if (ev.type == SDL_QUIT) { fprintf(stderr, "[display] SDL_QUIT received\n"); return false; }
         if (ev.type == SDL_KEYDOWN) {
-            if (ev.key.keysym.sym == SDLK_ESCAPE) return false;
+            if (ev.key.keysym.sym == SDLK_ESCAPE) { fprintf(stderr, "[display] ESCAPE pressed\n"); return false; }
             if (ev.key.repeat == 0)  // ignore auto-repeat; only fire on initial press
                 enqueue_key(ev.key.keysym.sym);
         } else if (ev.type == SDL_KEYUP) {
@@ -150,6 +158,15 @@ bool Display::flush() {
 
     update_key_states();
 
+    if (const char* dir = std::getenv("J2ME_DUMP_FRAMES")) {
+        static int frame_n = 0;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/frame_%06d.bmp", dir, frame_n++);
+        SDL_SaveBMP(m_screen, path);
+        if (std::getenv("J2ME_TRACE_DRAW"))
+            fprintf(stderr, "===== FLUSH #%d =====\n", frame_n - 1);
+    }
+
     // Upload surface pixels to texture
     SDL_UpdateTexture(m_texture, nullptr, m_screen->pixels, m_screen->pitch);
 
@@ -168,6 +185,8 @@ bool Display::flush() {
 //   Digits '0'-'9' (48-57), '*'=42, '#'=35
 
 void Display::enqueue_key(SDL_Keycode sym) {
+    if (std::getenv("J2ME_TRACE_KEYS"))
+        fprintf(stderr, "[key] enqueue_key sym=%d (%s)\n", sym, SDL_GetKeyName(sym));
     int midp = 0;
     switch (sym) {
         case SDLK_UP:        midp = -1;  break;

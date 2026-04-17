@@ -3,6 +3,7 @@
 #include "classfile/class_file.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <string>
@@ -66,6 +67,16 @@ struct MethodDef {
     // Return type category
     enum class RetType { Void, Int, Long, Float, Double, Ref };
     RetType ret_type = RetType::Void;
+
+    // ── Fast-path dispatch cache (set on first invocation) ──────────────────
+    // For hot natives we identify the method kind once (by name/desc/class)
+    // and cache a direct function pointer. Subsequent calls skip the string
+    // compare chain and std::function dispatch entirely.
+    //
+    // Func returns true if handled; false falls back to the full slow path.
+    using FastPathFunc = bool(*)(VM&, Frame&, uint32_t total_slots);
+    mutable FastPathFunc fast_path   = nullptr;
+    mutable uint8_t      fp_resolved = 0;  // 1 once we've tried to identify
 };
 
 // ─── ClassDef ────────────────────────────────────────────────────────────────
@@ -76,8 +87,11 @@ struct ClassDef {
     std::vector<ClassDef*> interfaces;
 
     // ── Fields ───────────────────────────────────────────────────────────────
-    std::vector<FieldDef> instance_fields;   // this class's own instance fields
-    std::vector<FieldDef> static_fields;
+    // deque for the same reason as methods: stub FieldDefs are appended at
+    // runtime from resolve_field, and cached FieldDef* pointers must stay
+    // valid across those insertions.
+    std::deque<FieldDef> instance_fields;   // this class's own instance fields
+    std::deque<FieldDef> static_fields;
 
     // Storage for static field values.  Indexed by FieldDef::slot_index.
     std::vector<Slot> static_values;
@@ -88,7 +102,11 @@ struct ClassDef {
     uint32_t instance_slot_count = 0;
 
     // ── Methods ──────────────────────────────────────────────────────────────
-    std::vector<MethodDef> methods;
+    // std::deque: new stub methods may be appended at runtime (when a call
+    // resolves to a not-yet-implemented native). vector would reallocate and
+    // invalidate MethodDef* pointers held by the CP/IC caches. deque keeps
+    // existing element addresses stable across push_back.
+    std::deque<MethodDef> methods;
 
     // ── Resolved constant pool ────────────────────────────────────────────────
     // Kept as the original parsed entries; resolved (class/field/method) refs

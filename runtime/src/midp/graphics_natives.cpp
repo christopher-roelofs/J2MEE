@@ -8,6 +8,7 @@
 #include <SDL2/SDL_ttf.h>
 
 #include <cstring>
+#include <cmath>
 #include <unordered_map>
 
 // ─── External state ──────────────────────────────────────────────────────────
@@ -30,6 +31,11 @@ static std::unordered_map<ObjRef, int>          g_font_size;  // Font ref → MI
 static std::unordered_map<ObjRef, int>          g_font_style; // Font ref → MIDP style constant
 static std::unordered_map<ObjRef, int>          g_font_face;  // Font ref → MIDP face constant
 static std::unordered_map<ObjRef, ObjRef>       g_gfx_font;   // Graphics ref → current Font ref
+
+// Displayable currently shown (set via Display.setCurrent). Used to deliver
+// input events to games that don't paint every frame (so do_repaint's key
+// pump doesn't fire often enough).
+ObjRef g_current_displayable = NULL_REF;
 
 // ─── Font backend ────────────────────────────────────────────────────────────
 // MIDP font size constants: SIZE_SMALL=8, SIZE_MEDIUM=0, SIZE_LARGE=16
@@ -298,6 +304,63 @@ static void draw_vline(SDL_Surface* surf, uint32_t color, int x, int y, int h) {
     fill_rect_on(surf, color, x, y, 1, h);
 }
 
+// Is the given point's angle (in degrees, 0°=3-o'clock, CCW) inside the arc?
+static inline bool arc_includes(int dx, int dy, int rx, int ry,
+                                int startAngle, int arcAngle) {
+    if (arcAngle >= 360 || arcAngle <= -360) return true;
+    double a = std::atan2(-(double)dy * rx, (double)dx * ry) * 180.0 / M_PI;
+    if (a < 0) a += 360;
+    double s = startAngle, e = startAngle + arcAngle;
+    if (arcAngle < 0) { s = startAngle + arcAngle; e = startAngle; }
+    while (s < 0)     { s += 360; e += 360; }
+    while (s >= 360)  { s -= 360; e -= 360; }
+    if (e <= 360)     return a >= s && a <= e;
+    return a >= s || a <= (e - 360);
+}
+
+static void fill_arc_on(SDL_Surface* surf, uint32_t color,
+                        int x, int y, int w, int h,
+                        int startAngle, int arcAngle) {
+    if (!surf || w <= 0 || h <= 0) return;
+    int rx = w / 2, ry = h / 2;
+    int cx = x + rx, cy = y + ry;
+    uint32_t mapped = map_color(surf, color);
+    SDL_Rect bbox{x, y, w, h};
+    SDL_Rect isect;
+    SDL_Rect clip; SDL_GetClipRect(surf, &clip);
+    if (!SDL_IntersectRect(&bbox, &clip, &isect)) return;
+    for (int py = isect.y; py < isect.y + isect.h; ++py) {
+        int dy = py - cy;
+        for (int px = isect.x; px < isect.x + isect.w; ++px) {
+            int dx = px - cx;
+            double nx = (double)dx / rx, ny = (double)dy / ry;
+            if (nx*nx + ny*ny > 1.0) continue;
+            if (!arc_includes(dx, dy, rx, ry, startAngle, arcAngle)) continue;
+            SDL_Rect one{px, py, 1, 1};
+            SDL_FillRect(surf, &one, mapped);
+        }
+    }
+}
+
+static void draw_arc_on(SDL_Surface* surf, uint32_t color,
+                        int x, int y, int w, int h,
+                        int startAngle, int arcAngle) {
+    if (!surf || w <= 0 || h <= 0) return;
+    int rx = w / 2, ry = h / 2;
+    int cx = x + rx, cy = y + ry;
+    uint32_t mapped = map_color(surf, color);
+    double step = 1.0 / std::max(rx, ry);
+    double a0 = startAngle * M_PI / 180.0;
+    double a1 = (startAngle + arcAngle) * M_PI / 180.0;
+    if (arcAngle < 0) std::swap(a0, a1);
+    for (double a = a0; a <= a1; a += step) {
+        int px = cx + (int)std::round(rx * std::cos(a));
+        int py = cy - (int)std::round(ry * std::sin(a));
+        SDL_Rect one{px, py, 1, 1};
+        SDL_FillRect(surf, &one, mapped);
+    }
+}
+
 // Bresenham line
 static void draw_line_on(SDL_Surface* surf, uint32_t color,
                           int x1, int y1, int x2, int y2) {
@@ -507,6 +570,28 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         });
 
     vm.register_native("javax/microedition/lcdui/Graphics",
+        "fillArc", "(IIIIII)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            auto t = gfx_tx(self);
+            fill_arc_on(gfx_surface(self), gfx_color(self),
+                        args[1].as_int() + t.x, args[2].as_int() + t.y,
+                        args[3].as_int(), args[4].as_int(),
+                        args[5].as_int(), args[6].as_int());
+        });
+
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "drawArc", "(IIIIII)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            auto t = gfx_tx(self);
+            draw_arc_on(gfx_surface(self), gfx_color(self),
+                        args[1].as_int() + t.x, args[2].as_int() + t.y,
+                        args[3].as_int(), args[4].as_int(),
+                        args[5].as_int(), args[6].as_int());
+        });
+
+    vm.register_native("javax/microedition/lcdui/Graphics",
         "drawRect", "(IIII)V",
         [](VM&, Frame&, std::span<Slot> args) {
             ObjRef  self = args[0].as_ref();
@@ -644,8 +729,13 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             SDL_Rect cur;
             SDL_GetClipRect(s, &cur);
             SDL_Rect isect;
-            if (SDL_IntersectRect(&cur, &nr, &isect))
+            if (SDL_IntersectRect(&cur, &nr, &isect)) {
                 SDL_SetClipRect(s, &isect);
+            } else {
+                // MIDP spec: empty intersection clips out all subsequent draws.
+                SDL_Rect empty{0, 0, 0, 0};
+                SDL_SetClipRect(s, &empty);
+            }
         });
 
     vm.register_native("javax/microedition/lcdui/Graphics",
@@ -1194,6 +1284,10 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
 
         MethodDef* kp = canvas_obj->klass->resolve_virtual("keyPressed",  "(I)V");
         MethodDef* kr = canvas_obj->klass->resolve_virtual("keyReleased", "(I)V");
+        if (std::getenv("J2ME_TRACE_KEYS"))
+            fprintf(stderr, "[key] delivering %zu presses + %zu releases to %s (kp=%p kr=%p)\n",
+                    presses.size(), releases.size(),
+                    canvas_obj->klass->name.c_str(), (void*)kp, (void*)kr);
 
         for (int code : presses) {
             // Soft keys: fire commandAction on the CommandListener if registered

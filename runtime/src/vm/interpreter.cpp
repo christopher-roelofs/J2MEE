@@ -251,150 +251,129 @@ static void exec_ldc(VM& vm, Frame& f, const ClassFile& cf, uint16_t cp_idx) {
 // Pop (arg_count) slots from f.stack into a vector, then call vm.invoke().
 // Returns the optional return slot which the caller pushes.
 
-// Fast-path for hot natives: avoids std::function dispatch + Frame construction
-// + args vector allocation. Returns true if handled in-place on f's stack.
-// The stack already has args pushed; we read them directly and replace with
-// return value (if any).
-static inline bool fast_path_native(VM& vm, Frame& f,
-                                    MethodDef* method, ClassDef* klass,
-                                    uint32_t total_slots) {
-    if (!method->is_native()) return false;
+// ─── Fast-path native implementations ────────────────────────────────────────
+// Each returns true if handled in-place on f's stack. The dispatcher caches
+// a pointer to the matching function on MethodDef so subsequent calls go
+// through no string compares.
+
+static bool fp_object_init(VM&, Frame& f, uint32_t) {
+    f.sp -= 1; return true;
+}
+static bool fp_currentTimeMillis(VM&, Frame& f, uint32_t) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    f.push_long((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return true;
+}
+static bool fp_math_min_ii(VM&, Frame& f, uint32_t) {
+    int32_t b = f.pop_int(), a = f.pop_int();
+    f.push_int(a < b ? a : b); return true;
+}
+static bool fp_math_max_ii(VM&, Frame& f, uint32_t) {
+    int32_t b = f.pop_int(), a = f.pop_int();
+    f.push_int(a > b ? a : b); return true;
+}
+static bool fp_math_abs_i(VM&, Frame& f, uint32_t) {
+    int32_t a = f.pop_int();
+    f.push_int(a < 0 ? -a : a); return true;
+}
+static bool fp_math_abs_j(VM&, Frame& f, uint32_t) {
+    int64_t a = f.pop_long();
+    f.push_long(a < 0 ? -a : a); return true;
+}
+static bool fp_math_min_jj(VM&, Frame& f, uint32_t) {
+    int64_t b = f.pop_long(), a = f.pop_long();
+    f.push_long(a < b ? a : b); return true;
+}
+static bool fp_math_max_jj(VM&, Frame& f, uint32_t) {
+    int64_t b = f.pop_long(), a = f.pop_long();
+    f.push_long(a > b ? a : b); return true;
+}
+static bool fp_math_sqrt(VM&, Frame& f, uint32_t) {
+    f.push_double(std::sqrt(f.pop_double())); return true;
+}
+static bool fp_math_sin(VM&, Frame& f, uint32_t) {
+    f.push_double(std::sin(f.pop_double())); return true;
+}
+static bool fp_math_cos(VM&, Frame& f, uint32_t) {
+    f.push_double(std::cos(f.pop_double())); return true;
+}
+static bool fp_vector_size(VM&, Frame& f, uint32_t) {
+    ObjRef self = f.pop_ref();
+    auto it = g_vectors.find(self);
+    f.push_int(it == g_vectors.end() ? 0 : (int32_t)it->second.size());
+    return true;
+}
+static bool fp_vector_elementAt(VM&, Frame& f, uint32_t) {
+    int32_t idx = f.pop_int();
+    ObjRef self = f.pop_ref();
+    auto it = g_vectors.find(self);
+    if (it != g_vectors.end() && idx >= 0 && idx < (int32_t)it->second.size())
+        f.push_ref(it->second[idx]);
+    else
+        f.push_ref(NULL_REF);
+    return true;
+}
+static bool fp_vector_isEmpty(VM&, Frame& f, uint32_t) {
+    ObjRef self = f.pop_ref();
+    auto it = g_vectors.find(self);
+    f.push_int(it == g_vectors.end() || it->second.empty() ? 1 : 0);
+    return true;
+}
+static bool fp_vector_addElement(VM&, Frame& f, uint32_t) {
+    ObjRef elem = f.pop_ref();
+    ObjRef self = f.pop_ref();
+    g_vectors[self].push_back(elem);
+    return true;
+}
+
+// Tried-once-then-fail marker (any non-null value that we can compare against)
+static bool fp_none(VM&, Frame&, uint32_t) { return false; }
+
+// First-time dispatch: identify the matching fast path once, cache it on
+// the MethodDef. Returns the cached pointer (fp_none if no match).
+static MethodDef::FastPathFunc identify_fast_path(MethodDef* method, ClassDef* klass) {
+    if (!method->is_native()) return fp_none;
     const std::string& cn = klass->name;
     const std::string& mn = method->name;
     const std::string& d  = method->descriptor;
 
-    // java/lang/Object.<init>()V — most common: just pop `this`, nothing else.
-    if (total_slots == 1 && mn == "<init>" && d == "()V" &&
-        (cn == "java/lang/Object")) {
-        f.sp -= 1;
-        return true;
-    }
+    if (cn == "java/lang/Object" && mn == "<init>" && d == "()V")
+        return fp_object_init;
+    if (cn == "java/lang/System" && mn == "currentTimeMillis" && d == "()J")
+        return fp_currentTimeMillis;
 
-    // java/lang/System.currentTimeMillis()J — no-arg, called every frame
-    if (total_slots == 0 && cn == "java/lang/System" &&
-        mn == "currentTimeMillis" && d == "()J") {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        f.push_long((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-        return true;
-    }
-
-    // java/lang/Math.min/max/abs (II)I and (JJ)J and (I)I and (J)J
     if (cn == "java/lang/Math") {
-        if (mn == "min" && d == "(II)I") {
-            int32_t b = f.pop_int(), a = f.pop_int();
-            f.push_int(a < b ? a : b);
-            return true;
-        }
-        if (mn == "max" && d == "(II)I") {
-            int32_t b = f.pop_int(), a = f.pop_int();
-            f.push_int(a > b ? a : b);
-            return true;
-        }
-        if (mn == "abs" && d == "(I)I") {
-            int32_t a = f.pop_int();
-            f.push_int(a < 0 ? -a : a);
-            return true;
-        }
-        if (mn == "abs" && d == "(J)J") {
-            int64_t a = f.pop_long();
-            f.push_long(a < 0 ? -a : a);
-            return true;
-        }
-        if (mn == "min" && d == "(JJ)J") {
-            int64_t b = f.pop_long(), a = f.pop_long();
-            f.push_long(a < b ? a : b);
-            return true;
-        }
-        if (mn == "max" && d == "(JJ)J") {
-            int64_t b = f.pop_long(), a = f.pop_long();
-            f.push_long(a > b ? a : b);
-            return true;
-        }
+        if (mn == "min" && d == "(II)I") return fp_math_min_ii;
+        if (mn == "max" && d == "(II)I") return fp_math_max_ii;
+        if (mn == "abs" && d == "(I)I")  return fp_math_abs_i;
+        if (mn == "abs" && d == "(J)J")  return fp_math_abs_j;
+        if (mn == "min" && d == "(JJ)J") return fp_math_min_jj;
+        if (mn == "max" && d == "(JJ)J") return fp_math_max_jj;
+        if (mn == "sqrt" && d == "(D)D") return fp_math_sqrt;
+        if (mn == "sin"  && d == "(D)D") return fp_math_sin;
+        if (mn == "cos"  && d == "(D)D") return fp_math_cos;
     }
 
-    // NOTE: String.length() / String.charAt() fast-paths disabled — they
-    // broke Bejeweled because our String layout has field(1) mismatched
-    // with the UTF-8-byte length stored in the char array for non-ASCII text.
-    // The slow path uses utf8_char_count which is semantically correct.
-
-    // java/lang/Math.sqrt (D)D — single arg takes 2 slots
-    if (cn == "java/lang/Math") {
-        if (mn == "sqrt" && d == "(D)D") {
-            double a = f.pop_double();
-            f.push_double(std::sqrt(a));
-            return true;
-        }
-        if (mn == "sin" && d == "(D)D") {
-            double a = f.pop_double();
-            f.push_double(std::sin(a));
-            return true;
-        }
-        if (mn == "cos" && d == "(D)D") {
-            double a = f.pop_double();
-            f.push_double(std::cos(a));
-            return true;
-        }
-    }
-
-    // java/util/Vector.size()I and .elementAt(I)Ljava/lang/Object;
     if (cn == "java/util/Vector") {
-        if (mn == "size" && d == "()I") {
-            ObjRef self = f.pop_ref();
-            auto it = g_vectors.find(self);
-            f.push_int(it == g_vectors.end() ? 0 : (int32_t)it->second.size());
-            return true;
-        }
-        if (mn == "elementAt" && d == "(I)Ljava/lang/Object;") {
-            int32_t idx = f.pop_int();
-            ObjRef self = f.pop_ref();
-            auto it = g_vectors.find(self);
-            if (it != g_vectors.end() && idx >= 0 && idx < (int32_t)it->second.size())
-                f.push_ref(it->second[idx]);
-            else
-                f.push_ref(NULL_REF);
-            return true;
-        }
-        if (mn == "isEmpty" && d == "()Z") {
-            ObjRef self = f.pop_ref();
-            auto it = g_vectors.find(self);
-            f.push_int(it == g_vectors.end() || it->second.empty() ? 1 : 0);
-            return true;
-        }
-        if (mn == "addElement" && d == "(Ljava/lang/Object;)V") {
-            ObjRef elem = f.pop_ref();
-            ObjRef self = f.pop_ref();
-            g_vectors[self].push_back(elem);
-            return true;
-        }
+        if (mn == "size"       && d == "()I")                       return fp_vector_size;
+        if (mn == "elementAt"  && d == "(I)Ljava/lang/Object;")     return fp_vector_elementAt;
+        if (mn == "isEmpty"    && d == "()Z")                       return fp_vector_isEmpty;
+        if (mn == "addElement" && d == "(Ljava/lang/Object;)V")     return fp_vector_addElement;
     }
 
-    // java/lang/StringBuffer.length()I and .toString()Ljava/lang/String;
-    if (cn == "java/lang/StringBuffer") {
-        if (mn == "length" && d == "()I") {
-            ObjRef self = f.pop_ref();
-            auto it = g_string_buffers.find(self);
-            // Note: this returns byte length, not UTF-8 char count. Matches
-            // the slow-path behaviour which uses utf8_char_count(...) — but
-            // for games sticking to ASCII, these are the same. Keep the
-            // slow path for correctness on non-ASCII.
-            if (it != g_string_buffers.end()) {
-                // Quick ASCII check: if any high byte, fall back.
-                for (char c : it->second) {
-                    if ((uint8_t)c & 0x80) {
-                        f.push_ref(self);  // re-push
-                        return false;
-                    }
-                }
-                f.push_int((int32_t)it->second.size());
-                return true;
-            }
-            f.push_int(0);
-            return true;
-        }
-    }
+    return fp_none;
+}
 
-    return false;
+static inline bool fast_path_native(VM& vm, Frame& f,
+                                    MethodDef* method, ClassDef* klass,
+                                    uint32_t total_slots) {
+    if (__builtin_expect(method->fp_resolved == 0, 0)) {
+        method->fast_path   = identify_fast_path(method, klass);
+        method->fp_resolved = 1;
+    }
+    if (method->fast_path == fp_none) return false;
+    return method->fast_path(vm, f, total_slots);
 }
 
 static void do_invoke(VM& vm, Frame& f,
@@ -1078,6 +1057,32 @@ dispatch_loop:
                         auto slash = simple.rfind('/');
                         if (slash != std::string::npos) simple = simple.substr(slash + 1);
                         matches = (simple == e.message);
+                    }
+                    // Hard-coded subtype relations: our synthetic JvmExceptions
+                    // don't carry a real class hierarchy, so map common
+                    // subclass relationships by hand. EOFException/FileNotFound
+                    // etc. all extend IOException.
+                    if (!matches && cn == "java/io/IOException") {
+                        matches = (e.message == "EOFException" ||
+                                   e.message == "FileNotFoundException" ||
+                                   e.message == "UTFDataFormatException" ||
+                                   e.message == "InterruptedIOException" ||
+                                   e.message == "IOException");
+                    }
+                    if (!matches && cn == "java/lang/RuntimeException") {
+                        matches = (e.message == "NullPointerException" ||
+                                   e.message == "ArrayIndexOutOfBoundsException" ||
+                                   e.message == "IndexOutOfBoundsException" ||
+                                   e.message == "ArithmeticException" ||
+                                   e.message == "ClassCastException" ||
+                                   e.message == "NumberFormatException" ||
+                                   e.message == "IllegalArgumentException" ||
+                                   e.message == "IllegalStateException");
+                    }
+                    if (!matches && cn == "java/lang/IndexOutOfBoundsException") {
+                        matches = (e.message == "ArrayIndexOutOfBoundsException" ||
+                                   e.message == "StringIndexOutOfBoundsException" ||
+                                   e.message == "IndexOutOfBoundsException");
                     }
                 }
             }
