@@ -867,6 +867,52 @@ void register_natives(VM& vm, const JarFile& jar) {
             int32_t len = src ? src->array_length() : 0;
             string_init_chars(v, f, args, 0, len);
         });
+
+    // String from byte array — treat bytes as ISO-8859-1 (CLDC default).
+    auto string_init_bytes = [](VM& v, Frame&, std::span<Slot> args,
+                                int32_t off, int32_t count) {
+        ObjRef self = args[0].as_ref();
+        ObjRef src_arr = args[1].as_ref();
+        HeapObject* dobj = v.heap().deref(self);
+        if (!dobj || dobj->data_words < 2) return;
+        HeapObject* src = (src_arr != NULL_REF) ? v.heap().deref(src_arr) : nullptr;
+        int32_t src_len = src ? src->array_length() : 0;
+        if (off < 0) off = 0;
+        if (count < 0) count = 0;
+        if (off > src_len) { count = 0; off = 0; }
+        else if (off + count > src_len) count = src_len - off;
+        ObjRef new_arr = v.heap().alloc_prim_array(
+            ArrayType::Char, count, v.loader().find_or_stub("[C"));
+        HeapObject* narr = v.heap().deref(new_arr);
+        uint16_t* dst = narr->array_shorts();
+        if (src && count > 0) {
+            const uint8_t* ss = src->array_bytes();
+            for (int32_t i = 0; i < count; ++i) dst[i] = ss[off + i];
+        }
+        dobj->field(0) = Slot::from_ref(new_arr);
+        dobj->field(1) = Slot::from_int(count);
+    };
+    vm.register_native("java/lang/String", "<init>", "([B)V",
+        [string_init_bytes](VM& v, Frame& f, std::span<Slot> args) {
+            HeapObject* src = v.heap().deref(args[1].as_ref());
+            int32_t len = src ? src->array_length() : 0;
+            string_init_bytes(v, f, args, 0, len);
+        });
+    vm.register_native("java/lang/String", "<init>", "([BII)V",
+        [string_init_bytes](VM& v, Frame& f, std::span<Slot> args) {
+            string_init_bytes(v, f, args, args[2].as_int(), args[3].as_int());
+        });
+    vm.register_native("java/lang/String", "<init>", "([BLjava/lang/String;)V",
+        [string_init_bytes](VM& v, Frame& f, std::span<Slot> args) {
+            // Ignore the encoding argument — treat as Latin-1.
+            HeapObject* src = v.heap().deref(args[1].as_ref());
+            int32_t len = src ? src->array_length() : 0;
+            string_init_bytes(v, f, args, 0, len);
+        });
+    vm.register_native("java/lang/String", "<init>", "([BIILjava/lang/String;)V",
+        [string_init_bytes](VM& v, Frame& f, std::span<Slot> args) {
+            string_init_bytes(v, f, args, args[2].as_int(), args[3].as_int());
+        });
     vm.register_native("java/lang/String", "<init>", "([CII)V",
         [string_init_chars](VM& v, Frame& f, std::span<Slot> args) {
             string_init_chars(v, f, args, args[2].as_int(), args[3].as_int());
