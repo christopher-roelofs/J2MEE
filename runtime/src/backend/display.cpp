@@ -184,7 +184,26 @@ bool Display::flush() {
 //   SOFT1=-6  SOFT2=-7
 //   Digits '0'-'9' (48-57), '*'=42, '#'=35
 
+// Override the default soft-key keycodes. Set J2ME_SOFTKEYS="-6,-7" (Nokia,
+// default), "21,22" (Siemens / some Jamdat titles like Bejeweled 3), or any
+// other pair your game expects.
+static int g_softkey_left  = -6;
+static int g_softkey_right = -7;
+static bool g_softkeys_inited = false;
+static void init_softkeys() {
+    if (g_softkeys_inited) return;
+    g_softkeys_inited = true;
+    const char* env = std::getenv("J2ME_SOFTKEYS");
+    if (!env) return;
+    int l = 0, r = 0;
+    if (sscanf(env, "%d,%d", &l, &r) == 2) {
+        g_softkey_left = l;
+        g_softkey_right = r;
+    }
+}
+
 void Display::enqueue_key(SDL_Keycode sym) {
+    init_softkeys();
     if (std::getenv("J2ME_TRACE_KEYS"))
         fprintf(stderr, "[key] enqueue_key sym=%d (%s)\n", sym, SDL_GetKeyName(sym));
     int midp = 0;
@@ -198,10 +217,10 @@ void Display::enqueue_key(SDL_Keycode sym) {
         case SDLK_SPACE:
         case SDLK_z:         midp = -5;  break;  // FIRE / OK
         case SDLK_F1:
-        case SDLK_LSHIFT:    midp = -6;  break;  // Left soft key
+        case SDLK_LSHIFT:    midp = g_softkey_left;  break;
         case SDLK_F2:
         case SDLK_BACKSPACE:
-        case SDLK_RSHIFT:    midp = -7;  break;  // Right soft key
+        case SDLK_RSHIFT:    midp = g_softkey_right; break;
         case SDLK_w:         midp = -1;  break;  // WASD up
         case SDLK_s:         midp = -2;  break;
         case SDLK_a:         midp = -3;  break;
@@ -219,6 +238,7 @@ void Display::enqueue_key(SDL_Keycode sym) {
 }
 
 void Display::enqueue_release(SDL_Keycode sym) {
+    init_softkeys();
     // Reuse the same mapping — just push to the release queue instead
     int midp = 0;
     switch (sym) {
@@ -231,10 +251,10 @@ void Display::enqueue_release(SDL_Keycode sym) {
         case SDLK_SPACE:
         case SDLK_z:         midp = -5;  break;
         case SDLK_F1:
-        case SDLK_LSHIFT:    midp = -6;  break;
+        case SDLK_LSHIFT:    midp = g_softkey_left;  break;
         case SDLK_F2:
         case SDLK_BACKSPACE:
-        case SDLK_RSHIFT:    midp = -7;  break;
+        case SDLK_RSHIFT:    midp = g_softkey_right; break;
         case SDLK_w:         midp = -1;  break;
         case SDLK_s:         midp = -2;  break;
         case SDLK_a:         midp = -3;  break;

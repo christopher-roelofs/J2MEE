@@ -564,9 +564,12 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         [](VM&, Frame&, std::span<Slot> args) {
             ObjRef self = args[0].as_ref();
             auto t = gfx_tx(self);
-            fill_rect_on(gfx_surface(self), gfx_color(self),
-                         args[1].as_int() + t.x, args[2].as_int() + t.y,
-                         args[3].as_int(), args[4].as_int());
+            int x = args[1].as_int() + t.x, y = args[2].as_int() + t.y;
+            int w = args[3].as_int(), h = args[4].as_int();
+            if (std::getenv("J2ME_TRACE_DRAW"))
+                fprintf(stderr, "[draw] fillRect (%d,%d) %dx%d color=0x%x\n",
+                        x, y, w, h, gfx_color(self));
+            fill_rect_on(gfx_surface(self), gfx_color(self), x, y, w, h);
         });
 
     vm.register_native("javax/microedition/lcdui/Graphics",
@@ -611,9 +614,12 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         [](VM&, Frame&, std::span<Slot> args) {
             ObjRef self = args[0].as_ref();
             auto t = gfx_tx(self);
-            draw_line_on(gfx_surface(self), gfx_color(self),
-                         args[1].as_int() + t.x, args[2].as_int() + t.y,
-                         args[3].as_int() + t.x, args[4].as_int() + t.y);
+            int x1 = args[1].as_int() + t.x, y1 = args[2].as_int() + t.y;
+            int x2 = args[3].as_int() + t.x, y2 = args[4].as_int() + t.y;
+            if (std::getenv("J2ME_TRACE_DRAW"))
+                fprintf(stderr, "[draw] drawLine (%d,%d)->(%d,%d) color=0x%x\n",
+                        x1, y1, x2, y2, gfx_color(self));
+            draw_line_on(gfx_surface(self), gfx_color(self), x1, y1, x2, y2);
         });
 
     vm.register_native("javax/microedition/lcdui/Graphics",
