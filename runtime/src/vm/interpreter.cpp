@@ -412,354 +412,538 @@ void VM::exec_frame(Frame& f) {
                " sp=" + std::to_string(f.sp);
     };
 
-    uint8_t op = 0;
-dispatch_loop:
-    try {
-    while (true) {
-        if (__builtin_expect(g_trace, 0)) {
-            fprintf(stderr, "  [%-30s %-20s] pc=%4u sp=%2u op=0x%02x\n",
-                f.klass  ? f.klass->name.c_str()  : "?",
-                f.method ? f.method->name.c_str() : "?",
-                f.pc, f.sp, code[f.pc]);
-        }
-        op = code[f.pc++];
+    // ── Direct-threaded dispatch ──────────────────────────────────────────────
+    // Opcode → label address table. Label addresses via GCC &&label extension.
+    // Built lazily on first entry; thereafter fetch is a single indexed load +
+    // indirect branch, eliminating the switch's range check and case-table
+    // lookup in hot loops.
+    static const void* dispatch_table[256];
+    static bool dispatch_init = false;
+    if (__builtin_expect(!dispatch_init, 0)) {
+        for (int i = 0; i < 256; ++i) dispatch_table[i] = &&L_default;
+        dispatch_table[NOP] = &&L_NOP;
+        dispatch_table[ACONST_NULL] = &&L_ACONST_NULL;
+        dispatch_table[ICONST_M1] = &&L_ICONST_M1;
+        dispatch_table[ICONST_0]  = &&L_ICONST_0;
+        dispatch_table[ICONST_1]  = &&L_ICONST_1;
+        dispatch_table[ICONST_2]  = &&L_ICONST_2;
+        dispatch_table[ICONST_3]  = &&L_ICONST_3;
+        dispatch_table[ICONST_4]  = &&L_ICONST_4;
+        dispatch_table[ICONST_5]  = &&L_ICONST_5;
+        dispatch_table[LCONST_0]  = &&L_LCONST_0;
+        dispatch_table[LCONST_1]  = &&L_LCONST_1;
+        dispatch_table[FCONST_0]  = &&L_FCONST_0;
+        dispatch_table[FCONST_1]  = &&L_FCONST_1;
+        dispatch_table[FCONST_2]  = &&L_FCONST_2;
+        dispatch_table[DCONST_0]  = &&L_DCONST_0;
+        dispatch_table[DCONST_1]  = &&L_DCONST_1;
+        dispatch_table[BIPUSH]    = &&L_BIPUSH;
+        dispatch_table[SIPUSH]    = &&L_SIPUSH;
+        dispatch_table[LDC]       = &&L_LDC;
+        dispatch_table[LDC_W]     = &&L_LDC_W;
+        dispatch_table[LDC2_W]    = &&L_LDC_W;  // share
+        dispatch_table[ILOAD]     = &&L_ILOAD;
+        dispatch_table[LLOAD]     = &&L_LLOAD;
+        dispatch_table[FLOAD]     = &&L_ILOAD;  // share with ILOAD
+        dispatch_table[DLOAD]     = &&L_LLOAD;
+        dispatch_table[ALOAD]     = &&L_ALOAD;
+        dispatch_table[ILOAD_0]   = &&L_ILOAD_0; dispatch_table[FLOAD_0] = &&L_ILOAD_0;
+        dispatch_table[ILOAD_1]   = &&L_ILOAD_1; dispatch_table[FLOAD_1] = &&L_ILOAD_1;
+        dispatch_table[ILOAD_2]   = &&L_ILOAD_2; dispatch_table[FLOAD_2] = &&L_ILOAD_2;
+        dispatch_table[ILOAD_3]   = &&L_ILOAD_3; dispatch_table[FLOAD_3] = &&L_ILOAD_3;
+        dispatch_table[LLOAD_0]   = &&L_LLOAD_0; dispatch_table[DLOAD_0] = &&L_LLOAD_0;
+        dispatch_table[LLOAD_1]   = &&L_LLOAD_1; dispatch_table[DLOAD_1] = &&L_LLOAD_1;
+        dispatch_table[LLOAD_2]   = &&L_LLOAD_2; dispatch_table[DLOAD_2] = &&L_LLOAD_2;
+        dispatch_table[LLOAD_3]   = &&L_LLOAD_3; dispatch_table[DLOAD_3] = &&L_LLOAD_3;
+        dispatch_table[ALOAD_0]   = &&L_ALOAD_0;
+        dispatch_table[ALOAD_1]   = &&L_ALOAD_1;
+        dispatch_table[ALOAD_2]   = &&L_ALOAD_2;
+        dispatch_table[ALOAD_3]   = &&L_ALOAD_3;
+        dispatch_table[IALOAD]    = &&L_IALOAD; dispatch_table[FALOAD] = &&L_IALOAD;
+        dispatch_table[LALOAD]    = &&L_LALOAD;
+        dispatch_table[AALOAD]    = &&L_AALOAD;
+        dispatch_table[BALOAD]    = &&L_BALOAD;
+        dispatch_table[CALOAD]    = &&L_CALOAD;
+        dispatch_table[SALOAD]    = &&L_SALOAD;
+        dispatch_table[ISTORE]    = &&L_ISTORE; dispatch_table[FSTORE] = &&L_ISTORE;
+        dispatch_table[LSTORE]    = &&L_LSTORE; dispatch_table[DSTORE] = &&L_LSTORE;
+        dispatch_table[ASTORE]    = &&L_ASTORE;
+        dispatch_table[ISTORE_0]  = &&L_ISTORE_0; dispatch_table[FSTORE_0] = &&L_ISTORE_0;
+        dispatch_table[ISTORE_1]  = &&L_ISTORE_1; dispatch_table[FSTORE_1] = &&L_ISTORE_1;
+        dispatch_table[ISTORE_2]  = &&L_ISTORE_2; dispatch_table[FSTORE_2] = &&L_ISTORE_2;
+        dispatch_table[ISTORE_3]  = &&L_ISTORE_3; dispatch_table[FSTORE_3] = &&L_ISTORE_3;
+        dispatch_table[LSTORE_0]  = &&L_LSTORE_0; dispatch_table[DSTORE_0] = &&L_LSTORE_0;
+        dispatch_table[LSTORE_1]  = &&L_LSTORE_1; dispatch_table[DSTORE_1] = &&L_LSTORE_1;
+        dispatch_table[LSTORE_2]  = &&L_LSTORE_2; dispatch_table[DSTORE_2] = &&L_LSTORE_2;
+        dispatch_table[LSTORE_3]  = &&L_LSTORE_3; dispatch_table[DSTORE_3] = &&L_LSTORE_3;
+        dispatch_table[ASTORE_0]  = &&L_ASTORE_0;
+        dispatch_table[ASTORE_1]  = &&L_ASTORE_1;
+        dispatch_table[ASTORE_2]  = &&L_ASTORE_2;
+        dispatch_table[ASTORE_3]  = &&L_ASTORE_3;
+        dispatch_table[IASTORE]   = &&L_IASTORE; dispatch_table[FASTORE] = &&L_IASTORE;
+        dispatch_table[LASTORE]   = &&L_LASTORE;
+        dispatch_table[AASTORE]   = &&L_AASTORE;
+        dispatch_table[BASTORE]   = &&L_BASTORE;
+        dispatch_table[CASTORE]   = &&L_CASTORE;
+        dispatch_table[SASTORE]   = &&L_SASTORE;
+        dispatch_table[POP]       = &&L_POP;
+        dispatch_table[POP2]      = &&L_POP2;
+        dispatch_table[DUP]       = &&L_DUP;
+        dispatch_table[DUP_X1]    = &&L_DUP_X1;
+        dispatch_table[DUP_X2]    = &&L_DUP_X2;
+        dispatch_table[DUP2]      = &&L_DUP2;
+        dispatch_table[DUP2_X1]   = &&L_DUP2_X1;
+        dispatch_table[DUP2_X2]   = &&L_DUP2_X2;
+        dispatch_table[SWAP]      = &&L_SWAP;
+        dispatch_table[IADD]      = &&L_IADD;
+        dispatch_table[ISUB]      = &&L_ISUB;
+        dispatch_table[IMUL]      = &&L_IMUL;
+        dispatch_table[IDIV]      = &&L_IDIV;
+        dispatch_table[IREM]      = &&L_IREM;
+        dispatch_table[INEG]      = &&L_INEG;
+        dispatch_table[ISHL]      = &&L_ISHL;
+        dispatch_table[ISHR]      = &&L_ISHR;
+        dispatch_table[IUSHR]     = &&L_IUSHR;
+        dispatch_table[IAND]      = &&L_IAND;
+        dispatch_table[IOR]       = &&L_IOR;
+        dispatch_table[IXOR]      = &&L_IXOR;
+        dispatch_table[FADD]      = &&L_FADD;
+        dispatch_table[FSUB]      = &&L_FSUB;
+        dispatch_table[FMUL]      = &&L_FMUL;
+        dispatch_table[FDIV]      = &&L_FDIV;
+        dispatch_table[FREM]      = &&L_FREM;
+        dispatch_table[FNEG]      = &&L_FNEG;
+        dispatch_table[DADD]      = &&L_DADD;
+        dispatch_table[DSUB]      = &&L_DSUB;
+        dispatch_table[DMUL]      = &&L_DMUL;
+        dispatch_table[DDIV]      = &&L_DDIV;
+        dispatch_table[DREM]      = &&L_DREM;
+        dispatch_table[DNEG]      = &&L_DNEG;
+        dispatch_table[LADD]      = &&L_LADD;
+        dispatch_table[LSUB]      = &&L_LSUB;
+        dispatch_table[LMUL]      = &&L_LMUL;
+        dispatch_table[LDIV]      = &&L_LDIV;
+        dispatch_table[LREM]      = &&L_LREM;
+        dispatch_table[LNEG]      = &&L_LNEG;
+        dispatch_table[LSHL]      = &&L_LSHL;
+        dispatch_table[LSHR]      = &&L_LSHR;
+        dispatch_table[LUSHR]     = &&L_LUSHR;
+        dispatch_table[LAND]      = &&L_LAND;
+        dispatch_table[LOR]       = &&L_LOR;
+        dispatch_table[LXOR]      = &&L_LXOR;
+        dispatch_table[LCMP]      = &&L_LCMP;
+        dispatch_table[I2L]       = &&L_I2L;
+        dispatch_table[I2F]       = &&L_I2F;
+        dispatch_table[I2D]       = &&L_I2D;
+        dispatch_table[L2I]       = &&L_L2I;
+        dispatch_table[L2F]       = &&L_L2F;
+        dispatch_table[L2D]       = &&L_L2D;
+        dispatch_table[F2I]       = &&L_F2I;
+        dispatch_table[F2L]       = &&L_F2L;
+        dispatch_table[F2D]       = &&L_F2D;
+        dispatch_table[D2I]       = &&L_D2I;
+        dispatch_table[D2L]       = &&L_D2L;
+        dispatch_table[D2F]       = &&L_D2F;
+        dispatch_table[I2B]       = &&L_I2B;
+        dispatch_table[I2C]       = &&L_I2C;
+        dispatch_table[I2S]       = &&L_I2S;
+        dispatch_table[IINC]      = &&L_IINC;
+        dispatch_table[IFEQ]      = &&L_IFEQ;
+        dispatch_table[IFNE]      = &&L_IFNE;
+        dispatch_table[IFLT]      = &&L_IFLT;
+        dispatch_table[IFGE]      = &&L_IFGE;
+        dispatch_table[IFGT]      = &&L_IFGT;
+        dispatch_table[IFLE]      = &&L_IFLE;
+        dispatch_table[IFNULL]    = &&L_IFNULL;
+        dispatch_table[IFNONNULL] = &&L_IFNONNULL;
+        dispatch_table[IF_ICMPEQ] = &&L_IF_ICMPEQ;
+        dispatch_table[IF_ICMPNE] = &&L_IF_ICMPNE;
+        dispatch_table[IF_ICMPLT] = &&L_IF_ICMPLT;
+        dispatch_table[IF_ICMPGE] = &&L_IF_ICMPGE;
+        dispatch_table[IF_ICMPGT] = &&L_IF_ICMPGT;
+        dispatch_table[IF_ICMPLE] = &&L_IF_ICMPLE;
+        dispatch_table[IF_ACMPEQ] = &&L_IF_ACMPEQ;
+        dispatch_table[IF_ACMPNE] = &&L_IF_ACMPNE;
+        dispatch_table[GOTO]      = &&L_GOTO;
+        dispatch_table[TABLESWITCH]  = &&L_TABLESWITCH;
+        dispatch_table[LOOKUPSWITCH] = &&L_LOOKUPSWITCH;
+        dispatch_table[RETURN]    = &&L_RETURN;
+        dispatch_table[IRETURN]   = &&L_RETURN;
+        dispatch_table[LRETURN]   = &&L_RETURN;
+        dispatch_table[ARETURN]   = &&L_RETURN;
+        dispatch_table[GETSTATIC] = &&L_GETSTATIC;
+        dispatch_table[PUTSTATIC] = &&L_PUTSTATIC;
+        dispatch_table[GETFIELD]  = &&L_GETFIELD;
+        dispatch_table[PUTFIELD]  = &&L_PUTFIELD;
+        dispatch_table[INVOKESTATIC]    = &&L_INVOKESTATIC;
+        dispatch_table[INVOKEVIRTUAL]   = &&L_INVOKEVIRTUAL;
+        dispatch_table[INVOKEINTERFACE] = &&L_INVOKEVIRTUAL;
+        dispatch_table[INVOKESPECIAL]   = &&L_INVOKESPECIAL;
+        dispatch_table[NEW]       = &&L_NEW;
+        dispatch_table[NEWARRAY]  = &&L_NEWARRAY;
+        dispatch_table[ANEWARRAY] = &&L_ANEWARRAY;
+        dispatch_table[MULTIANEWARRAY] = &&L_MULTIANEWARRAY;
+        dispatch_table[ARRAYLENGTH]    = &&L_ARRAYLENGTH;
+        dispatch_table[CHECKCAST] = &&L_CHECKCAST;
+        dispatch_table[INSTANCEOF] = &&L_INSTANCEOF;
+        dispatch_table[ATHROW]    = &&L_ATHROW;
+        dispatch_table[MONITORENTER] = &&L_MONITORENTER;
+        dispatch_table[MONITOREXIT]  = &&L_MONITOREXIT;
+        dispatch_table[WIDE]      = &&L_WIDE;
+        dispatch_init = true;
+    }
 
-        switch (op) {
+    uint8_t op = 0;
+
+#define TRACE_OP() do { \
+    if (__builtin_expect(g_trace, 0)) { \
+        fprintf(stderr, "  [%-30s %-20s] pc=%4u sp=%2u op=0x%02x\n", \
+            f.klass  ? f.klass->name.c_str()  : "?", \
+            f.method ? f.method->name.c_str() : "?", \
+            f.pc, f.sp, code[f.pc]); \
+    } \
+} while (0)
+#define DISPATCH() do { TRACE_OP(); op = code[f.pc++]; goto *dispatch_table[op]; } while (0)
+
+    // Outer while+try so exception handlers can `continue` to re-enter dispatch
+    // at an updated pc.
+    while (true) {
+    try {
+        DISPATCH();
 
         // ── Constants ─────────────────────────────────────────────────────────
-        case NOP:          break;
-        case ACONST_NULL:  f.push_ref(NULL_REF); break;
-        case ICONST_M1:    f.push_int(-1); break;
-        case ICONST_0:     f.push_int(0);  break;
-        case ICONST_1:     f.push_int(1);  break;
-        case ICONST_2:     f.push_int(2);  break;
-        case ICONST_3:     f.push_int(3);  break;
-        case ICONST_4:     f.push_int(4);  break;
-        case ICONST_5:     f.push_int(5);  break;
-        case LCONST_0:     f.push_long(0); break;
-        case LCONST_1:     f.push_long(1); break;
-        case FCONST_0:     f.push_float(0.0f); break;
-        case FCONST_1:     f.push_float(1.0f); break;
-        case FCONST_2:     f.push_float(2.0f); break;
-        case DCONST_0:     f.push_double(0.0); break;
-        case DCONST_1:     f.push_double(1.0); break;
+        L_NOP:          DISPATCH();
+        L_ACONST_NULL:  f.push_ref(NULL_REF); DISPATCH();
+        L_ICONST_M1:    f.push_int(-1); DISPATCH();
+        L_ICONST_0:     f.push_int(0);  DISPATCH();
+        L_ICONST_1:     f.push_int(1);  DISPATCH();
+        L_ICONST_2:     f.push_int(2);  DISPATCH();
+        L_ICONST_3:     f.push_int(3);  DISPATCH();
+        L_ICONST_4:     f.push_int(4);  DISPATCH();
+        L_ICONST_5:     f.push_int(5);  DISPATCH();
+        L_LCONST_0:     f.push_long(0); DISPATCH();
+        L_LCONST_1:     f.push_long(1); DISPATCH();
+        L_FCONST_0:     f.push_float(0.0f); DISPATCH();
+        L_FCONST_1:     f.push_float(1.0f); DISPATCH();
+        L_FCONST_2:     f.push_float(2.0f); DISPATCH();
+        L_DCONST_0:     f.push_double(0.0); DISPATCH();
+        L_DCONST_1:     f.push_double(1.0); DISPATCH();
 
-        case BIPUSH:  f.push_int(bc_s1(code, f.pc)); f.pc += 1; break;
-        case SIPUSH:  f.push_int(bc_s2(code, f.pc)); f.pc += 2; break;
+        L_BIPUSH:  f.push_int(bc_s1(code, f.pc)); f.pc += 1; DISPATCH();
+        L_SIPUSH:  f.push_int(bc_s2(code, f.pc)); f.pc += 2; DISPATCH();
 
-        case LDC:
+        L_LDC:
             exec_ldc(*this, f, *cf_ptr, bc_u1(code, f.pc));
-            f.pc += 1; break;
-        case LDC_W:
-        case LDC2_W:
+            f.pc += 1; DISPATCH();
+        L_LDC_W:
             exec_ldc(*this, f, *cf_ptr, bc_u2(code, f.pc));
-            f.pc += 2; break;
+            f.pc += 2; DISPATCH();
 
         // ── Loads ─────────────────────────────────────────────────────────────
-        case ILOAD: case FLOAD: f.push(f.locals[bc_u1(code,f.pc)]); f.pc+=1; break;
-        case LLOAD: case DLOAD: {
+        L_ILOAD: f.push(f.locals[bc_u1(code,f.pc)]); f.pc+=1; DISPATCH();
+        L_LLOAD: {
             uint8_t idx = bc_u1(code,f.pc); f.pc+=1;
-            f.push_long(f.get_long(idx)); break;
+            f.push_long(f.get_long(idx)); DISPATCH();
         }
-        case ALOAD: f.push(f.locals[bc_u1(code,f.pc)]); f.pc+=1; break;
+        L_ALOAD: f.push(f.locals[bc_u1(code,f.pc)]); f.pc+=1; DISPATCH();
 
-        case ILOAD_0: case FLOAD_0: f.push(f.locals[0]); break;
-        case ILOAD_1: case FLOAD_1: f.push(f.locals[1]); break;
-        case ILOAD_2: case FLOAD_2: f.push(f.locals[2]); break;
-        case ILOAD_3: case FLOAD_3: f.push(f.locals[3]); break;
+        L_ILOAD_0: f.push(f.locals[0]); DISPATCH();
+        L_ILOAD_1: f.push(f.locals[1]); DISPATCH();
+        L_ILOAD_2: f.push(f.locals[2]); DISPATCH();
+        L_ILOAD_3: f.push(f.locals[3]); DISPATCH();
 
-        case LLOAD_0: case DLOAD_0: f.push_long(f.get_long(0)); break;
-        case LLOAD_1: case DLOAD_1: f.push_long(f.get_long(1)); break;
-        case LLOAD_2: case DLOAD_2: f.push_long(f.get_long(2)); break;
-        case LLOAD_3: case DLOAD_3: f.push_long(f.get_long(3)); break;
+        L_LLOAD_0: f.push_long(f.get_long(0)); DISPATCH();
+        L_LLOAD_1: f.push_long(f.get_long(1)); DISPATCH();
+        L_LLOAD_2: f.push_long(f.get_long(2)); DISPATCH();
+        L_LLOAD_3: f.push_long(f.get_long(3)); DISPATCH();
 
-        case ALOAD_0: f.push(f.locals[0]); break;
-        case ALOAD_1: f.push(f.locals[1]); break;
-        case ALOAD_2: f.push(f.locals[2]); break;
-        case ALOAD_3: f.push(f.locals[3]); break;
+        L_ALOAD_0: f.push(f.locals[0]); DISPATCH();
+        L_ALOAD_1: f.push(f.locals[1]); DISPATCH();
+        L_ALOAD_2: f.push(f.locals[2]); DISPATCH();
+        L_ALOAD_3: f.push(f.locals[3]); DISPATCH();
 
         // ── Array loads ───────────────────────────────────────────────────────
-        case IALOAD: case FALOAD: {
+        L_IALOAD: {
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push(obj->array_slots()[idx]);
-            break;
+            DISPATCH();
         }
-        case LALOAD: {
+        L_LALOAD: {
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push_long(obj->array_longs()[idx]);
-            break;
+            DISPATCH();
         }
-        case AALOAD: {
+        L_AALOAD: {
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push_ref(obj->array_slots()[idx].as_ref());
-            break;
+            DISPATCH();
         }
-        case BALOAD: {
+        L_BALOAD: {
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push_int(static_cast<int8_t>(obj->array_bytes()[idx]));
-            break;
+            DISPATCH();
         }
-        case CALOAD: {
+        L_CALOAD: {
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push_int(obj->array_shorts()[idx]);
-            break;
+            DISPATCH();
         }
-        case SALOAD: {
+        L_SALOAD: {
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push_int(static_cast<int16_t>(obj->array_shorts()[idx]));
-            break;
+            DISPATCH();
         }
 
         // ── Stores ────────────────────────────────────────────────────────────
-        case ISTORE: case FSTORE: f.locals[bc_u1(code,f.pc)] = f.pop(); f.pc+=1; break;
-        case LSTORE: case DSTORE: {
+        L_ISTORE: f.locals[bc_u1(code,f.pc)] = f.pop(); f.pc+=1; DISPATCH();
+        L_LSTORE: {
             uint8_t idx = bc_u1(code,f.pc); f.pc+=1;
-            f.set_long(idx, f.pop_long()); break;
+            f.set_long(idx, f.pop_long()); DISPATCH();
         }
-        case ASTORE: f.locals[bc_u1(code,f.pc)] = f.pop(); f.pc+=1; break;
+        L_ASTORE: f.locals[bc_u1(code,f.pc)] = f.pop(); f.pc+=1; DISPATCH();
 
-        case ISTORE_0: case FSTORE_0: f.locals[0] = f.pop(); break;
-        case ISTORE_1: case FSTORE_1: f.locals[1] = f.pop(); break;
-        case ISTORE_2: case FSTORE_2: f.locals[2] = f.pop(); break;
-        case ISTORE_3: case FSTORE_3: f.locals[3] = f.pop(); break;
+        L_ISTORE_0: f.locals[0] = f.pop(); DISPATCH();
+        L_ISTORE_1: f.locals[1] = f.pop(); DISPATCH();
+        L_ISTORE_2: f.locals[2] = f.pop(); DISPATCH();
+        L_ISTORE_3: f.locals[3] = f.pop(); DISPATCH();
 
-        case LSTORE_0: case DSTORE_0: f.set_long(0, f.pop_long()); break;
-        case LSTORE_1: case DSTORE_1: f.set_long(1, f.pop_long()); break;
-        case LSTORE_2: case DSTORE_2: f.set_long(2, f.pop_long()); break;
-        case LSTORE_3: case DSTORE_3: f.set_long(3, f.pop_long()); break;
+        L_LSTORE_0: f.set_long(0, f.pop_long()); DISPATCH();
+        L_LSTORE_1: f.set_long(1, f.pop_long()); DISPATCH();
+        L_LSTORE_2: f.set_long(2, f.pop_long()); DISPATCH();
+        L_LSTORE_3: f.set_long(3, f.pop_long()); DISPATCH();
 
-        case ASTORE_0: f.locals[0] = f.pop(); break;
-        case ASTORE_1: f.locals[1] = f.pop(); break;
-        case ASTORE_2: f.locals[2] = f.pop(); break;
-        case ASTORE_3: f.locals[3] = f.pop(); break;
+        L_ASTORE_0: f.locals[0] = f.pop(); DISPATCH();
+        L_ASTORE_1: f.locals[1] = f.pop(); DISPATCH();
+        L_ASTORE_2: f.locals[2] = f.pop(); DISPATCH();
+        L_ASTORE_3: f.locals[3] = f.pop(); DISPATCH();
 
         // ── Array stores ──────────────────────────────────────────────────────
-        case IASTORE: case FASTORE: {
+        L_IASTORE: {
             Slot    val = f.pop();
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             obj->array_slots()[idx] = val;
-            break;
+            DISPATCH();
         }
-        case LASTORE: {
+        L_LASTORE: {
             int64_t val = f.pop_long();
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             obj->array_longs()[idx] = val;
-            break;
+            DISPATCH();
         }
-        case AASTORE: {
+        L_AASTORE: {
             ObjRef  val = f.pop_ref();
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             obj->array_slots()[idx] = Slot::from_ref(val);
-            break;
+            DISPATCH();
         }
-        case BASTORE: {
+        L_BASTORE: {
             int32_t val = f.pop_int();
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             obj->array_bytes()[idx] = static_cast<uint8_t>(val);
-            break;
+            DISPATCH();
         }
-        case CASTORE: {
+        L_CASTORE: {
             int32_t val = f.pop_int();
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             obj->array_shorts()[idx] = static_cast<uint16_t>(val);
-            break;
+            DISPATCH();
         }
-        case SASTORE: {
+        L_SASTORE: {
             int32_t val = f.pop_int();
             int32_t idx = f.pop_int();
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             obj->array_shorts()[idx] = static_cast<uint16_t>(val);
-            break;
+            DISPATCH();
         }
 
         // ── Stack manipulation ────────────────────────────────────────────────
-        case POP:   f.pop(); break;
-        case POP2:  f.pop(); f.pop(); break;
-        case DUP:   f.push(f.peek()); break;
-        case DUP_X1: {
+        L_POP:   f.pop(); DISPATCH();
+        L_POP2:  f.pop(); f.pop(); DISPATCH();
+        L_DUP:   f.push(f.peek()); DISPATCH();
+        L_DUP_X1: {
             Slot v1 = f.pop(), v2 = f.pop();
             f.push(v1); f.push(v2); f.push(v1);
-            break;
+            DISPATCH();
         }
-        case DUP_X2: {
+        L_DUP_X2: {
             // Form 1: ..., v3, v2, v1 → ..., v1, v3, v2, v1
             Slot v1 = f.pop(), v2 = f.pop(), v3 = f.pop();
             f.push(v1); f.push(v3); f.push(v2); f.push(v1);
-            break;
+            DISPATCH();
         }
-        case DUP2: {
+        L_DUP2: {
             Slot v1 = f.peek(0), v2 = f.peek(1);
             f.push(v2); f.push(v1);
-            break;
+            DISPATCH();
         }
-        case DUP2_X1: {
+        L_DUP2_X1: {
             // ..., v3, v2, v1 → ..., v2, v1, v3, v2, v1
             Slot v1 = f.pop(), v2 = f.pop(), v3 = f.pop();
             f.push(v2); f.push(v1); f.push(v3); f.push(v2); f.push(v1);
-            break;
+            DISPATCH();
         }
-        case DUP2_X2: {
+        L_DUP2_X2: {
             // ..., v4, v3, v2, v1 → ..., v2, v1, v4, v3, v2, v1
             Slot v1 = f.pop(), v2 = f.pop(), v3 = f.pop(), v4 = f.pop();
             f.push(v2); f.push(v1); f.push(v4); f.push(v3); f.push(v2); f.push(v1);
-            break;
+            DISPATCH();
         }
-        case SWAP: {
+        L_SWAP: {
             Slot v1 = f.pop(), v2 = f.pop();
             f.push(v1); f.push(v2);
-            break;
+            DISPATCH();
         }
 
         // ── Integer arithmetic ────────────────────────────────────────────────
-        case IADD: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a+b); break; }
-        case ISUB: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a-b); break; }
-        case IMUL: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a*b); break; }
-        case IDIV: {
+        L_IADD: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a+b); DISPATCH(); }
+        L_ISUB: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a-b); DISPATCH(); }
+        L_IMUL: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a*b); DISPATCH(); }
+        L_IDIV: {
             int32_t b=f.pop_int(), a=f.pop_int();
             if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
-            f.push_int(a/b); break;
+            f.push_int(a/b); DISPATCH();
         }
-        case IREM: {
+        L_IREM: {
             int32_t b=f.pop_int(), a=f.pop_int();
             if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
-            f.push_int(a%b); break;
+            f.push_int(a%b); DISPATCH();
         }
-        case INEG: f.push_int(-f.pop_int()); break;
-        case ISHL: { int32_t s=f.pop_int()&0x1f, v=f.pop_int(); f.push_int(v<<s); break; }
-        case ISHR: { int32_t s=f.pop_int()&0x1f, v=f.pop_int(); f.push_int(v>>s); break; }
-        case IUSHR:{ int32_t s=f.pop_int()&0x1f; uint32_t v=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(v>>s)); break; }
-        case IAND: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a&b); break; }
-        case IOR:  { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a|b); break; }
-        case IXOR: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a^b); break; }
+        L_INEG: f.push_int(-f.pop_int()); DISPATCH();
+        L_ISHL: { int32_t s=f.pop_int()&0x1f, v=f.pop_int(); f.push_int(v<<s); DISPATCH(); }
+        L_ISHR: { int32_t s=f.pop_int()&0x1f, v=f.pop_int(); f.push_int(v>>s); DISPATCH(); }
+        L_IUSHR:{ int32_t s=f.pop_int()&0x1f; uint32_t v=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(v>>s)); DISPATCH(); }
+        L_IAND: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a&b); DISPATCH(); }
+        L_IOR:  { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a|b); DISPATCH(); }
+        L_IXOR: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a^b); DISPATCH(); }
 
         // ── Float arithmetic ──────────────────────────────────────────────────
-        case FADD: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a+b);  break; }
-        case FSUB: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a-b);  break; }
-        case FMUL: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a*b);  break; }
-        case FDIV: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a/b);  break; }
-        case FREM: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(std::fmod(a,b)); break; }
-        case FNEG: { f.push_float(-f.pop_float()); break; }
+        L_FADD: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a+b);  DISPATCH(); }
+        L_FSUB: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a-b);  DISPATCH(); }
+        L_FMUL: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a*b);  DISPATCH(); }
+        L_FDIV: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(a/b);  DISPATCH(); }
+        L_FREM: { float  b=f.pop_float(),  a=f.pop_float();  f.push_float(std::fmod(a,b)); DISPATCH(); }
+        L_FNEG: { f.push_float(-f.pop_float()); DISPATCH(); }
 
         // ── Double arithmetic ─────────────────────────────────────────────────
-        case DADD: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a+b); break; }
-        case DSUB: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a-b); break; }
-        case DMUL: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a*b); break; }
-        case DDIV: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a/b); break; }
-        case DREM: { double b=f.pop_double(), a=f.pop_double(); f.push_double(std::fmod(a,b)); break; }
-        case DNEG: { f.push_double(-f.pop_double()); break; }
+        L_DADD: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a+b); DISPATCH(); }
+        L_DSUB: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a-b); DISPATCH(); }
+        L_DMUL: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a*b); DISPATCH(); }
+        L_DDIV: { double b=f.pop_double(), a=f.pop_double(); f.push_double(a/b); DISPATCH(); }
+        L_DREM: { double b=f.pop_double(), a=f.pop_double(); f.push_double(std::fmod(a,b)); DISPATCH(); }
+        L_DNEG: { f.push_double(-f.pop_double()); DISPATCH(); }
 
         // ── Long arithmetic ───────────────────────────────────────────────────
-        case LADD: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a+b); break; }
-        case LSUB: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a-b); break; }
-        case LMUL: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a*b); break; }
-        case LDIV: { int64_t b=f.pop_long(), a=f.pop_long();
+        L_LADD: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a+b); DISPATCH(); }
+        L_LSUB: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a-b); DISPATCH(); }
+        L_LMUL: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a*b); DISPATCH(); }
+        L_LDIV: { int64_t b=f.pop_long(), a=f.pop_long();
                      if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
-                     f.push_long(a/b); break; }
-        case LREM: { int64_t b=f.pop_long(), a=f.pop_long();
+                     f.push_long(a/b); DISPATCH(); }
+        L_LREM: { int64_t b=f.pop_long(), a=f.pop_long();
                      if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
-                     f.push_long(a%b); break; }
-        case LNEG: { f.push_long(-f.pop_long()); break; }
-        case LSHL: { int32_t s=f.pop_int()&0x3f; int64_t v=f.pop_long(); f.push_long(v<<s); break; }
-        case LSHR: { int32_t s=f.pop_int()&0x3f; int64_t v=f.pop_long(); f.push_long(v>>s); break; }
-        case LUSHR:{ int32_t s=f.pop_int()&0x3f; uint64_t v=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(v>>s)); break; }
-        case LAND: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a&b); break; }
-        case LOR:  { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a|b); break; }
-        case LXOR: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a^b); break; }
-        case LCMP: {
+                     f.push_long(a%b); DISPATCH(); }
+        L_LNEG: { f.push_long(-f.pop_long()); DISPATCH(); }
+        L_LSHL: { int32_t s=f.pop_int()&0x3f; int64_t v=f.pop_long(); f.push_long(v<<s); DISPATCH(); }
+        L_LSHR: { int32_t s=f.pop_int()&0x3f; int64_t v=f.pop_long(); f.push_long(v>>s); DISPATCH(); }
+        L_LUSHR:{ int32_t s=f.pop_int()&0x3f; uint64_t v=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(v>>s)); DISPATCH(); }
+        L_LAND: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a&b); DISPATCH(); }
+        L_LOR:  { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a|b); DISPATCH(); }
+        L_LXOR: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a^b); DISPATCH(); }
+        L_LCMP: {
             int64_t b=f.pop_long(), a=f.pop_long();
-            f.push_int(a>b ? 1 : a<b ? -1 : 0); break;
+            f.push_int(a>b ? 1 : a<b ? -1 : 0); DISPATCH();
         }
 
         // ── Conversions ───────────────────────────────────────────────────────
-        case I2L:  f.push_long  (f.pop_int());                                 break;
-        case I2F:  f.push_float (static_cast<float> (f.pop_int()));            break;
-        case I2D:  f.push_double(static_cast<double>(f.pop_int()));            break;
-        case L2I:  f.push_int   (static_cast<int32_t>(f.pop_long()));          break;
-        case L2F:  f.push_float (static_cast<float>  (f.pop_long()));          break;
-        case L2D:  f.push_double(static_cast<double> (f.pop_long()));          break;
-        case F2I:  f.push_int   (static_cast<int32_t>(f.pop_float()));         break;
-        case F2L:  f.push_long  (static_cast<int64_t>(f.pop_float()));         break;
-        case F2D:  f.push_double(static_cast<double> (f.pop_float()));         break;
-        case D2I:  f.push_int   (static_cast<int32_t>(f.pop_double()));        break;
-        case D2L:  f.push_long  (static_cast<int64_t>(f.pop_double()));        break;
-        case D2F:  f.push_float (static_cast<float>  (f.pop_double()));        break;
-        case I2B:  f.push_int(static_cast<int32_t>(static_cast<int8_t> (f.pop_int()))); break;
-        case I2C:  f.push_int(static_cast<int32_t>(static_cast<uint16_t>(f.pop_int()))); break;
-        case I2S:  f.push_int(static_cast<int32_t>(static_cast<int16_t> (f.pop_int()))); break;
+        L_I2L:  f.push_long  (f.pop_int());                                 DISPATCH();
+        L_I2F:  f.push_float (static_cast<float> (f.pop_int()));            DISPATCH();
+        L_I2D:  f.push_double(static_cast<double>(f.pop_int()));            DISPATCH();
+        L_L2I:  f.push_int   (static_cast<int32_t>(f.pop_long()));          DISPATCH();
+        L_L2F:  f.push_float (static_cast<float>  (f.pop_long()));          DISPATCH();
+        L_L2D:  f.push_double(static_cast<double> (f.pop_long()));          DISPATCH();
+        L_F2I:  f.push_int   (static_cast<int32_t>(f.pop_float()));         DISPATCH();
+        L_F2L:  f.push_long  (static_cast<int64_t>(f.pop_float()));         DISPATCH();
+        L_F2D:  f.push_double(static_cast<double> (f.pop_float()));         DISPATCH();
+        L_D2I:  f.push_int   (static_cast<int32_t>(f.pop_double()));        DISPATCH();
+        L_D2L:  f.push_long  (static_cast<int64_t>(f.pop_double()));        DISPATCH();
+        L_D2F:  f.push_float (static_cast<float>  (f.pop_double()));        DISPATCH();
+        L_I2B:  f.push_int(static_cast<int32_t>(static_cast<int8_t> (f.pop_int()))); DISPATCH();
+        L_I2C:  f.push_int(static_cast<int32_t>(static_cast<uint16_t>(f.pop_int()))); DISPATCH();
+        L_I2S:  f.push_int(static_cast<int32_t>(static_cast<int16_t> (f.pop_int()))); DISPATCH();
 
         // ── IINC ─────────────────────────────────────────────────────────────
-        case IINC: {
+        L_IINC: {
             uint8_t idx = bc_u1(code, f.pc);
             int8_t  c   = bc_s1(code, f.pc+1);
             f.locals[idx].raw += c;
-            f.pc += 2; break;
+            f.pc += 2; DISPATCH();
         }
 
         // ── Branches ──────────────────────────────────────────────────────────
         // Branch offsets are relative to the opcode's own address (f.pc-1).
         // Save base = opcode address, then set f.pc = base + off if taken.
-        #define BRANCH(cond) { uint32_t base=f.pc-1; int16_t off=bc_s2(code,f.pc); f.pc+=2; if(cond) f.pc=static_cast<uint32_t>(base+off); break; }
-        case IFEQ:      { int32_t v=f.pop_int(); BRANCH(v==0) }
-        case IFNE:      { int32_t v=f.pop_int(); BRANCH(v!=0) }
-        case IFLT:      { int32_t v=f.pop_int(); BRANCH(v< 0) }
-        case IFGE:      { int32_t v=f.pop_int(); BRANCH(v>=0) }
-        case IFGT:      { int32_t v=f.pop_int(); BRANCH(v> 0) }
-        case IFLE:      { int32_t v=f.pop_int(); BRANCH(v<=0) }
-        case IFNULL:    { ObjRef r=f.pop_ref(); BRANCH(r==NULL_REF) }
-        case IFNONNULL: { ObjRef r=f.pop_ref(); BRANCH(r!=NULL_REF) }
-        case IF_ICMPEQ: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a==b) }
-        case IF_ICMPNE: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a!=b) }
-        case IF_ICMPLT: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a< b) }
-        case IF_ICMPGE: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a>=b) }
-        case IF_ICMPGT: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a> b) }
-        case IF_ICMPLE: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a<=b) }
-        case IF_ACMPEQ: { ObjRef b=f.pop_ref(),a=f.pop_ref(); BRANCH(a==b) }
-        case IF_ACMPNE: { ObjRef b=f.pop_ref(),a=f.pop_ref(); BRANCH(a!=b) }
+        #define BRANCH(cond) { uint32_t base=f.pc-1; int16_t off=bc_s2(code,f.pc); f.pc+=2; if(cond) f.pc=static_cast<uint32_t>(base+off); DISPATCH(); }
+        L_IFEQ:      { int32_t v=f.pop_int(); BRANCH(v==0) }
+        L_IFNE:      { int32_t v=f.pop_int(); BRANCH(v!=0) }
+        L_IFLT:      { int32_t v=f.pop_int(); BRANCH(v< 0) }
+        L_IFGE:      { int32_t v=f.pop_int(); BRANCH(v>=0) }
+        L_IFGT:      { int32_t v=f.pop_int(); BRANCH(v> 0) }
+        L_IFLE:      { int32_t v=f.pop_int(); BRANCH(v<=0) }
+        L_IFNULL:    { ObjRef r=f.pop_ref(); BRANCH(r==NULL_REF) }
+        L_IFNONNULL: { ObjRef r=f.pop_ref(); BRANCH(r!=NULL_REF) }
+        L_IF_ICMPEQ: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a==b) }
+        L_IF_ICMPNE: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a!=b) }
+        L_IF_ICMPLT: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a< b) }
+        L_IF_ICMPGE: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a>=b) }
+        L_IF_ICMPGT: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a> b) }
+        L_IF_ICMPLE: { int32_t b=f.pop_int(),a=f.pop_int(); BRANCH(a<=b) }
+        L_IF_ACMPEQ: { ObjRef b=f.pop_ref(),a=f.pop_ref(); BRANCH(a==b) }
+        L_IF_ACMPNE: { ObjRef b=f.pop_ref(),a=f.pop_ref(); BRANCH(a!=b) }
         #undef BRANCH
 
-        case GOTO: {
+        L_GOTO: {
             int16_t off = bc_s2(code, f.pc);
             f.pc += off - 1;  // -1 because we already incremented past opcode
-            break;
+            DISPATCH();
         }
 
         // ── tableswitch ───────────────────────────────────────────────────────
-        case TABLESWITCH: {
+        L_TABLESWITCH: {
             uint32_t base_pc = f.pc - 1;
             // Align to 4-byte boundary after the opcode
             uint32_t pad = (4 - (f.pc % 4)) % 4;
@@ -774,11 +958,11 @@ dispatch_loop:
                 offset = bc_s4(code, f.pc + entry * 4);
             }
             f.pc = static_cast<uint32_t>(static_cast<int32_t>(base_pc) + offset);
-            break;
+            DISPATCH();
         }
 
         // ── lookupswitch ──────────────────────────────────────────────────────
-        case LOOKUPSWITCH: {
+        L_LOOKUPSWITCH: {
             uint32_t base_pc = f.pc - 1;
             uint32_t pad = (4 - (f.pc % 4)) % 4;
             f.pc += pad;
@@ -793,26 +977,23 @@ dispatch_loop:
                 if (key == match) { offset = off; break; }
             }
             f.pc = static_cast<uint32_t>(static_cast<int32_t>(base_pc) + offset);
-            break;
+            DISPATCH();
         }
 
         // ── Returns ───────────────────────────────────────────────────────────
-        case RETURN:  return;
-        case IRETURN: return;  // return value already on stack
-        case LRETURN: return;
-        case ARETURN: return;
+        L_RETURN: return;
 
         // ── Static fields ─────────────────────────────────────────────────────
-        case GETSTATIC: {
+        L_GETSTATIC: {
             auto [klass, fd] = resolve_field(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             initialize_class(klass);
             f.push(klass->static_slot(fd->slot_index));
             if (fd->is_long() || fd->is_double())
                 f.push(klass->static_slot(fd->slot_index + 1));
-            break;
+            DISPATCH();
         }
-        case PUTSTATIC: {
+        L_PUTSTATIC: {
             auto [klass, fd] = resolve_field(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             initialize_class(klass);
@@ -823,11 +1004,11 @@ dispatch_loop:
                 Slot val = f.pop();
                 klass->static_slot(fd->slot_index) = val;
             }
-            break;
+            DISPATCH();
         }
 
         // ── Instance fields ───────────────────────────────────────────────────
-        case GETFIELD: {
+        L_GETFIELD: {
             auto [klass, fd] = resolve_field(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             ObjRef ref = f.pop_ref();
@@ -836,9 +1017,9 @@ dispatch_loop:
             f.push(obj->field(fd->slot_index));
             if (fd->is_long() || fd->is_double())
                 f.push(obj->field(fd->slot_index + 1));
-            break;
+            DISPATCH();
         }
-        case PUTFIELD: {
+        L_PUTFIELD: {
             auto [klass, fd] = resolve_field(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             if (fd->is_long() || fd->is_double()) {
@@ -855,20 +1036,19 @@ dispatch_loop:
                 if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
                 obj->field(fd->slot_index) = val;
             }
-            break;
+            DISPATCH();
         }
 
         // ── Invocations ───────────────────────────────────────────────────────
-        case INVOKESTATIC: {
+        L_INVOKESTATIC: {
             auto [klass, md] = resolve_method(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             initialize_class(klass);
             uint32_t nslots = md->arg_slot_count;
             do_invoke(*this, f, md, klass, nslots);
-            break;
+            DISPATCH();
         }
-        case INVOKEVIRTUAL:
-        case INVOKEINTERFACE: {
+        L_INVOKEVIRTUAL: {
             uint16_t cp_idx = bc_u2(code, f.pc);
             auto [klass, md] = resolve_method(*cf_ptr, cp_idx);
             uint32_t call_site_pc = f.pc - 1;  // pc was already past the opcode
@@ -897,24 +1077,24 @@ dispatch_loop:
                               (static_cast<uint64_t>(call_site_pc) * 0x9E3779B97F4A7C15ULL);
             MethodDef* vmd = vi_lookup(ic_key, actual, md);
             do_invoke(*this, f, vmd, actual ? actual : klass, nslots);
-            break;
+            DISPATCH();
         }
-        case INVOKESPECIAL: {
+        L_INVOKESPECIAL: {
             auto [klass, md] = resolve_method(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             uint32_t nslots = md->arg_slot_count + 1;
             do_invoke(*this, f, md, klass, nslots);
-            break;
+            DISPATCH();
         }
 
         // ── Object creation ───────────────────────────────────────────────────
-        case NEW: {
+        L_NEW: {
             ClassDef* klass = resolve_class(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             f.push_ref(new_object(klass));
-            break;
+            DISPATCH();
         }
-        case NEWARRAY: {
+        L_NEWARRAY: {
             uint8_t  atype  = bc_u1(code, f.pc); f.pc += 1;
             int32_t  length = f.pop_int();
             ArrayType at    = static_cast<ArrayType>(atype);
@@ -927,9 +1107,9 @@ dispatch_loop:
                           m_loader.find_or_stub("[B"));
             if (arr == NULL_REF) throw std::runtime_error("OutOfMemoryError");
             f.push_ref(arr);
-            break;
+            DISPATCH();
         }
-        case ANEWARRAY: {
+        L_ANEWARRAY: {
             ClassDef* elem = resolve_class(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             int32_t length = f.pop_int();
@@ -937,9 +1117,9 @@ dispatch_loop:
                              m_loader.find_or_stub("[L" + elem->name + ";"));
             if (arr == NULL_REF) throw std::runtime_error("OutOfMemoryError");
             f.push_ref(arr);
-            break;
+            DISPATCH();
         }
-        case MULTIANEWARRAY: {
+        L_MULTIANEWARRAY: {
             uint16_t cp_idx = bc_u2(code, f.pc); f.pc += 2;
             uint8_t  dims   = bc_u1(code, f.pc); f.pc += 1;
             ClassDef* klass = resolve_class(*cf_ptr, cp_idx);
@@ -961,44 +1141,44 @@ dispatch_loop:
                 }
             }
             f.push_ref(outer);
-            break;
+            DISPATCH();
         }
-        case ARRAYLENGTH: {
+        L_ARRAYLENGTH: {
             ObjRef arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push_int(obj->array_length());
-            break;
+            DISPATCH();
         }
 
         // ── Type checks ───────────────────────────────────────────────────────
-        case CHECKCAST: {
+        L_CHECKCAST: {
             f.pc += 2;  // skip CP index; no-op for now (trust the game)
-            break;
+            DISPATCH();
         }
-        case INSTANCEOF: {
+        L_INSTANCEOF: {
             ClassDef* target = resolve_class(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             ObjRef ref = f.pop_ref();
-            if (ref == NULL_REF) { f.push_int(0); break; }
+            if (ref == NULL_REF) { f.push_int(0); DISPATCH(); }
             auto* obj = m_heap.deref(ref);
             bool result = obj && obj->klass && obj->klass->is_subclass_of(target);
             f.push_int(result ? 1 : 0);
-            break;
+            DISPATCH();
         }
 
         // ── Exception ─────────────────────────────────────────────────────────
-        case ATHROW: {
+        L_ATHROW: {
             ObjRef ex = f.pop_ref();
             throw JvmException{ex, "Java exception thrown"};
         }
 
         // ── Monitors (no-op; J2ME games are mostly single-threaded in logic) ──
-        case MONITORENTER: f.pop_ref(); break;
-        case MONITOREXIT:  f.pop_ref(); break;
+        L_MONITORENTER: f.pop_ref(); DISPATCH();
+        L_MONITOREXIT:  f.pop_ref(); DISPATCH();
 
         // ── WIDE prefix ───────────────────────────────────────────────────────
-        case WIDE: {
+        L_WIDE: {
             uint8_t wide_op = bc_u1(code, f.pc++);
             uint16_t idx    = bc_u2(code, f.pc); f.pc += 2;
             switch (wide_op) {
@@ -1015,18 +1195,16 @@ dispatch_loop:
                     throw std::runtime_error("Unsupported wide opcode: " +
                                              std::to_string(wide_op));
             }
-            break;
+            DISPATCH();
         }
 
-        default: {
+        L_default: {
             std::string msg = "Unimplemented opcode 0x" +
                               ([op]{ char b[4]; snprintf(b,4,"%02x",op); return std::string(b); }()) +
                               " at " + frame_loc();
             fprintf(stderr, "[vm] %s\n", msg.c_str());
             throw std::runtime_error(msg);
         }
-        }
-    }
     } catch (JvmException& e) {
         uint32_t throw_pc = f.pc > 0 ? f.pc - 1 : 0;
         if (e.location.empty() && cf_ptr)
@@ -1099,7 +1277,7 @@ dispatch_loop:
             f.sp = 0;
             f.push_ref(ex_ref);
             f.pc = entry.handler_pc;
-            goto dispatch_loop;   // re-enter the interpreter loop
+            goto dispatch_restart;   // re-enter the interpreter loop
         }
         // No handler in this frame: annotate and propagate
         if (e.location.empty()) {
@@ -1136,11 +1314,14 @@ dispatch_loop:
                 f.sp = 0;
                 f.push_ref(ex_ref);
                 f.pc = entry.handler_pc;
-                goto dispatch_loop;
+                goto dispatch_restart;
             }
             throw jex;
         }
         char buf[4]; snprintf(buf, 4, "%02x", op);
         throw std::runtime_error(msg + "\n  in " + frame_loc() + " op=0x" + buf);
     }
+    // continue outer loop after catch resumed via label below
+    dispatch_restart: ;
+    }  // end of outer while(true)
 }
