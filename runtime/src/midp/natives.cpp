@@ -131,43 +131,94 @@ static fs::path rms_path(const std::string& store_name) {
     return fs::path(g_rms_dir) / (store_name + ".rms");
 }
 
+// Defensive read. If the file is truncated, has a garbage record count, or
+// has a garbage record length, reject the whole load and clear the in-memory
+// store so the game starts fresh — far safer than handing bogus state back
+// to the MIDlet and watching it self-destruct. Saves from a crashed/killed
+// previous run used to manifest as games stuck on boot animation.
 static void rms_load(const std::string& store_name) {
     auto path = rms_path(store_name);
     if (!fs::exists(path)) return;
     std::ifstream in(path, std::ios::binary);
     if (!in) return;
+
+    // Hard caps so a corrupt header can't ask us to allocate gigabytes.
+    constexpr uint32_t kMaxRecords      = 1u << 20;   // 1M records
+    constexpr uint32_t kMaxRecordBytes  = 16u << 20;  // 16 MB per record
+
+    auto fail = [&](const char* why) {
+        fprintf(stderr, "[rms] discarding corrupt %s (%s)\n",
+                path.c_str(), why);
+        g_record_stores[store_name].clear();
+        // Leave the file on disk so the user can inspect — the game will
+        // overwrite it on the next save via atomic rename.
+    };
+
     uint32_t count = 0;
-    in.read(reinterpret_cast<char*>(&count), 4);
+    if (!in.read(reinterpret_cast<char*>(&count), 4)) return fail("short header");
+    if (count > kMaxRecords) return fail("implausible record count");
+
     auto& recs = g_record_stores[store_name];
+    recs.clear();
     recs.resize(count);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t len = 0;
-        in.read(reinterpret_cast<char*>(&len), 4);
+        if (!in.read(reinterpret_cast<char*>(&len), 4))
+            return fail("truncated in record header");
         if (len == 0xFFFFFFFFu) { recs[i].clear(); continue; }
+        if (len > kMaxRecordBytes) return fail("implausible record length");
         recs[i].resize(len);
-        if (len > 0) in.read(reinterpret_cast<char*>(recs[i].data()), len);
+        if (len > 0 && !in.read(reinterpret_cast<char*>(recs[i].data()), len))
+            return fail("truncated in record body");
     }
     fprintf(stderr, "[rms] loaded %s: %u records\n", store_name.c_str(), count);
 }
 
+// Atomic write: build the file as <name>.rms.tmp, flush+close, then rename
+// over the real path. POSIX guarantees the rename is atomic on the same
+// filesystem, so readers see either the old file or the new one — never a
+// partially-written mix. Before this, Ctrl+C / ESC during a save could
+// leave a truncated file that poisoned the next launch.
 static void rms_save(const std::string& store_name) {
     if (g_rms_dir.empty()) return;
     fs::create_directories(g_rms_dir);
     auto path = rms_path(store_name);
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) { fprintf(stderr, "[rms] failed to write %s\n", path.c_str()); return; }
-    auto& recs = g_record_stores[store_name];
-    uint32_t count = (uint32_t)recs.size();
-    out.write(reinterpret_cast<const char*>(&count), 4);
-    for (auto& rec : recs) {
-        if (rec.empty()) {
-            uint32_t marker = 0xFFFFFFFFu;
-            out.write(reinterpret_cast<const char*>(&marker), 4);
-        } else {
-            uint32_t len = (uint32_t)rec.size();
-            out.write(reinterpret_cast<const char*>(&len), 4);
-            out.write(reinterpret_cast<const char*>(rec.data()), len);
+    auto tmp  = path;
+    tmp += ".tmp";
+
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            fprintf(stderr, "[rms] failed to open %s\n", tmp.c_str());
+            return;
         }
+        auto& recs = g_record_stores[store_name];
+        uint32_t count = (uint32_t)recs.size();
+        out.write(reinterpret_cast<const char*>(&count), 4);
+        for (auto& rec : recs) {
+            if (rec.empty()) {
+                uint32_t marker = 0xFFFFFFFFu;
+                out.write(reinterpret_cast<const char*>(&marker), 4);
+            } else {
+                uint32_t len = (uint32_t)rec.size();
+                out.write(reinterpret_cast<const char*>(&len), 4);
+                out.write(reinterpret_cast<const char*>(rec.data()), len);
+            }
+        }
+        out.flush();
+        if (!out) {
+            fprintf(stderr, "[rms] write failed on %s\n", tmp.c_str());
+            fs::remove(tmp);
+            return;
+        }
+    }  // ofstream destructor closes the file
+
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        fprintf(stderr, "[rms] rename %s -> %s failed: %s\n",
+                tmp.c_str(), path.c_str(), ec.message().c_str());
+        fs::remove(tmp, ec);
     }
 }
 
@@ -346,20 +397,11 @@ void register_natives(VM& vm, const JarFile& jar) {
     vm.register_native("java/lang/Class", "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         [&jar](VM& v, Frame& f, std::span<Slot> args) {
-            std::string path = v.string_value(args[1].as_ref());
-            if (!path.empty() && path[0] == '/') path = path.substr(1);
-
-            if (!jar.has(path)) {
-                // Strip locale prefix fallback: "en/foo.str" -> "foo.str"
-                auto slash = path.find('/');
-                if (slash != std::string::npos) {
-                    std::string stripped = path.substr(slash + 1);
-                    if (jar.has(stripped)) path = stripped;
-                }
-            }
-            if (!jar.has(path)) {
+            std::string requested = v.string_value(args[1].as_ref());
+            std::string path = jar.resolve(requested);
+            if (path.empty()) {
                 fprintf(stderr, "[native] getResourceAsStream: not found: %s\n",
-                        path.c_str());
+                        requested.c_str());
                 f.push_ref(NULL_REF);
                 return;
             }
@@ -1931,6 +1973,28 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     // VServ ad SDK then think the ad fetch succeeded with no ad and proceed.
     auto make_fake_http = [](VM& v, std::span<Slot> args) {
         std::string url = v.string_value(args[0].as_ref());
+        // For sms:// we return a MessageConnection so the cast in
+        //   (MessageConnection) Connector.open("sms://…")
+        // succeeds. Then newMessage/send below pretend the SMS went through,
+        // which is what trial titles like KimCuong2 interpret as "registered".
+        if (url.rfind("sms:", 0) == 0) {
+            fprintf(stderr, "[net] Connector.open(%s) → fake MessageConnection\n",
+                    url.c_str());
+            ClassDef* mc = v.loader().find_or_stub(
+                "javax/wireless/messaging/MessageConnection");
+            return v.heap().alloc_object(mc, 0);
+        }
+        // tel:, cbs:, btspp:, … we don't simulate. Throw the standard
+        // "transport unavailable" signal so games fall through.
+        if (url.rfind("http:", 0) != 0 && url.rfind("https:", 0) != 0) {
+            fprintf(stderr, "[net] Connector.open(%s) → ConnectionNotFoundException\n",
+                    url.c_str());
+            ClassDef* exk = v.loader().find_or_stub(
+                "javax/microedition/io/ConnectionNotFoundException");
+            ObjRef ex = v.heap().alloc_object(exk, 0);
+            throw JvmException{ex,
+                "ConnectionNotFoundException: " + url, {}};
+        }
         fprintf(stderr, "[net] Connector.open(%s) → fake HTTP 200\n", url.c_str());
         ClassDef* httpKlass = v.loader().find_or_stub(
             "javax/microedition/io/HttpConnection");
@@ -1981,6 +2045,55 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/io/HttpConnection",
         "getLength", "()J",
         [](VM&, Frame& f, std::span<Slot>) { f.push_long(0); });
+
+    // ── javax.wireless.messaging (WMA / JSR-120): fake SMS ─────────────
+    // Trial-gated feature-phone games (KimCuong2, Vietnamese / Southeast
+    // Asian titles) send a premium SMS to a short code to "register" and
+    // unlock the full game. No real network — we just pretend every
+    // newMessage→send round-trip succeeded. The game reads "SMS sent
+    // successfully" and proceeds into gameplay. getAddress() returns the
+    // sender's own "phone number" so round-trip reply games also work.
+    auto new_fake_message = [](VM& v, Frame& f, std::span<Slot>) {
+        ClassDef* tm = v.loader().find_or_stub(
+            "javax/wireless/messaging/TextMessage");
+        f.push_ref(v.heap().alloc_object(tm, 0));
+    };
+    vm.register_native("javax/wireless/messaging/MessageConnection",
+        "newMessage", "(Ljava/lang/String;)Ljavax/wireless/messaging/Message;",
+        new_fake_message);
+    vm.register_native("javax/wireless/messaging/MessageConnection",
+        "newMessage", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/wireless/messaging/Message;",
+        new_fake_message);
+    vm.register_native("javax/wireless/messaging/MessageConnection",
+        "send", "(Ljavax/wireless/messaging/Message;)V",
+        [](VM&, Frame&, std::span<Slot>) {
+            fprintf(stderr, "[net] MessageConnection.send → pretended success\n");
+        });
+    vm.register_native("javax/wireless/messaging/MessageConnection",
+        "numberOfSegments", "(Ljavax/wireless/messaging/Message;)I",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(1); });
+    vm.register_native("javax/wireless/messaging/MessageConnection",
+        "close", "()V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/wireless/messaging/MessageConnection",
+        "setMessageListener", "(Ljavax/wireless/messaging/MessageListener;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    // Message / TextMessage setters + getters (enough to round-trip).
+    vm.register_native("javax/wireless/messaging/TextMessage",
+        "setPayloadText", "(Ljava/lang/String;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/wireless/messaging/TextMessage",
+        "getPayloadText", "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) { f.push_ref(v.new_string("")); });
+    vm.register_native("javax/wireless/messaging/Message",
+        "setAddress", "(Ljava/lang/String;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/wireless/messaging/Message",
+        "getAddress", "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) { f.push_ref(v.new_string("sms://0")); });
+    vm.register_native("javax/wireless/messaging/Message",
+        "getTimestamp", "()Ljava/util/Date;",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
     vm.register_native("javax/microedition/io/HttpConnection",
         "openInputStream", "()Ljava/io/InputStream;",
         [](VM& v, Frame& f, std::span<Slot>) {
@@ -2037,6 +2150,19 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         });
     vm.register_native("java/util/Calendar", "setTime", "(Ljava/util/Date;)V",
         [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("java/util/Calendar", "getTime", "()Ljava/util/Date;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* dk = v.loader().find_or_stub("java/util/Date");
+            f.push_ref(v.heap().alloc_object(dk, 0));
+        });
+    vm.register_native("java/util/Calendar", "setTimeInMillis", "(J)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("java/util/Calendar", "getTimeInMillis", "()J",
+        [](VM&, Frame& f, std::span<Slot>) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            f.push_long(int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000);
+        });
     vm.register_native("java/util/Calendar", "get", "(I)I",
         [](VM&, Frame& f, std::span<Slot> args) {
             // Calendar field IDs: YEAR=1, MONTH=2, DAY_OF_MONTH=5,
@@ -2289,6 +2415,21 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             if (sn) {
                 try {
                     v.invoke(sn, obj->klass, {Slot::from_ref(displayable)});
+                } catch (const QuitRequest&) { throw; }
+                catch (...) {}
+            }
+            // Real MIDP invokes paint() on the canvas immediately after
+            // setCurrent so the user sees it without needing input. Older
+            // titles (Puzzle Bobble 2003) do all their work in the MIDlet
+            // constructor and leave startApp() empty — without this kick,
+            // paint never fires, key delivery never starts, and the game
+            // sits idle forever. Route through Canvas.repaint()V which our
+            // natives resolve to do_repaint (lazy Display::open + paint +
+            // flush).
+            MethodDef* rp = obj->klass->resolve_virtual("repaint", "()V");
+            if (rp) {
+                try {
+                    v.invoke(rp, obj->klass, {Slot::from_ref(displayable)});
                 } catch (const QuitRequest&) { throw; }
                 catch (...) {}
             }

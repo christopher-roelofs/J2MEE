@@ -1090,11 +1090,10 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
     vm.register_native("javax/microedition/lcdui/Image",
         "createImage", "(Ljava/lang/String;)Ljavax/microedition/lcdui/Image;",
         [&jar, make_image_ref](VM& v, Frame& f, std::span<Slot> args) {
-            std::string path = v.string_value(args[0].as_ref());
-            if (!path.empty() && path[0] == '/') path = path.substr(1);
-
-            if (!jar.has(path)) {
-                fprintf(stderr, "[image] not found in JAR: %s\n", path.c_str());
+            std::string requested = v.string_value(args[0].as_ref());
+            std::string path = jar.resolve(requested);
+            if (path.empty()) {
+                fprintf(stderr, "[image] not found in JAR: %s\n", requested.c_str());
                 f.push_ref(NULL_REF); return;
             }
 
@@ -1339,6 +1338,8 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
     vm.register_native("javax/microedition/lcdui/game/GameCanvas",
         "flushGraphics", "()V",
         [deliver_key_events](VM& v, Frame&, std::span<Slot> args) {
+            static bool first = false;
+            if (!first) { first = true; fprintf(stderr, "[survey] first-flush kind=GameCanvas\n"); }
             if (!Display::instance().flush()) {
                 throw QuitRequest{};
             }
@@ -1348,6 +1349,8 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
     vm.register_native("javax/microedition/lcdui/game/GameCanvas",
         "flushGraphics", "(IIII)V",
         [deliver_key_events](VM& v, Frame&, std::span<Slot> args) {
+            static bool first = false;
+            if (!first) { first = true; fprintf(stderr, "[survey] first-flush kind=GameCanvas-rect\n"); }
             if (!Display::instance().flush()) {
                 throw QuitRequest{};
             }
@@ -1398,6 +1401,12 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         MethodDef* paint = canvas_obj->klass->resolve_virtual(
             "paint", "(Ljavax/microedition/lcdui/Graphics;)V");
         if (paint) {
+            static bool first_paint_logged = false;
+            if (!first_paint_logged) {
+                first_paint_logged = true;
+                fprintf(stderr, "[survey] first-paint klass=%s\n",
+                        canvas_obj->klass->name.c_str());
+            }
             try {
                 v.invoke(paint, canvas_obj->klass,
                          {Slot::from_ref(canvas_ref), Slot::from_ref(gfxRef)});

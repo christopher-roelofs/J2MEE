@@ -17,6 +17,17 @@ public:
     // Throws std::runtime_error if the entry does not exist.
     const std::vector<uint8_t>& get(const std::string& name) const;
 
+    // Resolve a resource name to an existing entry, trying common fallbacks:
+    //   - exact match
+    //   - strip a leading "/"
+    //   - strip a leading locale-style prefix ("en/foo" → "foo")
+    //   - if no extension present, try common image extensions
+    //     (.png, .jpg, .jpeg, .gif)
+    // Returns the matched entry name, or empty string if nothing matched.
+    // Several titles (Super Puzzle Bobble, some Jamdat games) call
+    // Image.createImage("ballsas") where the real entry is "ballsas.png".
+    std::string resolve(const std::string& name) const;
+
     // All entry names in the archive.
     std::vector<std::string> entries() const;
 

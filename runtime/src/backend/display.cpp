@@ -1,6 +1,9 @@
 #include "display.hpp"
 #include <stdexcept>
 #include <cstdio>
+#include <chrono>
+
+volatile std::sig_atomic_t g_quit_requested = 0;
 
 // ─── GameCanvas key state bits (MIDP 2.0 spec) ───────────────────────────────
 // These must match the values the game expects from getKeyStates().
@@ -26,10 +29,23 @@ Display& Display::instance() {
 // ─── open ─────────────────────────────────────────────────────────────────────
 
 void Display::open(int w, int h, const std::string& title) {
-    if (m_window) return;  // already open
+    if (m_screen) return;  // already open
 
     m_logical_w = w;
     m_logical_h = h;
+
+    // Headless: create the offscreen ARGB8888 surface the game draws into,
+    // but skip SDL_Init(VIDEO), the window, the renderer, and the texture.
+    // SDL_CreateRGBSurfaceWithFormat works without any subsystem init.
+    if (m_headless) {
+        m_screen = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+        if (!m_screen)
+            throw std::runtime_error(std::string("SDL_CreateRGBSurface: ") + SDL_GetError());
+        SDL_FillRect(m_screen, nullptr, SDL_MapRGBA(m_screen->format, 255, 255, 255, 255));
+        m_wall_start_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return;
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) < 0)
         throw std::runtime_error(std::string("SDL_Init: ") + SDL_GetError());
@@ -117,6 +133,25 @@ void Display::open(int w, int h, const std::string& title) {
 // ─── flush ────────────────────────────────────────────────────────────────────
 
 bool Display::flush() {
+    // Terminal signal (Ctrl+C, SIGTERM) routes through the same path as
+    // window-close so that in-flight RMS saves / timers unwind cleanly.
+    if (g_quit_requested) {
+        fprintf(stderr, "[display] quit requested via signal\n");
+        return false;
+    }
+    if (m_headless) {
+        // Advance scripted input / tick counter, then check budgets.
+        headless_advance();
+        ++m_tick_count;
+        if (m_max_ticks && m_tick_count >= m_max_ticks) return false;
+        if (m_max_run_ms) {
+            uint64_t now_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (now_ms - m_wall_start_ms >= m_max_run_ms) return false;
+        }
+        if (m_tick_ms) SDL_Delay(m_tick_ms);
+        return true;
+    }
     if (!m_window) return true;
 
     // Poll events
@@ -270,9 +305,52 @@ void Display::enqueue_release(SDL_Keycode sym) {
         m_pending_releases.push_back(midp);
 }
 
+// ─── Headless scripted input ─────────────────────────────────────────────────
+// Each flush() call in headless mode = one tick. Keys with press_tick ==
+// tick_count are pushed as keyPressed; held keys whose release_tick fires are
+// pushed as keyReleased. update_key_states() uses m_held for getKeyStates().
+
+void Display::headless_advance() {
+    // Fire any scheduled releases first so games that poll between press and
+    // release see the press-only state for at least one tick.
+    for (auto it = m_held.begin(); it != m_held.end(); ) {
+        if (m_tick_count >= it->second) {
+            m_pending_releases.push_back(it->first);
+            it = m_held.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Press any keys whose press_tick has arrived.
+    while (m_key_script_idx < m_key_script.size()
+           && m_key_script[m_key_script_idx].press_tick <= (int64_t)m_tick_count) {
+        const ScriptedKey& k = m_key_script[m_key_script_idx++];
+        m_pending_keys.push_back(k.midp_code);
+        int hold = k.hold_ticks > 0 ? k.hold_ticks : 2;
+        m_held.push_back({k.midp_code, m_tick_count + hold});
+    }
+    update_key_states();
+}
+
 // ─── Key state ────────────────────────────────────────────────────────────────
 
 void Display::update_key_states() {
+    if (m_headless) {
+        // Derive state bitmask from currently-held scripted keys only.
+        int bits = 0;
+        for (auto& h : m_held) {
+            switch (h.first) {
+                case -1: bits |= Key::UP;    break;
+                case -2: bits |= Key::DOWN;  break;
+                case -3: bits |= Key::LEFT;  break;
+                case -4: bits |= Key::RIGHT; break;
+                case -5: bits |= Key::FIRE;  break;
+                default: break;
+            }
+        }
+        m_key_states = bits;
+        return;
+    }
     const uint8_t* kb = SDL_GetKeyboardState(nullptr);
     int bits = 0;
 
@@ -290,6 +368,33 @@ void Display::update_key_states() {
     m_key_states = bits;
 }
 
+// ─── PPM dump ────────────────────────────────────────────────────────────────
+// Binary P6, matches brewhle's format so the same tools work on both.
+
+bool Display::save_ppm(const std::string& path) const {
+    if (!m_screen) return false;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    std::fprintf(f, "P6\n%d %d\n255\n", m_logical_w, m_logical_h);
+    SDL_LockSurface(m_screen);
+    const uint32_t* px = static_cast<const uint32_t*>(m_screen->pixels);
+    int pitch_px = m_screen->pitch / 4;
+    for (int y = 0; y < m_logical_h; ++y) {
+        for (int x = 0; x < m_logical_w; ++x) {
+            uint32_t p = px[y * pitch_px + x];
+            uint8_t rgb[3] = {
+                (uint8_t)((p >> 16) & 0xFF),
+                (uint8_t)((p >>  8) & 0xFF),
+                (uint8_t)((p >>  0) & 0xFF),
+            };
+            std::fwrite(rgb, 1, 3, f);
+        }
+    }
+    SDL_UnlockSurface(m_screen);
+    std::fclose(f);
+    return true;
+}
+
 // ─── Destructor ───────────────────────────────────────────────────────────────
 
 Display::~Display() {
@@ -297,5 +402,6 @@ Display::~Display() {
     if (m_texture)  SDL_DestroyTexture(m_texture);
     if (m_renderer) SDL_DestroyRenderer(m_renderer);
     if (m_window)   SDL_DestroyWindow(m_window);
-    SDL_Quit();
+    // In headless mode we never called SDL_Init, so skip SDL_Quit.
+    if (!m_headless) SDL_Quit();
 }

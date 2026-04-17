@@ -64,10 +64,20 @@ ClassDef* ClassLoader::build_class_def(ClassFile* cf) {
 // ─── Phase 2: link hierarchy ──────────────────────────────────────────────────
 
 void ClassLoader::link_hierarchy() {
-    for (auto& [name, klass] : m_classes) {
-        const ClassFile* cf = klass->source;
-        if (!cf) continue;
+    // find_or_stub() below inserts into m_classes, invalidating iterators of
+    // an unordered_map traversal. Snapshot the JAR-loaded classes first and
+    // iterate the snapshot so new stubs don't cut the loop short. (Before
+    // this fix, only the first class that didn't need any new-stub parents
+    // got its super set; every subsequent class ended up with super=null.
+    // Visible effect: Super Puzzle Bobble's class `f` couldn't resolve
+    // Canvas.repaint() because f → GAMECANVAS was never linked.)
+    std::vector<ClassDef*> jar_classes;
+    jar_classes.reserve(m_classes.size());
+    for (auto& [name, klass] : m_classes)
+        if (klass->source) jar_classes.push_back(klass.get());
 
+    for (ClassDef* klass : jar_classes) {
+        const ClassFile* cf = klass->source;
         if (!cf->super_class.empty())
             klass->super = find_or_stub(cf->super_class);
 
@@ -145,10 +155,37 @@ ClassDef* ClassLoader::make_stub(const std::string& name) {
     auto klass = std::make_unique<ClassDef>();
     klass->name   = name;
     klass->source = nullptr;
-    // Stub the most common base class chain so instanceof / is_subclass_of works
-    // for the J2ME hierarchy.  Full hierarchy is built by native registration.
     ClassDef* ptr = klass.get();
     m_classes[name] = std::move(klass);
+
+    // Seed well-known MIDP / CLDC parent links. Without this, a JAR-loaded
+    // class that extends a stubbed framework class (e.g. Motorola
+    // FullCanvas → GameCanvas → Canvas) terminates at the first stub when
+    // resolve_virtual walks upward, so natives registered on Canvas never
+    // get found and every invocation falls through to a generic stub.
+    // Affected titles: Super Puzzle Bobble (com/hellomoto/fullscreen/game/
+    // GAMECANVAS), other FullCanvas-based Motorola builds.
+    static const std::pair<const char*, const char*> kStubParents[] = {
+        {"javax/microedition/lcdui/game/GameCanvas",
+            "javax/microedition/lcdui/Canvas"},
+        {"javax/microedition/lcdui/Canvas",
+            "javax/microedition/lcdui/Displayable"},
+        {"javax/microedition/lcdui/Displayable", "java/lang/Object"},
+        {"javax/microedition/lcdui/Screen",
+            "javax/microedition/lcdui/Displayable"},
+        {"javax/microedition/lcdui/Form",   "javax/microedition/lcdui/Screen"},
+        {"javax/microedition/lcdui/List",   "javax/microedition/lcdui/Screen"},
+        {"javax/microedition/lcdui/Alert",  "javax/microedition/lcdui/Screen"},
+        {"javax/microedition/lcdui/TextBox","javax/microedition/lcdui/Screen"},
+        // Nokia full-screen canvas used by many Asian ports of JSR-82 titles.
+        {"com/nokia/mid/ui/FullCanvas", "javax/microedition/lcdui/Canvas"},
+    };
+    for (auto& [child, parent] : kStubParents) {
+        if (name == child) {
+            ptr->super = find_or_stub(parent);
+            break;
+        }
+    }
     return ptr;
 }
 

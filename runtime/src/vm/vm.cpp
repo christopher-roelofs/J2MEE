@@ -307,6 +307,8 @@ void VM::run(const std::string& midlet_class) {
 
     ObjRef midlet_obj = new_object(klass);
 
+    fprintf(stderr, "[survey] midlet-constructed: %s\n", class_name.c_str());
+
     // Call <init>()V
     if (auto* init = klass->resolve_virtual("<init>", "()V"))
         invoke(init, klass, {Slot::from_ref(midlet_obj)});
@@ -317,7 +319,9 @@ void VM::run(const std::string& midlet_class) {
     if (!startApp) throw std::runtime_error("startApp not found");
 
     for (int startApp_round = 0; startApp_round < 5; ++startApp_round) {
+        fprintf(stderr, "[survey] startApp-entered round=%d\n", startApp_round);
         invoke(startApp, klass, {Slot::from_ref(midlet_obj)});
+        fprintf(stderr, "[survey] startApp-returned round=%d\n", startApp_round);
 
         if (m_pending_threads.empty()) break;  // nothing deferred — done
 

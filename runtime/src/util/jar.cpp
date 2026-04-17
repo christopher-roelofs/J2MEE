@@ -170,3 +170,32 @@ std::vector<std::string> JarFile::entries_with_suffix(const std::string& suffix)
             result.push_back(name);
     return result;
 }
+
+std::string JarFile::resolve(const std::string& name) const {
+    if (name.empty()) return "";
+    if (m_entries.count(name)) return name;
+    if (name[0] == '/') {
+        std::string stripped = name.substr(1);
+        if (m_entries.count(stripped)) return stripped;
+        return resolve(stripped);
+    }
+    // Locale prefix strip ("en/foo.str" → "foo.str").
+    auto slash = name.find('/');
+    if (slash != std::string::npos) {
+        std::string tail = name.substr(slash + 1);
+        if (m_entries.count(tail)) return tail;
+    }
+    // No extension in the basename → try common image extensions. Fixes
+    // titles like Super Puzzle Bobble that call Image.createImage("ballsas")
+    // where the real entry is "ballsas.png".
+    auto last_slash = name.find_last_of('/');
+    auto basename_start = (last_slash == std::string::npos) ? 0 : last_slash + 1;
+    if (name.find('.', basename_start) == std::string::npos) {
+        static const char* kExts[] = { ".png", ".jpg", ".jpeg", ".gif" };
+        for (const char* ext : kExts) {
+            std::string with_ext = name + ext;
+            if (m_entries.count(with_ext)) return with_ext;
+        }
+    }
+    return "";
+}
