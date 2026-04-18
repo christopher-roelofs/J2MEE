@@ -3,6 +3,7 @@
 #include "class_def.hpp"
 #include "class_loader.hpp"
 #include "frame.hpp"
+#include "scheduler.hpp"
 #include "util/jar.hpp"
 
 #include <deque>
@@ -137,40 +138,38 @@ public:
     }
 private:
 
-    // Active call stack (frames).
-    // std::deque: push_back never invalidates references to existing elements,
-    // which is required because exec_frame holds Frame& while pushing new frames.
-    std::deque<Frame> m_call_stack;
-
-    // Threads started via Thread.start() that have not yet run.
-    // Deferred until after startApp() returns so that object construction
-    // (which calls Thread.start() before setting singleton fields) can complete.
-    struct PendingThread {
-        MethodDef* run_method;
-        ClassDef*  run_klass;
-        ObjRef     runnable;
-        ObjRef     thread_ref;
-    };
-
 public:
-    // Called by the Thread.start() native to defer thread execution.
-    void enqueue_thread(ObjRef thread_ref, ObjRef runnable,
-                        MethodDef* run_method, ClassDef* run_klass) {
-        m_pending_threads.push_back({run_method, run_klass, runnable, thread_ref});
+    // The green-thread scheduler. Each Java thread has its own C stack +
+    // frame deque; only one executes at a time (cooperative switching on
+    // sleep/wait/notify). This replaces the old single-threaded model that
+    // deferred Thread.start() until startApp() returned.
+    Scheduler scheduler;
+    // The frame deque the interpreter is currently operating on. Routes to
+    // the running thread's frames. A reference so existing code that writes
+    // `m_call_stack.push_back(...)` translates to `call_stack().push_back(...)`.
+    std::deque<Frame>& call_stack() { return scheduler.current()->frames; }
+
+    // Called by the Thread.start() native. Spawns the thread into the
+    // scheduler's ready queue; it runs when the current thread next yields.
+    JavaThread* start_thread(ObjRef thread_ref, ObjRef runnable,
+                             MethodDef* run_method, ClassDef* run_klass) {
+        return scheduler.spawn(thread_ref, [this, runnable, run_method, run_klass]() {
+            invoke(run_method, run_klass,
+                   std::vector<Slot>{Slot::from_ref(runnable)});
+        });
     }
 
-    // Pop and run one pending thread's run() synchronously. Used by
-    // Object.wait() to yield to a waiter-notifier thread in our cooperative
-    // single-threaded model. Returns true if a thread ran.
-    bool run_next_pending_thread();
-    size_t pending_thread_count() const { return m_pending_threads.size(); }
+    // The ObjRef of the java.lang.Thread currently executing.
+    ObjRef current_thread_ref() const {
+        return scheduler.current() ? scheduler.current()->java_ref : NULL_REF;
+    }
 
-    // The ObjRef of the thread currently executing (set by the drain loop).
+    // Back-compat: some code paths (Thread.currentThread native, the old
+    // thread-error logger) used to read VM::current_thread directly. Keep
+    // the field name as a read-only alias populated on each schedule.
     ObjRef current_thread = NULL_REF;
 
 private:
-    std::vector<PendingThread> m_pending_threads;
-
     // ── Internal execution ────────────────────────────────────────────────────
     void exec_frame(Frame& frame);
 };

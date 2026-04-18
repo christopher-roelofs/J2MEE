@@ -24,6 +24,7 @@ set(SOURCES
     src/vm/heap.cpp
     src/vm/class_def.cpp
     src/vm/class_loader.cpp
+    src/vm/scheduler.cpp
     src/util/jar.cpp
     src/midp/natives.cpp
     src/midp/graphics_natives.cpp

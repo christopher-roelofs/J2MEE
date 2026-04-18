@@ -345,29 +345,37 @@ void register_natives(VM& vm, const JarFile& jar) {
             f.push_ref(v.new_string(name + "@" + std::to_string(self)));
         });
 
-    // We don't have real monitors. Games often wait() on one thread until a
-    // sibling thread calls notify(). With sequential execution that would
-    // deadlock, so wait() cooperatively yields — run any pending thread's run()
-    // to completion so it has a chance to produce the state the waiter wants.
+    // Proper wait/notify via the green-thread scheduler. wait() puts the
+    // current thread in the Waiting state keyed on the monitor ObjRef and
+    // swapcontexts out; notify()/notifyAll() flip matching waiters back to
+    // Ready. The timed wait form still respects the timeout — if nobody
+    // notifies, the waiter is woken by its own Sleeping-style wake_at
+    // transition, which we implement by queuing it Sleeping instead.
     vm.register_native("java/lang/Object", "wait", "()V",
-        [](VM& v, Frame&, std::span<Slot>) {
-            if (!v.run_next_pending_thread())
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        [](VM& v, Frame&, std::span<Slot> args) {
+            v.scheduler.wait_current(args[0].as_ref());
         });
     vm.register_native("java/lang/Object", "wait", "(J)V",
         [](VM& v, Frame&, std::span<Slot> args) {
             Slot2 s2; s2.lo = args[1].raw; s2.hi = args[2].raw;
             int64_t ms = s2.as_long();
-            if (!v.run_next_pending_thread()) {
-                if (ms <= 0) ms = 16;
-                if (ms > 1000) ms = 1000;
-                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            if (ms <= 0) {
+                v.scheduler.wait_current(args[0].as_ref());
+            } else {
+                // Timed wait: approximate as a plain sleep. A notify()
+                // during the sleep won't wake us early, but this pattern is
+                // rare in the games we target (most use the untimed form).
+                v.scheduler.sleep_current((uint64_t)ms);
             }
         });
     vm.register_native("java/lang/Object", "notify", "()V",
-        [](VM&, Frame&, std::span<Slot>) {});
+        [](VM& v, Frame&, std::span<Slot> args) {
+            v.scheduler.notify_one(args[0].as_ref());
+        });
     vm.register_native("java/lang/Object", "notifyAll", "()V",
-        [](VM&, Frame&, std::span<Slot>) {});
+        [](VM& v, Frame&, std::span<Slot> args) {
+            v.scheduler.notify_all(args[0].as_ref());
+        });
 
     // ── java.lang.Class ──────────────────────────────────────────────────────
 
@@ -1909,21 +1917,15 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
     // ── java.lang.Thread ─────────────────────────────────────────────────────
 
+    // java.lang.Thread — `start`, `sleep`, `currentThread` are registered in
+    // graphics_natives.cpp (which has the scheduler/Display context). Only
+    // the Runnable-taking constructor needs a no-op here — it's called by
+    // the `new Thread(runnable)` bytecode before Thread.start captures the
+    // runnable from g_thread_runnable.
     vm.register_native("java/lang/Thread", "<init>", "(Ljava/lang/Runnable;)V",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/lang/Thread", "<init>", "()V",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/lang/Thread", "start", "()V",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/lang/Thread", "sleep", "(J)V",
-        [](VM&, Frame&, std::span<Slot> args) {
-            Slot2 s2; s2.lo = args[0].raw; s2.hi = args[1].raw;
-            int64_t ms = s2.as_long();
-            if (ms > 0 && ms <= 5000) {
-                struct timespec ts { ms / 1000, (ms % 1000) * 1000000L };
-                nanosleep(&ts, nullptr);
-            }
-        });
     vm.register_native("java/lang/Thread", "yield", "()V",
         [](VM& v, Frame&, std::span<Slot>) {
             // Pump SDL events + deliver input to the current displayable so
@@ -2628,7 +2630,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             MethodDef* run = obj->klass->resolve_virtual("run", "()V");
             if (run) {
                 // Defer like Thread.start() — run after current call chain completes
-                v.enqueue_thread(runnable_ref, runnable_ref, run, obj->klass);
+                v.start_thread(runnable_ref, runnable_ref, run, obj->klass);
             }
         });
 

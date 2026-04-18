@@ -1578,7 +1578,7 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         ClassDef* loopKlass = v.loader().find_or_stub("__timer_loop__");
         MethodDef* md = loopKlass->find_method("__repeating__", "()V");
         ObjRef dummy = v.new_object(loopKlass);
-        v.enqueue_thread(dummy, dummy, md, loopKlass);
+        v.start_thread(dummy, dummy, md, loopKlass);
     };
 
     // schedule(TimerTask, long delay, long period)
@@ -1648,9 +1648,9 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
                 ClassDef* loopKlass = v.loader().find_or_stub("__timer_loop__");
                 MethodDef* md = loopKlass->find_method("__oneshot__", "()V");
                 ObjRef dummy = v.new_object(loopKlass);
-                v.enqueue_thread(dummy, dummy, md, loopKlass);
+                v.start_thread(dummy, dummy, md, loopKlass);
             } else {
-                v.enqueue_thread(task_ref, task_ref, run, task_obj->klass);
+                v.start_thread(task_ref, task_ref, run, task_obj->klass);
             }
         });
 
@@ -1707,22 +1707,27 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
                 return;
             }
 
-            // Defer: let the current call chain (constructors etc.) finish first.
-            v.enqueue_thread(thread_ref, runnable_ref, run, runnable_obj->klass);
+            // Spawn a new green thread; it becomes Ready and runs when the
+            // current thread next yields (sleep/wait).
+            v.start_thread(thread_ref, runnable_ref, run, runnable_obj->klass);
         });
 
     vm.register_native("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;",
         [](VM& v, Frame& f, std::span<Slot>) {
-            f.push_ref(v.current_thread);
+            f.push_ref(v.current_thread_ref());
         });
 
     vm.register_native("java/lang/Thread", "sleep", "(J)V",
-        [](VM&, Frame&, std::span<Slot> args) {
+        [](VM& v, Frame&, std::span<Slot> args) {
             // Static method: args[0]=lo, args[1]=hi of the long milliseconds argument
             Slot2 s; s.lo = args[0].raw; s.hi = args[1].raw;
             int64_t ms = s.as_long();
-            if (ms > 0) SDL_Delay(static_cast<uint32_t>(std::min(ms, int64_t(50))));
-            // Check for quit so the X button works during sleep loops
+            if (ms <= 0) ms = 1;  // 0 means "yield" in our model
+            // Sleep on the green-thread scheduler, not SDL_Delay. This
+            // blocks only THIS thread — other Java threads get to run.
+            // The scheduler's main loop polls SDL events between dispatches
+            // so keyboard/window-close still work while we're here.
+            v.scheduler.sleep_current((uint64_t)ms);
             if (!Display::instance().flush())
                 throw QuitRequest{};
         });

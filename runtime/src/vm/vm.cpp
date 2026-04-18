@@ -267,10 +267,11 @@ std::vector<Slot> VM::invoke(MethodDef* method, ClassDef* klass,
     for (size_t i = 0; i < args.size(); ++i)
         frame.locals[i] = args[i];
 
-    m_call_stack.push_back(std::move(frame));
-    exec_frame(m_call_stack.back());
-    Frame completed = std::move(m_call_stack.back());
-    m_call_stack.pop_back();
+    auto& stk = call_stack();
+    stk.push_back(std::move(frame));
+    exec_frame(stk.back());
+    Frame completed = std::move(stk.back());
+    stk.pop_back();
 
     return slots_from_frame(completed, method);
 }
@@ -303,72 +304,25 @@ void VM::run(const std::string& midlet_class) {
     ClassDef* klass = m_loader.find(class_name);
     if (!klass) throw std::runtime_error("MIDlet class not found: " + midlet_class);
 
-    initialize_class(klass);
+    // Spawn a green thread that drives the MIDlet lifecycle (<init> →
+    // startApp) on its own C stack. Any Thread.start() calls made during
+    // <init> or startApp land in the scheduler's ready queue and run when
+    // this thread yields via Thread.sleep() or Object.wait().
+    scheduler.spawn(NULL_REF, [this, klass, class_name]() {
+        initialize_class(klass);
+        ObjRef midlet_obj = new_object(klass);
+        fprintf(stderr, "[survey] midlet-constructed: %s\n", class_name.c_str());
 
-    ObjRef midlet_obj = new_object(klass);
+        if (auto* init = klass->resolve_virtual("<init>", "()V"))
+            invoke(init, klass, std::vector<Slot>{Slot::from_ref(midlet_obj)});
 
-    fprintf(stderr, "[survey] midlet-constructed: %s\n", class_name.c_str());
+        MethodDef* startApp = klass->resolve_virtual("startApp", "()V");
+        if (!startApp) throw std::runtime_error("startApp not found");
 
-    // Call <init>()V
-    if (auto* init = klass->resolve_virtual("<init>", "()V"))
-        invoke(init, klass, {Slot::from_ref(midlet_obj)});
+        fprintf(stderr, "[survey] startApp-entered round=0\n");
+        invoke(startApp, klass, std::vector<Slot>{Slot::from_ref(midlet_obj)});
+        fprintf(stderr, "[survey] startApp-returned round=0\n");
+    });
 
-    // Call startApp()V — may be re-invoked after deferred threads complete
-    // (mimics MIDP lifecycle: startApp → pause → resume → startApp again)
-    MethodDef* startApp = klass->resolve_virtual("startApp", "()V");
-    if (!startApp) throw std::runtime_error("startApp not found");
-
-    for (int startApp_round = 0; startApp_round < 5; ++startApp_round) {
-        fprintf(stderr, "[survey] startApp-entered round=%d\n", startApp_round);
-        invoke(startApp, klass, {Slot::from_ref(midlet_obj)});
-        fprintf(stderr, "[survey] startApp-returned round=%d\n", startApp_round);
-
-        if (m_pending_threads.empty()) break;  // nothing deferred — done
-
-        // Drain threads that were started during startApp / previous threads
-        while (!m_pending_threads.empty()) {
-            auto threads = std::move(m_pending_threads);
-            m_pending_threads.clear();
-            for (auto& pt : threads) {
-                current_thread = pt.thread_ref;
-                try {
-                    invoke(pt.run_method, pt.run_klass, {Slot::from_ref(pt.runnable)});
-                } catch (const QuitRequest&) {
-                    current_thread = NULL_REF;
-                    return;
-                } catch (const JvmException& e) {
-                    current_thread = NULL_REF;
-                    fprintf(stderr, "[thread] run() threw JvmException: %s\n  at %s\n",
-                            e.message.c_str(), e.location.c_str());
-                } catch (const std::exception& e) {
-                    current_thread = NULL_REF;
-                    fprintf(stderr, "[thread] run() threw: %s\n", e.what());
-                }
-                current_thread = NULL_REF;
-            }
-        }
-        // After threads complete, re-invoke startApp() — the game may now
-        // be ready to proceed (e.g., ad SDK set a flag during its thread)
-    }
-}
-
-bool VM::run_next_pending_thread() {
-    if (m_pending_threads.empty()) return false;
-    PendingThread pt = m_pending_threads.front();
-    m_pending_threads.erase(m_pending_threads.begin());
-    ObjRef prev_thread = current_thread;
-    current_thread = pt.thread_ref;
-    try {
-        invoke(pt.run_method, pt.run_klass, {Slot::from_ref(pt.runnable)});
-    } catch (const QuitRequest&) {
-        current_thread = prev_thread;
-        throw;
-    } catch (const JvmException& e) {
-        fprintf(stderr, "[thread] yielded run() threw: %s\n  at %s\n",
-                e.message.c_str(), e.location.c_str());
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[thread] yielded run() threw: %s\n", e.what());
-    }
-    current_thread = prev_thread;
-    return true;
+    scheduler.run_to_completion();
 }
