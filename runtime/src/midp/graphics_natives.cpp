@@ -349,6 +349,10 @@ static void draw_arc_on(SDL_Surface* surf, uint32_t color,
     int rx = w / 2, ry = h / 2;
     int cx = x + rx, cy = y + ry;
     uint32_t mapped = map_color(surf, color);
+    // SDL_FillRect already honours the clip rect, so the 1×1 fills below
+    // are automatically clipped — but do an early-out on an empty clip.
+    SDL_Rect clip; SDL_GetClipRect(surf, &clip);
+    if (clip.w <= 0 || clip.h <= 0) return;
     double step = 1.0 / std::max(rx, ry);
     double a0 = startAngle * M_PI / 180.0;
     double a1 = (startAngle + arcAngle) * M_PI / 180.0;
@@ -361,19 +365,27 @@ static void draw_arc_on(SDL_Surface* surf, uint32_t color,
     }
 }
 
-// Bresenham line
+// Bresenham line. Clips against the Graphics clip rect, not just the
+// surface bounds — several games (Age of Empires II Mobile's tile-
+// highlight outline) rely on setClip to keep drawLine inside a sub-
+// rectangle. Without this, lines leak over the HUD.
 static void draw_line_on(SDL_Surface* surf, uint32_t color,
                           int x1, int y1, int x2, int y2) {
     if (!surf) return;
     uint32_t mc = map_color(surf, color);
 
+    SDL_Rect clip; SDL_GetClipRect(surf, &clip);
+    // An empty clip means "draw nothing" per MIDP semantics.
+    if (clip.w <= 0 || clip.h <= 0) return;
+    int cx0 = clip.x, cy0 = clip.y;
+    int cx1 = clip.x + clip.w, cy1 = clip.y + clip.h;
+
     int dx = abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
     int dy = -abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
     int err = dx + dy;
 
-    int w = surf->w, h = surf->h;
     while (true) {
-        if (x1 >= 0 && x1 < w && y1 >= 0 && y1 < h) {
+        if (x1 >= cx0 && x1 < cx1 && y1 >= cy0 && y1 < cy1) {
             uint32_t* p = reinterpret_cast<uint32_t*>(
                 static_cast<uint8_t*>(surf->pixels) + y1 * surf->pitch + x1 * 4);
             *p = mc;

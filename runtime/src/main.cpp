@@ -107,6 +107,10 @@ std::vector<ScriptedKey> build_key_script(const std::string& list) {
 
 int main(int argc, char* argv[]) {
     g_trace = (std::getenv("J2ME_TRACE") != nullptr);
+    extern uint64_t g_heartbeat_insns;
+    if (const char* e = std::getenv("J2ME_HEARTBEAT")) {
+        g_heartbeat_insns = (uint64_t)std::strtoull(e, nullptr, 10);
+    }
     install_signal_handlers();
 
     // Split args into positional (jar, class, WxH) and option flags. Keeps

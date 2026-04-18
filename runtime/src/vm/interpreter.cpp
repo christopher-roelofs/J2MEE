@@ -398,6 +398,12 @@ static void do_invoke(VM& vm, Frame& f,
 
 bool g_trace = false;
 
+// Heartbeat sampling: if J2ME_HEARTBEAT=<N> is set in the environment, print
+// the executing class.method every N interpreter dispatches. Cheap way to
+// find infinite Java-level loops when no natives fire. 0 = disabled.
+uint64_t g_heartbeat_insns   = 0;
+uint64_t g_heartbeat_counter = 0;
+
 void VM::exec_frame(Frame& f) {
     // Use the method's OWNING class for constant pool resolution — the bytecode
     // was compiled against that class's cp, not the runtime type's.
@@ -601,6 +607,15 @@ void VM::exec_frame(Frame& f) {
             f.klass  ? f.klass->name.c_str()  : "?", \
             f.method ? f.method->name.c_str() : "?", \
             f.pc, f.sp, code[f.pc]); \
+    } \
+    if (__builtin_expect(g_heartbeat_insns > 0, 0)) { \
+        if (++g_heartbeat_counter >= g_heartbeat_insns) { \
+            g_heartbeat_counter = 0; \
+            fprintf(stderr, "[hb] %s.%s pc=%u\n", \
+                f.klass  ? f.klass->name.c_str()  : "?", \
+                f.method ? f.method->name.c_str() : "?", \
+                f.pc); \
+        } \
     } \
 } while (0)
 #define DISPATCH() do { TRACE_OP(); op = code[f.pc++]; goto *dispatch_table[op]; } while (0)

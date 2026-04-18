@@ -2131,6 +2131,75 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(args[0].as_ref());  // return this
         });
 
+    // ── javax.microedition.m3g (JSR-184): minimal stub singleton ────────────
+    // Bejeweled 3 and New Bejeweled Twist call Graphics3D.getInstance() during
+    // their loading phase and decide "3D is unavailable" only if it returns
+    // null. Without M3G, returning null here parks the game on an empty
+    // loading screen. Returning a sentinel object makes the game proceed with
+    // its 2D fallback path. Methods the game then calls on the sentinel
+    // (setCamera, setViewport, render, bindTarget, releaseTarget, ...) are
+    // registered as no-ops so invokevirtual doesn't fall through to the
+    // auto-stub path and spam logs. This isn't real M3G rendering — it's
+    // "pretend 3D is there but do nothing" so the 2D path can execute.
+    vm.register_native("javax/microedition/m3g/Graphics3D",
+        "getInstance", "()Ljavax/microedition/m3g/Graphics3D;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            static ObjRef g3d = NULL_REF;
+            if (g3d == NULL_REF) {
+                ClassDef* k = v.loader().find_or_stub("javax/microedition/m3g/Graphics3D");
+                g3d = v.heap().alloc_object(k, 0);
+            }
+            f.push_ref(g3d);
+        });
+    for (const auto& sig : {
+        "bindTarget(Ljava/lang/Object;)V",
+        "bindTarget(Ljava/lang/Object;ZI)V",
+        "releaseTarget()V",
+        "setCamera(Ljavax/microedition/m3g/Camera;Ljavax/microedition/m3g/Transform;)V",
+        "setViewport(IIII)V",
+        "clear(Ljavax/microedition/m3g/Background;)V",
+        "render(Ljavax/microedition/m3g/World;)V",
+        "render(Ljavax/microedition/m3g/Node;Ljavax/microedition/m3g/Transform;)V",
+        "render(Ljavax/microedition/m3g/VertexBuffer;Ljavax/microedition/m3g/IndexBuffer;Ljavax/microedition/m3g/Appearance;Ljavax/microedition/m3g/Transform;)V",
+        "setLight(ILjavax/microedition/m3g/Light;Ljavax/microedition/m3g/Transform;)I",
+        "resetLights()V",
+        "getHints()I",
+        "setHints(I)V",
+    }) {
+        std::string s(sig);
+        auto paren = s.find('(');
+        std::string name = s.substr(0, paren);
+        std::string desc = s.substr(paren);
+        vm.register_native("javax/microedition/m3g/Graphics3D", name, desc,
+            [desc](VM&, Frame& f, std::span<Slot>) {
+                // Return default value by descriptor return type.
+                char r = desc[desc.find(')') + 1];
+                switch (r) {
+                    case 'I': case 'Z': case 'S': case 'B': case 'C':
+                        f.push_int(0); break;
+                    case 'J': f.push_long(0); break;
+                    case 'F': f.push_float(0.0f); break;
+                    case 'D': f.push_double(0.0); break;
+                    case 'L': case '[': f.push_ref(NULL_REF); break;
+                    default: break;  // V
+                }
+            });
+    }
+    // Minimal constructors so `new Camera()`, `new Transform()`, etc. don't
+    // NPE before their setters get called. The game's 2D fallback usually
+    // short-circuits before using these, but we log-clean anyway.
+    for (const char* klass : {
+        "javax/microedition/m3g/Camera",
+        "javax/microedition/m3g/Transform",
+        "javax/microedition/m3g/Background",
+        "javax/microedition/m3g/World",
+        "javax/microedition/m3g/Light",
+        "javax/microedition/m3g/Appearance",
+    }) {
+        vm.register_native(klass, "<init>", "()V",
+            [](VM&, Frame&, std::span<Slot>) {});
+    }
+
     // ── java.util.Date / Calendar ────────────────────────────────────────────
     vm.register_native("java/util/Date", "<init>", "()V",
         [](VM&, Frame&, std::span<Slot>) {});
