@@ -485,9 +485,30 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
     bool has_colorkey = (SDL_GetColorKey(raw, &ckey) == 0);
     bool has_alpha = (raw->format->Amask != 0);
 
-    // Convert color key to RGBA values we can work with
+    // For indexed PNGs with a color key, build a per-pixel transparency
+    // mask from the SOURCE palette indices (not from post-convert RGB).
+    // A common Doom RPG / Bejeweled 3 pattern is a palette that has both
+    // a transparent-white entry (color-key index, alpha 0) and an opaque-
+    // white entry for the sprite body — both map to RGB (255,255,255) in
+    // ARGB8888, so matching on RGB eats the visible white pixels too.
+    std::vector<bool> transparent_mask;
+    bool indexed_ckey = has_colorkey && raw->format->BytesPerPixel == 1;
+    if (indexed_ckey) {
+        SDL_LockSurface(raw);
+        const uint8_t* src = static_cast<const uint8_t*>(raw->pixels);
+        int pitch = raw->pitch;
+        transparent_mask.resize((size_t)raw->w * raw->h, false);
+        uint8_t ck_idx = (uint8_t)(ckey & 0xFF);
+        for (int y = 0; y < raw->h; ++y)
+            for (int x = 0; x < raw->w; ++x)
+                if (src[y * pitch + x] == ck_idx)
+                    transparent_mask[(size_t)y * raw->w + x] = true;
+        SDL_UnlockSurface(raw);
+    }
+    // Non-indexed color-key fallback: record the RGB value; we'll match on
+    // it after conversion the old way.
     uint8_t ck_r = 0, ck_g = 0, ck_b = 0;
-    if (has_colorkey)
+    if (has_colorkey && !indexed_ckey)
         SDL_GetRGB(ckey, raw->format, &ck_r, &ck_g, &ck_b);
 
     SDL_Surface* converted = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_ARGB8888, 0);
@@ -497,17 +518,22 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
     SDL_LockSurface(converted);
     uint32_t* px = static_cast<uint32_t*>(converted->pixels);
     int count = converted->w * converted->h;
-    if (has_colorkey) {
-        // Make color key pixels transparent, everything else opaque
+    if (indexed_ckey) {
+        for (int i = 0; i < count; i++) {
+            if (transparent_mask[(size_t)i])
+                px[i] = 0x00000000u;
+            else
+                px[i] |= 0xFF000000u;
+        }
+    } else if (has_colorkey) {
         uint32_t ck_rgb = ((uint32_t)ck_r << 16) | ((uint32_t)ck_g << 8) | ck_b;
         for (int i = 0; i < count; i++) {
             if ((px[i] & 0x00FFFFFFu) == ck_rgb)
-                px[i] = 0x00000000u;  // transparent
+                px[i] = 0x00000000u;
             else
-                px[i] |= 0xFF000000u;  // opaque
+                px[i] |= 0xFF000000u;
         }
     } else if (!has_alpha) {
-        // No alpha, no color key — make all pixels fully opaque
         for (int i = 0; i < count; i++)
             px[i] |= 0xFF000000u;
     }
