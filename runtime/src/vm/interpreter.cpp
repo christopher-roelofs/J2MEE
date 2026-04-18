@@ -611,7 +611,8 @@ void VM::exec_frame(Frame& f) {
     if (__builtin_expect(g_heartbeat_insns > 0, 0)) { \
         if (++g_heartbeat_counter >= g_heartbeat_insns) { \
             g_heartbeat_counter = 0; \
-            fprintf(stderr, "[hb] %s.%s pc=%u\n", \
+            fprintf(stderr, "[hb t=%d] %s.%s pc=%u\n", \
+                current_thread_ref(), \
                 f.klass  ? f.klass->name.c_str()  : "?", \
                 f.method ? f.method->name.c_str() : "?", \
                 f.pc); \

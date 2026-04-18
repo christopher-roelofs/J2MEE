@@ -56,6 +56,9 @@ JavaThread* Scheduler::spawn(ObjRef java_ref, std::function<void()> entry) {
 
     JavaThread* raw = thr.get();
     m_threads.push_back(std::move(thr));
+    if (std::getenv("J2ME_TRACE_SCHED"))
+        fprintf(stderr, "[sched] spawn thread java_ref=%d (%zu total)\n",
+                java_ref, m_threads.size());
     return raw;
 }
 
@@ -158,14 +161,27 @@ void Scheduler::yield() {
 void Scheduler::sleep_current(uint64_t ms) {
     JavaThread* self = m_current;
     if (!self) { SDL_Delay((uint32_t)std::min<uint64_t>(ms, 50)); return; }
+    // Cap at 50 ms. Feature-phone games from 2008 pace their code assuming
+    // a 10-20 FPS interpreter; honouring a 100 ms Thread.sleep literally on
+    // modern hardware turns a 5-second loading phase into a multi-minute
+    // stall. The cap gives the sleeping thread control back sooner so
+    // heavyweight loaders (Bejeweled 3) complete in reasonable wall time,
+    // without losing the cooperative-yield property — other ready threads
+    // still get scheduled while we're sleeping.
+    uint64_t capped = std::min<uint64_t>(ms, 50);
+    if (std::getenv("J2ME_TRACE_SCHED"))
+        fprintf(stderr, "[sched t=%d] sleep(%lu ms, capped %lu)\n",
+                self->java_ref, (unsigned long)ms, (unsigned long)capped);
     self->state      = JavaThread::State::Sleeping;
-    self->wake_at_ms = now_ms() + ms;
+    self->wake_at_ms = now_ms() + capped;
     swapcontext(&self->ctx, &m_scheduler_ctx);
 }
 
 void Scheduler::wait_current(ObjRef monitor) {
     JavaThread* self = m_current;
     if (!self) return;
+    if (std::getenv("J2ME_TRACE_SCHED"))
+        fprintf(stderr, "[sched t=%d] wait(obj=%d)\n", self->java_ref, monitor);
     self->state   = JavaThread::State::Waiting;
     self->wait_on = monitor;
     swapcontext(&self->ctx, &m_scheduler_ctx);

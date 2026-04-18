@@ -1091,6 +1091,17 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             if (!obj) { f.push_ref(NULL_REF); return; }
 
             const uint8_t* data = obj->array_bytes() + offset;
+            if (const char* dir = std::getenv("J2ME_DUMP_PNGS")) {
+                // Unrelated-asset debug: dump raw PNG bytes to a directory
+                // so a human can inspect what the game is feeding the
+                // decoder. Zero-cost when the env var is unset.
+                static int s_id = 0;
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/png_%04d_len%d.png",
+                              dir, s_id++, length);
+                FILE* fp = std::fopen(path, "wb");
+                if (fp) { std::fwrite(data, 1, length, fp); std::fclose(fp); }
+            }
             SDL_Surface* surf = load_png_from_bytes(data, length);
             if (!surf) {
                 f.push_ref(NULL_REF); return;
