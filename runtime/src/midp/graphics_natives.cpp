@@ -851,6 +851,66 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             blit_image(gfx_surface(gfx), it->second, dx + tr.x, dy + tr.y, sx, sy, sw, sh, t);
         });
 
+    // Graphics.drawRGB(int[] rgb, int off, int scanlength,
+    //                  int x, int y, int w, int h, boolean processAlpha)
+    // Direct pixel composite. Doom RPG uses this for its bitmap-font menu
+    // text — without an implementation, menu items render invisible.
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "drawRGB", "([IIIIIIIZ)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            ObjRef arr  = args[1].as_ref();
+            int off     = args[2].as_int();
+            int scan    = args[3].as_int();
+            int x       = args[4].as_int();
+            int y       = args[5].as_int();
+            int w       = args[6].as_int();
+            int h       = args[7].as_int();
+            bool processAlpha = (args[8].as_int() != 0);
+
+            SDL_Surface* dst = gfx_surface(self);
+            if (!dst || w <= 0 || h <= 0) return;
+            HeapObject* obj = v.heap().deref(arr);
+            if (!obj) return;
+            Slot* elems = obj->array_slots();
+            int32_t len = obj->array_length();
+            auto tr = gfx_tx(self);
+            SDL_Rect clip; SDL_GetClipRect(dst, &clip);
+            int cx0 = clip.x, cy0 = clip.y;
+            int cx1 = clip.x + clip.w, cy1 = clip.y + clip.h;
+
+            SDL_LockSurface(dst);
+            uint32_t* dpix = static_cast<uint32_t*>(dst->pixels);
+            int dpitch = dst->pitch / 4;
+            for (int row = 0; row < h; ++row) {
+                int py = y + row + tr.y;
+                if (py < cy0 || py >= cy1) continue;
+                int base = off + row * scan;
+                for (int col = 0; col < w; ++col) {
+                    int px = x + col + tr.x;
+                    if (px < cx0 || px >= cx1) continue;
+                    int idx = base + col;
+                    if (idx < 0 || idx >= len) continue;
+                    uint32_t src = static_cast<uint32_t>(elems[idx].as_int());
+                    uint8_t a = processAlpha ? (uint8_t)(src >> 24) : 0xFF;
+                    if (a == 0) continue;  // fully transparent
+                    if (a == 0xFF) {
+                        dpix[py * dpitch + px] = 0xFF000000u | (src & 0x00FFFFFFu);
+                    } else {
+                        // alpha blend src over dest
+                        uint32_t d = dpix[py * dpitch + px];
+                        uint8_t dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
+                        uint8_t sr = (src >> 16) & 0xFF, sg = (src >> 8) & 0xFF, sb = src & 0xFF;
+                        uint8_t r = (sr * a + dr * (255 - a)) / 255;
+                        uint8_t g = (sg * a + dg * (255 - a)) / 255;
+                        uint8_t b = (sb * a + db * (255 - a)) / 255;
+                        dpix[py * dpitch + px] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+            SDL_UnlockSurface(dst);
+        });
+
     vm.register_native("javax/microedition/lcdui/Graphics",
         "copyArea", "(IIIIIII)V",
         [](VM&, Frame&, std::span<Slot> args) {
@@ -1384,6 +1444,26 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         "getKeyStates", "()I",
         [](VM&, Frame& f, std::span<Slot>) {
             f.push_int(Display::instance().key_states());
+        });
+
+    // GameCanvas.getGraphics() returns a Graphics that draws into the
+    // offscreen buffer; flushGraphics() copies buffer->screen. We don't
+    // maintain a separate offscreen buffer — drawing goes directly to the
+    // screen surface, and flushGraphics just presents it. Visually that's
+    // the same as an immediate-paint Canvas. Games relying on this pattern
+    // (Doom RPG, likely many others) silently produced NULL Graphics and
+    // dropped every draw before this was wired up.
+    vm.register_native("javax/microedition/lcdui/game/GameCanvas",
+        "getGraphics", "()Ljavax/microedition/lcdui/Graphics;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            Display& d = Display::instance();
+            if (!d.is_open()) d.open(g_screen_w, g_screen_h);
+            ClassDef* gfxKlass = v.loader().find_or_stub(
+                "javax/microedition/lcdui/Graphics");
+            ObjRef gfxRef = v.heap().alloc_object(gfxKlass, 0);
+            g_gfx_surf[gfxRef] = d.screen();
+            g_colors[gfxRef]   = 0xFF000000u;
+            f.push_ref(gfxRef);
         });
 
     vm.register_native("javax/microedition/lcdui/Canvas",
