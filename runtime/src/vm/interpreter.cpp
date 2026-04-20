@@ -846,21 +846,27 @@ void VM::exec_frame(Frame& f) {
         }
 
         // ── Integer arithmetic ────────────────────────────────────────────────
-        L_IADD: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a+b); DISPATCH(); }
-        L_ISUB: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a-b); DISPATCH(); }
-        L_IMUL: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a*b); DISPATCH(); }
+        // Java requires two's-complement wrap on overflow, which is UB on
+        // signed C++ ints. Route through unsigned (defined to wrap) and cast
+        // back so -O2/UBSan don't miscompile or trap.
+        L_IADD: { uint32_t b=static_cast<uint32_t>(f.pop_int()), a=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(a+b)); DISPATCH(); }
+        L_ISUB: { uint32_t b=static_cast<uint32_t>(f.pop_int()), a=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(a-b)); DISPATCH(); }
+        L_IMUL: { uint32_t b=static_cast<uint32_t>(f.pop_int()), a=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(a*b)); DISPATCH(); }
         L_IDIV: {
             int32_t b=f.pop_int(), a=f.pop_int();
             if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
+            // INT_MIN / -1 is UB in C++; Java defines it to wrap to INT_MIN.
+            if (a==INT32_MIN && b==-1) { f.push_int(INT32_MIN); DISPATCH(); }
             f.push_int(a/b); DISPATCH();
         }
         L_IREM: {
             int32_t b=f.pop_int(), a=f.pop_int();
             if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
+            if (a==INT32_MIN && b==-1) { f.push_int(0); DISPATCH(); }
             f.push_int(a%b); DISPATCH();
         }
-        L_INEG: f.push_int(-f.pop_int()); DISPATCH();
-        L_ISHL: { int32_t s=f.pop_int()&0x1f, v=f.pop_int(); f.push_int(v<<s); DISPATCH(); }
+        L_INEG: { uint32_t v=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(0u - v)); DISPATCH(); }
+        L_ISHL: { int32_t s=f.pop_int()&0x1f; uint32_t v=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(v<<s)); DISPATCH(); }
         L_ISHR: { int32_t s=f.pop_int()&0x1f, v=f.pop_int(); f.push_int(v>>s); DISPATCH(); }
         L_IUSHR:{ int32_t s=f.pop_int()&0x1f; uint32_t v=static_cast<uint32_t>(f.pop_int()); f.push_int(static_cast<int32_t>(v>>s)); DISPATCH(); }
         L_IAND: { int32_t b=f.pop_int(), a=f.pop_int(); f.push_int(a&b); DISPATCH(); }
@@ -884,17 +890,19 @@ void VM::exec_frame(Frame& f) {
         L_DNEG: { f.push_double(-f.pop_double()); DISPATCH(); }
 
         // ── Long arithmetic ───────────────────────────────────────────────────
-        L_LADD: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a+b); DISPATCH(); }
-        L_LSUB: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a-b); DISPATCH(); }
-        L_LMUL: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a*b); DISPATCH(); }
+        L_LADD: { uint64_t b=static_cast<uint64_t>(f.pop_long()), a=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(a+b)); DISPATCH(); }
+        L_LSUB: { uint64_t b=static_cast<uint64_t>(f.pop_long()), a=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(a-b)); DISPATCH(); }
+        L_LMUL: { uint64_t b=static_cast<uint64_t>(f.pop_long()), a=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(a*b)); DISPATCH(); }
         L_LDIV: { int64_t b=f.pop_long(), a=f.pop_long();
                      if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
+                     if (a==INT64_MIN && b==-1) { f.push_long(INT64_MIN); DISPATCH(); }
                      f.push_long(a/b); DISPATCH(); }
         L_LREM: { int64_t b=f.pop_long(), a=f.pop_long();
                      if (b==0) throw JvmException{NULL_REF,"ArithmeticException: / by zero"};
+                     if (a==INT64_MIN && b==-1) { f.push_long(0); DISPATCH(); }
                      f.push_long(a%b); DISPATCH(); }
-        L_LNEG: { f.push_long(-f.pop_long()); DISPATCH(); }
-        L_LSHL: { int32_t s=f.pop_int()&0x3f; int64_t v=f.pop_long(); f.push_long(v<<s); DISPATCH(); }
+        L_LNEG: { uint64_t v=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(0ull - v)); DISPATCH(); }
+        L_LSHL: { int32_t s=f.pop_int()&0x3f; uint64_t v=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(v<<s)); DISPATCH(); }
         L_LSHR: { int32_t s=f.pop_int()&0x3f; int64_t v=f.pop_long(); f.push_long(v>>s); DISPATCH(); }
         L_LUSHR:{ int32_t s=f.pop_int()&0x3f; uint64_t v=static_cast<uint64_t>(f.pop_long()); f.push_long(static_cast<int64_t>(v>>s)); DISPATCH(); }
         L_LAND: { int64_t b=f.pop_long(), a=f.pop_long(); f.push_long(a&b); DISPATCH(); }
@@ -1114,13 +1122,25 @@ void VM::exec_frame(Frame& f) {
             uint8_t  atype  = bc_u1(code, f.pc); f.pc += 1;
             int32_t  length = f.pop_int();
             ArrayType at    = static_cast<ArrayType>(atype);
+            const char* arr_name;
+            switch (at) {
+                case ArrayType::Boolean: arr_name = "[Z"; break;
+                case ArrayType::Char:    arr_name = "[C"; break;
+                case ArrayType::Float:   arr_name = "[F"; break;
+                case ArrayType::Double:  arr_name = "[D"; break;
+                case ArrayType::Byte:    arr_name = "[B"; break;
+                case ArrayType::Short:   arr_name = "[S"; break;
+                case ArrayType::Int:     arr_name = "[I"; break;
+                case ArrayType::Long:    arr_name = "[J"; break;
+                default:                 arr_name = "[B"; break;
+            }
             ObjRef arr;
             if (at == ArrayType::Long || at == ArrayType::Double)
                 arr = m_heap.alloc_long_array(length,
-                          m_loader.find_or_stub("[J"));
+                          m_loader.find_or_stub(arr_name));
             else
                 arr = m_heap.alloc_prim_array(at, length,
-                          m_loader.find_or_stub("[B"));
+                          m_loader.find_or_stub(arr_name));
             if (arr == NULL_REF) throw std::runtime_error("OutOfMemoryError");
             f.push_ref(arr);
             DISPATCH();
