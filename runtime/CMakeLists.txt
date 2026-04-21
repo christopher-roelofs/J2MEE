@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Vendored Sonivox EAS synthesizer (Apache-2.0). Defines sonivox_eas target.
 add_subdirectory(third_party/sonivox)
 
+# Vendored Khronos M3G reference (EPL-1.0). Defines m3g target. Optional —
+# games not using JSR-184 don't pull this in at runtime.
+add_subdirectory(third_party/m3g)
+
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 # Debug build enables sanitizers
@@ -81,4 +85,4 @@ else()
     target_link_libraries(j2me PRIVATE ${SDL2_MIXER_LIBRARIES})
 endif()
 
-target_link_libraries(j2me PRIVATE sonivox_eas)
+target_link_libraries(j2me PRIVATE sonivox_eas m3g)
