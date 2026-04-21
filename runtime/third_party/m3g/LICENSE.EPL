@@ -1,0 +1,10 @@
+The Khronos M3G reference implementation in this directory (m3g_*.c, m3g_*.h,
+m3g_*.inl) is Copyright (c) 2003 Nokia Corporation and is licensed under the
+Eclipse Public License v1.0 (EPL-1.0).
+
+Full text: https://www.eclipse.org/legal/epl-v10.html
+
+Sources vendored from J2ME-Loader's app/src/main/cpp/m3g tree
+(https://github.com/woesss/J2ME-Loader, also EPL-1.0).
+
+Modifications local to this project are released under the same EPL-1.0.
