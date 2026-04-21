@@ -34,6 +34,7 @@ set(SOURCES
     src/midp/natives.cpp
     src/midp/graphics_natives.cpp
     src/midp/audio_eas.cpp
+    src/midp/m3g_backend.cpp
     src/backend/display.cpp
 )
 
