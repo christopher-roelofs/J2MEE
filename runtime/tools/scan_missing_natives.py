@@ -15,10 +15,11 @@ import os, re, struct, sys, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.abspath(os.path.join(HERE, '..', 'src'))
 
-# Parse registered natives out of the C++ source: match the first three
-# string literals after `register_native(`, possibly spread across lines.
+# Parse registered natives out of the C++ source. Matches register_native(),
+# register_noop() and register_stub() — all take (class, name, desc) as the
+# first three string args (noop/stub have a 4th `note` arg that we ignore).
 _REG = re.compile(
-    r'register_native\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"',
+    r'register_(?:native|noop|stub)\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"',
     re.DOTALL)
 
 def load_registered():
