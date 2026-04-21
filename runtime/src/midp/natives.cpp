@@ -3145,6 +3145,21 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         });
 
     vm.register_native("javax/microedition/rms/RecordStore",
+        "getSizeAvailable", "()I",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(8 * 1024 * 1024); });
+
+    vm.register_native("javax/microedition/rms/RecordStore",
+        "getSize", "()I",
+        [rs_name](VM&, Frame& f, std::span<Slot> args) {
+            const std::string& name = rs_name(args[0].as_ref());
+            auto it = g_record_stores.find(name);
+            int32_t total = 0;
+            if (it != g_record_stores.end())
+                for (auto& r : it->second) total += (int32_t)r.size();
+            f.push_int(total);
+        });
+
+    vm.register_native("javax/microedition/rms/RecordStore",
         "addRecord", "([BII)I",
         [rs_name](VM& v, Frame& f, std::span<Slot> args) {
             const std::string& name = rs_name(args[0].as_ref());
@@ -3353,6 +3368,26 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         });
 
     vm.register_native("javax/microedition/rms/RecordEnumeration",
+        "nextRecord", "()[B",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            auto it = g_record_enums.find(args[0].as_ref());
+            if (it == g_record_enums.end()) { f.push_ref(NULL_REF); return; }
+            auto& re = it->second;
+            auto sit = g_record_stores.find(re.store);
+            if (sit == g_record_stores.end()) { f.push_ref(NULL_REF); return; }
+            while (re.pos < (int32_t)sit->second.size() && sit->second[re.pos].empty())
+                re.pos++;
+            if (re.pos >= (int32_t)sit->second.size()) { f.push_ref(NULL_REF); return; }
+            const auto& bytes = sit->second[re.pos++];
+            ObjRef arr = v.heap().alloc_prim_array(ArrayType::Byte,
+                (int32_t)bytes.size(), v.loader().find_or_stub("[B"));
+            HeapObject* arrObj = v.heap().deref(arr);
+            if (arrObj && !bytes.empty())
+                std::memcpy(arrObj->array_bytes(), bytes.data(), bytes.size());
+            f.push_ref(arr);
+        });
+
+    vm.register_native("javax/microedition/rms/RecordEnumeration",
         "numRecords", "()I",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto it = g_record_enums.find(args[0].as_ref());
@@ -3474,9 +3509,65 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "createPlayer",
         "(Ljava/lang/String;)Ljavax/microedition/media/Player;",
         [](VM& v, Frame& f, std::span<Slot>) {
-            // Locator-based creation (e.g. "capture://audio") — stub
             f.push_ref(v.new_object(
                 v.loader().find_or_stub("javax/microedition/media/Player")));
+        });
+
+    vm.register_native("javax/microedition/media/Manager",
+        "playTone", "(III)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            int note = args[0].as_int();
+            int dur  = args[1].as_int();
+            int vol  = args[2].as_int();
+            if (dur <= 0 || vol <= 0) return;
+            if (note < 0) note = 0; if (note > 127) note = 127;
+            double freq = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+            int rate = 22050;
+            int samples = (rate * dur) / 1000;
+            if (samples <= 0) return;
+            std::vector<int16_t> pcm(samples * 2);
+            int16_t amp = (int16_t)(28000 * vol / 100);
+            double phase = 0, step = 2.0 * M_PI * freq / rate;
+            for (int i = 0; i < samples; ++i) {
+                int16_t s = (int16_t)(amp * std::sin(phase));
+                pcm[i*2] = pcm[i*2+1] = s;
+                phase += step; if (phase > 2*M_PI) phase -= 2*M_PI;
+            }
+            Mix_Chunk* chunk = Mix_QuickLoad_RAW(
+                (Uint8*)pcm.data(), (Uint32)(pcm.size() * sizeof(int16_t)));
+            if (!chunk) return;
+            int ch = Mix_PlayChannel(-1, chunk, 0);
+            if (ch < 0) Mix_FreeChunk(chunk);
+        });
+
+    vm.register_native("javax/microedition/media/Manager",
+        "getSupportedContentTypes",
+        "(Ljava/lang/String;)[Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            const char* types[] = {
+                "audio/midi", "audio/mid", "audio/x-mid",
+                "audio/mpeg", "audio/x-wav", "audio/wav", "audio/x-tone-seq"
+            };
+            int n = (int)(sizeof(types)/sizeof(types[0]));
+            ObjRef arr = v.heap().alloc_ref_array(n,
+                v.loader().find_or_stub("[Ljava/lang/String;"));
+            HeapObject* arrObj = v.heap().deref(arr);
+            if (arrObj) {
+                Slot* slots = arrObj->array_slots();
+                for (int i = 0; i < n; ++i) slots[i] = Slot::from_ref(v.new_string(types[i]));
+            }
+            f.push_ref(arr);
+        });
+
+    vm.register_native("javax/microedition/media/Manager",
+        "getSupportedProtocols",
+        "(Ljava/lang/String;)[Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ObjRef arr = v.heap().alloc_ref_array(1,
+                v.loader().find_or_stub("[Ljava/lang/String;"));
+            HeapObject* arrObj = v.heap().deref(arr);
+            if (arrObj) arrObj->array_slots()[0] = Slot::from_ref(v.new_string("device"));
+            f.push_ref(arr);
         });
 
     static std::unordered_map<ObjRef, ObjRef> g_player_listeners;
@@ -3578,6 +3669,10 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             Slot2 s2; s2.lo = args[1].raw; s2.hi = args[2].raw;
             f.push_long(s2.as_long());
         });
+    vm.register_stub("javax/microedition/media/Player",
+        "getMediaTime", "()J",
+        "no position tracking; -1 = TIME_UNKNOWN per spec",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_long(-1); });
 
     // getControl("VolumeControl") → returns a VolumeControl object
     vm.register_native("javax/microedition/media/Player",

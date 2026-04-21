@@ -631,6 +631,42 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             f.push_int(static_cast<int32_t>(gfx_color(args[0].as_ref()) & 0x00FFFFFFu));
         });
 
+    // Spec: closest displayable color. We render at 24-bit truecolor.
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "getDisplayColor", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            f.push_int(args[1].as_int() & 0x00FFFFFFu);
+        });
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "getRedComponent", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            f.push_int((gfx_color(args[0].as_ref()) >> 16) & 0xFF);
+        });
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "getGreenComponent", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            f.push_int((gfx_color(args[0].as_ref()) >> 8) & 0xFF);
+        });
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "getBlueComponent", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            f.push_int(gfx_color(args[0].as_ref()) & 0xFF);
+        });
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "setGrayScale", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            uint32_t g = (uint32_t)(args[1].as_int() & 0xFF);
+            g_colors[self] = 0xFF000000u | (g << 16) | (g << 8) | g;
+        });
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "getGrayScale", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            uint32_t c = gfx_color(args[0].as_ref());
+            int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+            f.push_int((r + g + b) / 3);
+        });
+
     vm.register_native("javax/microedition/lcdui/Graphics",
         "fillRect", "(IIII)V",
         [](VM&, Frame&, std::span<Slot> args) {
