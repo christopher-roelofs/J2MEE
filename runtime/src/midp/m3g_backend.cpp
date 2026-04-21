@@ -18,9 +18,11 @@
 #include "m3g_core.h"
 
 #include <SDL.h>
+#include <zlib.h>
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -91,4 +93,72 @@ extern "C" M3Gbool m3gglGetNativeWindowParams(M3GNativeWindow /*wnd*/,
 bool j2me_m3g_make_current() {
     if (!ensure_gl_context()) return false;
     return SDL_GL_MakeCurrent(g_gl_window, g_gl_context) == 0;
+}
+
+// ─── M3G interface lifecycle ─────────────────────────────────────────────────
+// One process-wide M3GInterface created lazily on first request. M3G's API
+// requires every other m3gXxx() call to take a handle derived from this.
+//
+// The handle-indirection callbacks (objAllocFunc/Resolve/Free) exist so a host
+// VM can move objects in memory; for desktop we just use the pointer as the
+// handle (uintptr_t round-trip).
+
+namespace {
+
+void* m3g_malloc(M3Gpointer bytes) { return std::malloc((size_t)bytes); }
+void  m3g_free(void* p)            { std::free(p); }
+
+M3GMemObject m3g_obj_alloc(M3Gpointer bytes) {
+    void* p = std::malloc((size_t)bytes);
+    return (M3GMemObject)(uintptr_t)p;
+}
+void* m3g_obj_resolve(M3GMemObject h) { return (void*)(uintptr_t)h; }
+void  m3g_obj_free(M3GMemObject h)    { std::free((void*)(uintptr_t)h); }
+
+void m3g_error_handler(M3Genum errorCode, M3GInterface) {
+    std::fprintf(stderr, "[m3g] error 0x%x\n", (unsigned)errorCode);
+}
+
+void* m3g_begin_render(M3Guint /*userTarget*/) {
+    j2me_m3g_make_current();
+    return nullptr;  // we don't track per-target context yet
+}
+void m3g_end_render(M3Guint /*userTarget*/)     {}
+void m3g_release_target(M3Guint /*userTarget*/) {}
+
+M3GInterface g_interface = nullptr;
+
+} // namespace
+
+// M3G's loader inflate.inl declares this as host-provided. Naming carries
+// "Symbian" historically; behavior is just a single-shot zlib inflate.
+extern "C" M3Gsizei m3gSymbianInflateBlock(M3Gsizei srcLength,
+                                           const M3Gubyte* src,
+                                           M3Gsizei dstLength,
+                                           M3Gubyte* dst) {
+    uLongf out = (uLongf)dstLength;
+    int rc = uncompress((Bytef*)dst, &out, (const Bytef*)src, (uLong)srcLength);
+    return rc == Z_OK ? (M3Gsizei)out : 0;
+}
+
+// Lazily create the singleton M3GInterface. Returns nullptr on failure.
+M3GInterface j2me_m3g_interface() {
+    if (g_interface) return g_interface;
+    M3Gparams p{};
+    p.mallocFunc        = m3g_malloc;
+    p.freeFunc          = m3g_free;
+    p.objAllocFunc      = m3g_obj_alloc;
+    p.objResolveFunc    = m3g_obj_resolve;
+    p.objFreeFunc       = m3g_obj_free;
+    p.errorFunc         = m3g_error_handler;
+    p.beginRenderFunc   = m3g_begin_render;
+    p.endRenderFunc     = m3g_end_render;
+    p.releaseTargetFunc = m3g_release_target;
+    p.userContext       = nullptr;
+    g_interface = m3gCreateInterface(&p);
+    if (g_interface)
+        std::fprintf(stderr, "[m3g] interface created\n");
+    else
+        std::fprintf(stderr, "[m3g] m3gCreateInterface failed\n");
+    return g_interface;
 }
