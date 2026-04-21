@@ -28,15 +28,29 @@ TTF_Font* get_ttf_font(int px_size, bool bold, bool mono = false);  // defined i
 // Java strings are UTF-16 character-indexed.  We store UTF-8 internally, so we
 // need to convert between byte offsets and character indices.
 
+// Return the number of bytes consumed by the char starting at s[i], matching
+// utf8_decode_at's tolerance for invalid sequences (single-byte fallback).
+static inline size_t utf8_step(const std::string& s, size_t i) {
+    if (i >= s.size()) return 1;
+    uint8_t c = (uint8_t)s[i];
+    if (c < 0x80) return 1;
+    if (c < 0xC2) return 1;   // invalid start → Latin-1 fallback
+    if (c < 0xE0) {
+        return (i + 1 < s.size() && ((uint8_t)s[i+1] & 0xC0) == 0x80) ? 2 : 1;
+    }
+    if (c < 0xF0) {
+        return (i + 2 < s.size()
+                && ((uint8_t)s[i+1] & 0xC0) == 0x80
+                && ((uint8_t)s[i+2] & 0xC0) == 0x80) ? 3 : 1;
+    }
+    return 4;
+}
+
 // Count the number of Unicode code points in a UTF-8 string.
 static int32_t utf8_char_count(const std::string& s) {
     int32_t count = 0;
     for (size_t i = 0; i < s.size(); ) {
-        uint8_t c = s[i];
-        if      (c < 0x80)   i += 1;
-        else if (c < 0xE0)   i += 2;
-        else if (c < 0xF0)   i += 3;
-        else                  i += 4;
+        i += utf8_step(s, i);
         ++count;
     }
     return count;
@@ -47,29 +61,43 @@ static size_t utf8_char_to_byte(const std::string& s, int32_t char_idx) {
     size_t byte_off = 0;
     int32_t ci = 0;
     while (byte_off < s.size() && ci < char_idx) {
-        uint8_t c = s[byte_off];
-        if      (c < 0x80)   byte_off += 1;
-        else if (c < 0xE0)   byte_off += 2;
-        else if (c < 0xF0)   byte_off += 3;
-        else                  byte_off += 4;
+        byte_off += utf8_step(s, byte_off);
         ++ci;
     }
     return byte_off;
 }
 
 // Decode the Unicode code point at a byte offset.  Advances off past the character.
+// Invalid UTF-8 sequences fall back to Latin-1 interpretation (1 byte = 1 char)
+// so games that store single-byte chars in range 0x80-0xFF (e.g. via
+// String.replace('~','\u0080')) don't get their following byte absorbed as a
+// bogus UTF-8 continuation.
 static uint16_t utf8_decode_at(const std::string& s, size_t& off) {
     if (off >= s.size()) return 0;
     uint8_t c = s[off];
     uint16_t cp;
     if (c < 0x80) {
         cp = c; off += 1;
+    } else if (c < 0xC2) {
+        // 0x80-0xBF are continuation bytes, 0xC0-0xC1 are overlong — none
+        // are valid start bytes. Treat as Latin-1 fallback.
+        cp = c; off += 1;
     } else if (c < 0xE0) {
-        cp = ((c & 0x1F) << 6) | (s[off+1] & 0x3F);
-        off += 2;
+        if (off + 1 < s.size() && ((uint8_t)s[off+1] & 0xC0) == 0x80) {
+            cp = ((c & 0x1F) << 6) | (s[off+1] & 0x3F);
+            off += 2;
+        } else {
+            cp = c; off += 1;  // invalid continuation → Latin-1 fallback
+        }
     } else if (c < 0xF0) {
-        cp = ((c & 0x0F) << 12) | ((s[off+1] & 0x3F) << 6) | (s[off+2] & 0x3F);
-        off += 3;
+        if (off + 2 < s.size()
+            && ((uint8_t)s[off+1] & 0xC0) == 0x80
+            && ((uint8_t)s[off+2] & 0xC0) == 0x80) {
+            cp = ((c & 0x0F) << 12) | ((s[off+1] & 0x3F) << 6) | (s[off+2] & 0x3F);
+            off += 3;
+        } else {
+            cp = c; off += 1;
+        }
     } else {
         // 4-byte chars → surrogate pair territory; return replacement char
         cp = 0xFFFD; off += 4;
@@ -290,9 +318,24 @@ void register_natives(VM& vm, const JarFile& jar) {
     // ── java.lang.Throwable ──────────────────────────────────────────────────
     // We don't have a real exception hierarchy; just make these no-ops so game
     // code can call e.printStackTrace() / e.getMessage() without crashing.
-    vm.register_native("java/lang/Throwable", "<init>",          "()V",                    [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/lang/Throwable", "<init>",          "(Ljava/lang/String;)V",  [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/lang/Throwable", "printStackTrace", "()V",                    [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Throwable", "<init>", "()V",
+        "no message field to init",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Throwable", "<init>", "(Ljava/lang/String;)V",
+        "message arg discarded; getMessage() returns \"\"",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Throwable", "printStackTrace", "()V",
+        "no stack-trace capture — deliberately silent",
+        [](VM&, Frame&, std::span<Slot>) {});
+    // BIOS Throwable.<init> calls these private native leaves; both are
+    // spec-legal no-ops when there's no trace capture machinery.
+    vm.register_noop("java/lang/Throwable", "fillInStackTrace", "()V",
+        "no trace capture",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Throwable", "obtainBackTrace",
+        "()Ljava/lang/Object;",
+        "no trace capture; return null",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
     vm.register_native("java/lang/Throwable", "getMessage",      "()Ljava/lang/String;",
         [](VM& v, Frame& f, std::span<Slot>) { f.push_ref(v.new_string("")); });
     vm.register_native("java/lang/Throwable", "toString",        "()Ljava/lang/String;",
@@ -303,16 +346,27 @@ void register_natives(VM& vm, const JarFile& jar) {
             std::replace(name.begin(), name.end(), '/', '.');
             f.push_ref(v.new_string(name));
         });
-    vm.register_native("java/lang/Exception", "<init>",          "()V",                    [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/lang/Exception", "<init>",          "(Ljava/lang/String;)V",  [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/lang/Exception", "printStackTrace", "()V",                    [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Exception", "<init>", "()V",
+        "no message field to init",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Exception", "<init>", "(Ljava/lang/String;)V",
+        "message arg discarded; getMessage() returns \"\"",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Exception", "printStackTrace", "()V",
+        "no stack-trace capture — deliberately silent",
+        [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/lang/Exception", "getMessage",      "()Ljava/lang/String;",
         [](VM& v, Frame& f, std::span<Slot>) { f.push_ref(v.new_string("")); });
-    vm.register_native("java/lang/RuntimeException", "printStackTrace", "()V",             [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/RuntimeException", "printStackTrace", "()V",
+        "no stack-trace capture — deliberately silent",
+        [](VM&, Frame&, std::span<Slot>) {});
 
     // ── java.lang.Object ─────────────────────────────────────────────────────
 
-    vm.register_native("java/lang/Object", "<init>", "()V",
+    // Object.<init> has an interpreter fast path (fp_object_init) that
+    // bypasses this lambda — hit count will always read 0 in the report.
+    vm.register_noop("java/lang/Object", "<init>", "()V",
+        "no fields to init (interpreter fast-path bypasses this lambda)",
         [](VM&, Frame&, std::span<Slot>) {});
 
     vm.register_native("java/lang/Object", "getClass",
@@ -362,10 +416,10 @@ void register_natives(VM& vm, const JarFile& jar) {
             if (ms <= 0) {
                 v.scheduler.wait_current(args[0].as_ref());
             } else {
-                // Timed wait: approximate as a plain sleep. A notify()
-                // during the sleep won't wake us early, but this pattern is
-                // rare in the games we target (most use the untimed form).
-                v.scheduler.sleep_current((uint64_t)ms);
+                // Real timed wait: Waiting state with a wake deadline, so a
+                // notify() from another thread wakes us early (which plain
+                // sleep wouldn't).
+                v.scheduler.wait_current_timed(args[0].as_ref(), (uint64_t)ms);
             }
         });
     vm.register_native("java/lang/Object", "notify", "()V",
@@ -388,6 +442,40 @@ void register_natives(VM& vm, const JarFile& jar) {
             f.push_ref(v.new_string(name));
         });
 
+    vm.register_native("java/lang/Class", "isArray", "()Z",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            ClassDef* k = class_from_object(v, args[0].as_ref());
+            f.push_int((k && !k->name.empty() && k->name[0] == '[') ? 1 : 0);
+        });
+    vm.register_native("java/lang/Class", "isInterface", "()Z",
+        [](VM&, Frame& f, std::span<Slot>) {
+            // ClassDef doesn't store class-level access flags today; nothing
+            // in our game set checks this path materially. Return false.
+            f.push_int(0);
+        });
+
+    // BIOS Class.newInstance() calls these two private leaves: newInstance0
+    // allocates, newInstance1 invokes <init>()V on the fresh instance.
+    vm.register_noop("java/lang/Class", "newInstance0",
+        "()Ljava/lang/Object;",
+        "BIOS newInstance leaf: alloc only (no ctor)",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            ClassDef* klass = class_from_object(v, args[0].as_ref());
+            if (!klass) { f.push_ref(NULL_REF); return; }
+            f.push_ref(v.new_object(klass));
+        });
+    vm.register_noop("java/lang/Class", "newInstance1",
+        "(Ljava/lang/Object;)V",
+        "BIOS newInstance leaf: invoke <init>()V on the freshly allocated obj",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef obj = args[1].as_ref();
+            if (obj == NULL_REF) return;
+            HeapObject* ho = v.heap().deref(obj);
+            if (!ho || !ho->klass) return;
+            if (auto* init = ho->klass->resolve_virtual("<init>", "()V"))
+                v.invoke(init, ho->klass, {Slot::from_ref(obj)});
+        });
+
     vm.register_native("java/lang/Class", "forName",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         [](VM& v, Frame& f, std::span<Slot> args) {
@@ -407,6 +495,10 @@ void register_natives(VM& vm, const JarFile& jar) {
         [&jar](VM& v, Frame& f, std::span<Slot> args) {
             std::string requested = v.string_value(args[1].as_ref());
             std::string path = jar.resolve(requested);
+            if (getenv("J2ME_TRACE_RES"))
+                fprintf(stderr, "[res] getResourceAsStream(\"%s\") -> %s\n",
+                        requested.c_str(),
+                        path.empty() ? "NOT FOUND" : path.c_str());
             if (path.empty()) {
                 fprintf(stderr, "[native] getResourceAsStream: not found: %s\n",
                         requested.c_str());
@@ -504,6 +596,20 @@ void register_natives(VM& vm, const JarFile& jar) {
             StreamEntry& s = it->second;
             int16_t v = static_cast<int16_t>(
                 (uint16_t(s.data[s.pos]) << 8) | s.data[s.pos+1]);
+            s.pos += 2;
+            f.push_int(v);
+        });
+
+    // readChar reads an unsigned 16-bit big-endian value as a Java char.
+    // Wolfenstein RPG uses this to parse map data; stubbing it makes map
+    // loading spin forever because the BSP stream appears to be all zeros.
+    vm.register_native("java/io/DataInputStream", "readChar", "()C",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_streams.find(args[0].as_ref());
+            if (it == g_streams.end() || it->second.pos + 2 > (int32_t)it->second.data.size())
+                throw JvmException{NULL_REF, "EOFException"};
+            StreamEntry& s = it->second;
+            uint16_t v = (uint16_t(s.data[s.pos]) << 8) | uint16_t(s.data[s.pos+1]);
             s.pos += 2;
             f.push_int(v);
         });
@@ -740,9 +846,11 @@ void register_natives(VM& vm, const JarFile& jar) {
             auto it = g_streams.find(args[0].as_ref());
             if (it != g_streams.end()) it->second.data.clear();
         });
-    vm.register_native("java/io/ByteArrayOutputStream", "close", "()V",
-        [](VM&, Frame&, std::span<Slot>) {});  // games often reuse after close
-    vm.register_native("java/io/ByteArrayOutputStream", "flush", "()V",
+    vm.register_noop("java/io/ByteArrayOutputStream", "close", "()V",
+        "in-memory buffer; games often reuse after close",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/io/ByteArrayOutputStream", "flush", "()V",
+        "in-memory buffer; nothing to flush",
         [](VM&, Frame&, std::span<Slot>) {});
     // ── java.io.DataOutputStream ──────────────────────────────────────────────
     // Wraps another OutputStream. We track the underlying stream ref and
@@ -836,9 +944,11 @@ void register_natives(VM& vm, const JarFile& jar) {
             uint8_t* bytes = reinterpret_cast<uint8_t*>(arr->array_bytes());
             s->data.insert(s->data.end(), bytes + off, bytes + off + len);
         });
-    vm.register_native("java/io/DataOutputStream", "flush", "()V",
+    vm.register_noop("java/io/DataOutputStream", "flush", "()V",
+        "forwards to underlying; we write immediately",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/io/DataOutputStream", "close", "()V",
+    vm.register_noop("java/io/DataOutputStream", "close", "()V",
+        "wrapper; underlying stream lifetime managed by the ref",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/io/DataOutputStream", "size", "()I",
         [dos_target](VM&, Frame& f, std::span<Slot> args) {
@@ -861,7 +971,8 @@ void register_natives(VM& vm, const JarFile& jar) {
 
     // ── java.lang.String ─────────────────────────────────────────────────────
 
-    vm.register_native("java/lang/String", "<init>", "()V",
+    vm.register_noop("java/lang/String", "<init>", "()V",
+        "String(): empty default; field_slots already zeroed",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/lang/String", "<init>", "(Ljava/lang/String;)V",
         [](VM& v, Frame&, std::span<Slot> args) {
@@ -1355,7 +1466,21 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "(Ljava/lang/String;)Ljava/lang/StringBuffer;",
         [](VM& v, Frame& f, std::span<Slot> args) {
             ObjRef self = args[0].as_ref();
-            g_string_buffers[self] += v.string_value(args[1].as_ref());
+            std::string sv = v.string_value(args[1].as_ref());
+            g_string_buffers[self] += sv;
+            if (getenv("J2ME_TRACE_APPEND")) {
+                static int s_a = 0;
+                if (s_a < 200) {
+                    fprintf(stderr, "[append] sb=%u += \"", self);
+                    for (size_t i = 0; i < sv.size() && i < 40; ++i) {
+                        uint8_t c = sv[i];
+                        if (c >= 0x20 && c < 0x7F) fputc((char)c, stderr);
+                        else fprintf(stderr, "<%02x>", c);
+                    }
+                    fprintf(stderr, "\" (len=%zu, was=%zu)\n", sv.size(), g_string_buffers[self].size() - sv.size());
+                    s_a++;
+                }
+            }
             f.push_ref(self);
         });
 
@@ -1449,15 +1574,37 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto it = g_string_buffers.find(args[0].as_ref());
             int32_t idx = args[1].as_int();
+            int32_t result = 0;
             if (it != g_string_buffers.end()) {
                 size_t byte_off = utf8_char_to_byte(it->second, idx);
                 if (byte_off < it->second.size())
-                    f.push_int(utf8_decode_at(it->second, byte_off));
-                else
-                    f.push_int(0);
-            } else {
-                f.push_int(0);
+                    result = utf8_decode_at(it->second, byte_off);
             }
+            if (getenv("J2ME_TRACE_CHARAT") && it != g_string_buffers.end()) {
+                static int s_c = 0;
+                static ObjRef last_sb = NULL_REF;
+                ObjRef sb = args[0].as_ref();
+                // On new StringBuffer or idx==0, dump the content
+                if (s_c < 400 && (sb != last_sb || idx == 0)) {
+                    const std::string& s = it->second;
+                    fprintf(stderr, "[sb] #%u content len=%zu: \"", sb, s.size());
+                    for (size_t i = 0; i < s.size() && i < 80; ++i) {
+                        uint8_t c = s[i];
+                        if (c >= 0x20 && c < 0x7F) fputc((char)c, stderr);
+                        else fprintf(stderr, "<%02x>", c);
+                    }
+                    fprintf(stderr, "\"\n");
+                    last_sb = sb;
+                    s_c++;
+                }
+                if (s_c < 400) {
+                    fprintf(stderr, "[charAt] sb=%u idx=%d -> 0x%02x '%c'\n",
+                            sb, idx, result,
+                            (result>=0x20&&result<0x7F)?(char)result:'?');
+                    s_c++;
+                }
+            }
+            f.push_int(result);
         });
 
     // ── java.lang.Short / Byte / Boolean ─────────────────────────────────────
@@ -1579,12 +1726,12 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         return false;
     };
 
-    vm.register_native("java/util/Hashtable", "<init>", "()V",
+    vm.register_fallback("java/util/Hashtable", "<init>", "()V",
         [](VM&, Frame&, std::span<Slot> args) {
             g_hashtables[args[0].as_ref()] = {};
         });
 
-    vm.register_native("java/util/Hashtable", "put",
+    vm.register_fallback("java/util/Hashtable", "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         [obj_equals](VM& v, Frame& f, std::span<Slot> args) {
             ObjRef self = args[0].as_ref(), key = args[1].as_ref(), val = args[2].as_ref();
@@ -1596,7 +1743,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(NULL_REF);
         });
 
-    vm.register_native("java/util/Hashtable", "get",
+    vm.register_fallback("java/util/Hashtable", "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         [obj_equals](VM& v, Frame& f, std::span<Slot> args) {
             ObjRef self = args[0].as_ref(), key = args[1].as_ref();
@@ -1607,7 +1754,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(NULL_REF);
         });
 
-    vm.register_native("java/util/Hashtable", "containsKey",
+    vm.register_fallback("java/util/Hashtable", "containsKey",
         "(Ljava/lang/Object;)Z",
         [obj_equals](VM& v, Frame& f, std::span<Slot> args) {
             ObjRef self = args[0].as_ref(), key = args[1].as_ref();
@@ -1616,7 +1763,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_int(0);
         });
 
-    vm.register_native("java/util/Hashtable", "size", "()I",
+    vm.register_fallback("java/util/Hashtable", "size", "()I",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto it = g_hashtables.find(args[0].as_ref());
             f.push_int(it != g_hashtables.end()
@@ -1625,26 +1772,26 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
     // ── java.util.Vector ─────────────────────────────────────────────────────
 
-    vm.register_native("java/util/Vector", "<init>", "(I)V",
+    vm.register_fallback("java/util/Vector", "<init>", "(I)V",
         [](VM&, Frame&, std::span<Slot> args) {
             g_vectors[args[0].as_ref()] = {};
         });
-    vm.register_native("java/util/Vector", "<init>", "(II)V",
+    vm.register_fallback("java/util/Vector", "<init>", "(II)V",
         [](VM&, Frame&, std::span<Slot> args) {
             g_vectors[args[0].as_ref()] = {};
         });
-    vm.register_native("java/util/Vector", "<init>", "()V",
+    vm.register_fallback("java/util/Vector", "<init>", "()V",
         [](VM&, Frame&, std::span<Slot> args) {
             g_vectors[args[0].as_ref()] = {};
         });
 
-    vm.register_native("java/util/Vector", "addElement",
+    vm.register_fallback("java/util/Vector", "addElement",
         "(Ljava/lang/Object;)V",
         [](VM&, Frame&, std::span<Slot> args) {
             g_vectors[args[0].as_ref()].push_back(args[1].as_ref());
         });
 
-    vm.register_native("java/util/Vector", "elementAt",
+    vm.register_fallback("java/util/Vector", "elementAt",
         "(I)Ljava/lang/Object;",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto& v = g_vectors[args[0].as_ref()];
@@ -1652,19 +1799,19 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(idx >= 0 && idx < (int32_t)v.size() ? v[idx] : NULL_REF);
         });
 
-    vm.register_native("java/util/Vector", "size", "()I",
+    vm.register_fallback("java/util/Vector", "size", "()I",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto it = g_vectors.find(args[0].as_ref());
             f.push_int(it != g_vectors.end()
                        ? static_cast<int32_t>(it->second.size()) : 0);
         });
 
-    vm.register_native("java/util/Vector", "removeAllElements", "()V",
+    vm.register_fallback("java/util/Vector", "removeAllElements", "()V",
         [](VM&, Frame&, std::span<Slot> args) {
             g_vectors[args[0].as_ref()].clear();
         });
 
-    vm.register_native("java/util/Vector", "removeElementAt", "(I)V",
+    vm.register_fallback("java/util/Vector", "removeElementAt", "(I)V",
         [](VM&, Frame&, std::span<Slot> args) {
             auto& v = g_vectors[args[0].as_ref()];
             int32_t idx = args[1].as_int();
@@ -1672,7 +1819,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
                 v.erase(v.begin() + idx);
         });
 
-    vm.register_native("java/util/Vector", "insertElementAt",
+    vm.register_fallback("java/util/Vector", "insertElementAt",
         "(Ljava/lang/Object;I)V",
         [](VM&, Frame&, std::span<Slot> args) {
             auto& v = g_vectors[args[0].as_ref()];
@@ -1684,13 +1831,13 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
                 v.push_back(elem);
         });
 
-    vm.register_native("java/util/Vector", "isEmpty", "()Z",
+    vm.register_fallback("java/util/Vector", "isEmpty", "()Z",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto it = g_vectors.find(args[0].as_ref());
             f.push_int(it == g_vectors.end() || it->second.empty() ? 1 : 0);
         });
 
-    vm.register_native("java/util/Vector", "contains",
+    vm.register_fallback("java/util/Vector", "contains",
         "(Ljava/lang/Object;)Z",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto& v = g_vectors[args[0].as_ref()];
@@ -1699,7 +1846,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_int(0);
         });
 
-    vm.register_native("java/util/Vector", "removeElement",
+    vm.register_fallback("java/util/Vector", "removeElement",
         "(Ljava/lang/Object;)Z",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
@@ -1714,7 +1861,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_int(0);
         });
 
-    vm.register_native("java/util/Vector", "indexOf",
+    vm.register_fallback("java/util/Vector", "indexOf",
         "(Ljava/lang/Object;)I",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
@@ -1724,35 +1871,36 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_int(-1);
         });
 
-    vm.register_native("java/util/Vector", "lastElement",
+    vm.register_fallback("java/util/Vector", "lastElement",
         "()Ljava/lang/Object;",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
             f.push_ref(vec.empty() ? NULL_REF : vec.back());
         });
 
-    vm.register_native("java/util/Vector", "firstElement",
+    vm.register_fallback("java/util/Vector", "firstElement",
         "()Ljava/lang/Object;",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
             f.push_ref(vec.empty() ? NULL_REF : vec.front());
         });
 
-    vm.register_native("java/util/Vector", "ensureCapacity", "(I)V",
+    vm.register_noop("java/util/Vector", "ensureCapacity", "(I)V",
+        "underlying std::vector grows on demand; hint is ignored",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/util/Vector", "capacity", "()I",
+    vm.register_fallback("java/util/Vector", "capacity", "()I",
         [](VM&, Frame& f, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
             f.push_int(static_cast<int32_t>(vec.capacity()));
         });
-    vm.register_native("java/util/Vector", "setSize", "(I)V",
+    vm.register_fallback("java/util/Vector", "setSize", "(I)V",
         [](VM&, Frame&, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
             int32_t sz = args[1].as_int();
             if (sz < 0) sz = 0;
             vec.resize(sz, NULL_REF);
         });
-    vm.register_native("java/util/Vector", "copyInto",
+    vm.register_fallback("java/util/Vector", "copyInto",
         "([Ljava/lang/Object;)V",
         [](VM& v, Frame&, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
@@ -1764,7 +1912,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             for (int32_t i = 0; i < std::min((int32_t)vec.size(), len); ++i)
                 slots[i] = Slot::from_ref(vec[i]);
         });
-    vm.register_native("java/util/Vector", "setElementAt",
+    vm.register_fallback("java/util/Vector", "setElementAt",
         "(Ljava/lang/Object;I)V",
         [](VM&, Frame&, std::span<Slot> args) {
             auto& vec = g_vectors[args[0].as_ref()];
@@ -1776,7 +1924,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     // Vector.elements() → Enumeration
     static std::unordered_map<ObjRef, std::pair<ObjRef, int32_t>> g_enumerations;  // enum ref → (vector ref, pos)
 
-    vm.register_native("java/util/Vector", "elements",
+    vm.register_fallback("java/util/Vector", "elements",
         "()Ljava/util/Enumeration;",
         [](VM& v, Frame& f, std::span<Slot> args) {
             ObjRef vec_ref = args[0].as_ref();
@@ -1805,7 +1953,60 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
                 f.push_ref(NULL_REF);
         });
 
+    // ── java.lang.Float / Double bit-cast leaves ────────────────────────────
+    // BIOS's Float.java / Double.java declare these native; games may also
+    // call them directly.
+    vm.register_native("java/lang/Float", "floatToIntBits", "(F)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            float v = args[0].as_float();
+            int32_t bits; std::memcpy(&bits, &v, 4);
+            f.push_int(bits);
+        });
+    vm.register_native("java/lang/Float", "intBitsToFloat", "(I)F",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            int32_t bits = args[0].as_int();
+            float v; std::memcpy(&v, &bits, 4);
+            f.push_float(v);
+        });
+    vm.register_native("java/lang/Double", "doubleToLongBits", "(D)J",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            Slot2 s2; s2.lo = args[0].raw; s2.hi = args[1].raw;
+            double v = s2.as_double();
+            int64_t bits; std::memcpy(&bits, &v, 8);
+            f.push_long(bits);
+        });
+    vm.register_native("java/lang/Double", "longBitsToDouble", "(J)D",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            Slot2 s2; s2.lo = args[0].raw; s2.hi = args[1].raw;
+            int64_t bits = s2.as_long();
+            double v; std::memcpy(&v, &bits, 8);
+            f.push_double(v);
+        });
+
     // ── java.lang.Math ───────────────────────────────────────────────────────
+    // sin/cos/sqrt have interpreter fast paths already; the rest route to libm.
+    auto math_unary = [](double (*fn)(double)) {
+        return NativeFunc([fn](VM&, Frame& f, std::span<Slot> args) {
+            Slot2 s2; s2.lo = args[0].raw; s2.hi = args[1].raw;
+            double r = fn(s2.as_double());
+            f.push_double(r);
+        });
+    };
+    vm.register_native("java/lang/Math", "sin",   "(D)D", math_unary(std::sin));
+    vm.register_native("java/lang/Math", "cos",   "(D)D", math_unary(std::cos));
+    vm.register_native("java/lang/Math", "tan",   "(D)D", math_unary(std::tan));
+    vm.register_native("java/lang/Math", "sqrt",  "(D)D", math_unary(std::sqrt));
+    vm.register_native("java/lang/Math", "ceil",  "(D)D", math_unary(std::ceil));
+    vm.register_native("java/lang/Math", "floor", "(D)D", math_unary(std::floor));
+    vm.register_native("java/lang/Math", "asin",  "(D)D", math_unary(std::asin));
+    vm.register_native("java/lang/Math", "acos",  "(D)D", math_unary(std::acos));
+    vm.register_native("java/lang/Math", "atan",  "(D)D", math_unary(std::atan));
+    vm.register_native("java/lang/Math", "atan2", "(DD)D",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            Slot2 a; a.lo = args[0].raw; a.hi = args[1].raw;
+            Slot2 b; b.lo = args[2].raw; b.hi = args[3].raw;
+            f.push_double(std::atan2(a.as_double(), b.as_double()));
+        });
 
     vm.register_native("java/lang/Math", "abs", "(I)I",
         [](VM&, Frame& f, std::span<Slot> args) {
@@ -1877,7 +2078,8 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         [](VM&, Frame& f, std::span<Slot>) { f.push_long(1024 * 1024); });
     vm.register_native("java/lang/Runtime", "totalMemory", "()J",
         [](VM&, Frame& f, std::span<Slot>) { f.push_long(2 * 1024 * 1024); });
-    vm.register_native("java/lang/Runtime", "gc", "()V",
+    vm.register_noop("java/lang/Runtime", "gc", "()V",
+        "host GC runs automatically; no manual collect",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // ── java.lang.System ─────────────────────────────────────────────────────
@@ -1912,7 +2114,8 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             }
         });
 
-    vm.register_native("java/lang/System", "gc", "()V",
+    vm.register_noop("java/lang/System", "gc", "()V",
+        "host GC runs automatically; no manual collect",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // ── java.lang.Thread ─────────────────────────────────────────────────────
@@ -1922,9 +2125,28 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     // the Runnable-taking constructor needs a no-op here — it's called by
     // the `new Thread(runnable)` bytecode before Thread.start captures the
     // runnable from g_thread_runnable.
-    vm.register_native("java/lang/Thread", "<init>", "(Ljava/lang/Runnable;)V",
+    // BIOS Thread leaves — all no-ops for our cooperative scheduler.
+    vm.register_noop("java/lang/Thread", "setPriority0", "(II)V",
+        "cooperative scheduler; priority ignored",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/lang/Thread", "<init>", "()V",
+    vm.register_noop("java/lang/Thread", "interrupt0", "()V",
+        "no interrupt modelled",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Thread", "internalExit", "()V",
+        "cooperative exit happens when the green thread returns",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Thread", "isAlive", "()Z",
+        "best-effort: always report alive (until our scheduler tracks)",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(1); });
+    vm.register_noop("java/lang/Thread", "activeCount", "()I",
+        "not tracked; return 1",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(1); });
+
+    vm.register_noop("java/lang/Thread", "<init>", "(Ljava/lang/Runnable;)V",
+        "runnable captured separately in g_thread_runnable",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("java/lang/Thread", "<init>", "()V",
+        "subclass-run thread; no state to init here",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("java/lang/Thread", "yield", "()V",
         [](VM& v, Frame&, std::span<Slot>) {
@@ -2020,11 +2242,13 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         });
 
     // Fake HttpConnection methods.
-    vm.register_native("javax/microedition/io/HttpConnection",
+    vm.register_stub("javax/microedition/io/HttpConnection",
         "setRequestMethod", "(Ljava/lang/String;)V",
+        "no HTTP backend; method silently discarded",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/io/HttpConnection",
+    vm.register_stub("javax/microedition/io/HttpConnection",
         "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V",
+        "no HTTP backend; headers silently discarded",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("javax/microedition/io/HttpConnection",
         "getResponseCode", "()I",
@@ -2074,21 +2298,25 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/wireless/messaging/MessageConnection",
         "numberOfSegments", "(Ljavax/wireless/messaging/Message;)I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(1); });
-    vm.register_native("javax/wireless/messaging/MessageConnection",
+    vm.register_stub("javax/wireless/messaging/MessageConnection",
         "close", "()V",
+        "no SMS backend; nothing to close",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/wireless/messaging/MessageConnection",
+    vm.register_stub("javax/wireless/messaging/MessageConnection",
         "setMessageListener", "(Ljavax/wireless/messaging/MessageListener;)V",
+        "no SMS backend; listener never fires",
         [](VM&, Frame&, std::span<Slot>) {});
     // Message / TextMessage setters + getters (enough to round-trip).
-    vm.register_native("javax/wireless/messaging/TextMessage",
+    vm.register_stub("javax/wireless/messaging/TextMessage",
         "setPayloadText", "(Ljava/lang/String;)V",
+        "no SMS backend; payload discarded",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("javax/wireless/messaging/TextMessage",
         "getPayloadText", "()Ljava/lang/String;",
         [](VM& v, Frame& f, std::span<Slot>) { f.push_ref(v.new_string("")); });
-    vm.register_native("javax/wireless/messaging/Message",
+    vm.register_stub("javax/wireless/messaging/Message",
         "setAddress", "(Ljava/lang/String;)V",
+        "no SMS backend; address discarded",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("javax/wireless/messaging/Message",
         "getAddress", "()Ljava/lang/String;",
@@ -2111,20 +2339,25 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             ClassDef* osKlass = v.loader().find_or_stub("java/io/OutputStream");
             f.push_ref(v.heap().alloc_object(osKlass, 0));
         });
-    vm.register_native("javax/microedition/io/HttpConnection",
+    vm.register_stub("javax/microedition/io/HttpConnection",
         "close", "()V",
+        "no HTTP backend; nothing to close",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/io/OutputStream",
+    vm.register_stub("java/io/OutputStream",
         "write", "([B)V",
+        "abstract-base no-op; subclasses should override",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/io/OutputStream",
+    vm.register_stub("java/io/OutputStream",
         "write", "([BII)V",
+        "abstract-base no-op; subclasses should override",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/io/OutputStream",
+    vm.register_noop("java/io/OutputStream",
         "flush", "()V",
+        "abstract base; spec allows no-op",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/io/OutputStream",
+    vm.register_noop("java/io/OutputStream",
         "close", "()V",
+        "abstract base; spec allows no-op",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // ── String.toString() ──────────────────────────────────────────────────────
@@ -2198,43 +2431,48 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "javax/microedition/m3g/Light",
         "javax/microedition/m3g/Appearance",
     }) {
-        vm.register_native(klass, "<init>", "()V",
+        vm.register_stub(klass, "<init>", "()V",
+            "M3G class constructed but pipeline not implemented",
             [](VM&, Frame&, std::span<Slot>) {});
     }
 
     // ── java.util.Date / Calendar ────────────────────────────────────────────
-    vm.register_native("java/util/Date", "<init>", "()V",
+    vm.register_stub("java/util/Date", "<init>", "()V",
+        "Date fields not stored; only getTime() at point-of-call works",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/util/Date", "<init>", "(J)V",
+    vm.register_stub("java/util/Date", "<init>", "(J)V",
+        "long ctor arg discarded; Date does not roundtrip",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/util/Date", "getTime", "()J",
+    vm.register_fallback("java/util/Date", "getTime", "()J",
         [](VM&, Frame& f, std::span<Slot>) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             f.push_long(int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000);
         });
 
-    vm.register_native("java/util/Calendar", "getInstance",
+    vm.register_fallback("java/util/Calendar", "getInstance",
         "()Ljava/util/Calendar;",
         [](VM& v, Frame& f, std::span<Slot>) {
             f.push_ref(v.new_object(v.loader().find_or_stub("java/util/Calendar")));
         });
-    vm.register_native("java/util/Calendar", "setTime", "(Ljava/util/Date;)V",
+    vm.register_stub("java/util/Calendar", "setTime", "(Ljava/util/Date;)V",
+        "Calendar does not store Date; subsequent get() returns wall clock",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/util/Calendar", "getTime", "()Ljava/util/Date;",
+    vm.register_fallback("java/util/Calendar", "getTime", "()Ljava/util/Date;",
         [](VM& v, Frame& f, std::span<Slot>) {
             ClassDef* dk = v.loader().find_or_stub("java/util/Date");
             f.push_ref(v.heap().alloc_object(dk, 0));
         });
-    vm.register_native("java/util/Calendar", "setTimeInMillis", "(J)V",
+    vm.register_stub("java/util/Calendar", "setTimeInMillis", "(J)V",
+        "Calendar does not store millis; subsequent get() returns wall clock",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("java/util/Calendar", "getTimeInMillis", "()J",
+    vm.register_fallback("java/util/Calendar", "getTimeInMillis", "()J",
         [](VM&, Frame& f, std::span<Slot>) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             f.push_long(int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000);
         });
-    vm.register_native("java/util/Calendar", "get", "(I)I",
+    vm.register_fallback("java/util/Calendar", "get", "(I)I",
         [](VM&, Frame& f, std::span<Slot> args) {
             // Calendar field IDs: YEAR=1, MONTH=2, DAY_OF_MONTH=5,
             // HOUR_OF_DAY=11, MINUTE=12, SECOND=13
@@ -2256,25 +2494,26 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
     // ── java.util.Random ──────────────────────────────────────────────────────
 
-    vm.register_native("java/util/Random", "<init>", "()V",
+    vm.register_fallback("java/util/Random", "<init>", "()V",
         [](VM&, Frame&, std::span<Slot>) { srand(static_cast<unsigned>(time(nullptr))); });
-    vm.register_native("java/util/Random", "<init>", "(J)V",
+    vm.register_fallback("java/util/Random", "<init>", "(J)V",
         [](VM&, Frame&, std::span<Slot> args) {
             // args[0]=this, args[1]=lo word of seed, args[2]=hi word of seed
             Slot2 s; s.lo = args[1].raw; s.hi = args[2].raw;
             srand(static_cast<unsigned>(s.as_long() & 0xFFFFFFFF));
         });
-    vm.register_native("java/util/Random", "nextInt", "(I)I",
+    vm.register_fallback("java/util/Random", "nextInt", "(I)I",
         [](VM&, Frame& f, std::span<Slot> args) {
             int32_t b = args[1].as_int();
             f.push_int(b > 0 ? rand() % b : 0);
         });
-    vm.register_native("java/util/Random", "nextInt", "()I",
+    vm.register_fallback("java/util/Random", "nextInt", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(rand()); });
 
     // ── javax.microedition.midlet.MIDlet ─────────────────────────────────────
 
-    vm.register_native("javax/microedition/midlet/MIDlet", "<init>", "()V",
+    vm.register_noop("javax/microedition/midlet/MIDlet", "<init>", "()V",
+        "no MIDlet-level fields to init",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("javax/microedition/midlet/MIDlet",
         "getAppProperty", "(Ljava/lang/String;)Ljava/lang/String;",
@@ -2322,6 +2561,33 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             throw QuitRequest{};
         });
 
+    // Lifecycle signal to the AMS that the MIDlet has paused itself. Spec
+    // permits the runtime to do nothing; we don't model pause state yet.
+    vm.register_noop("javax/microedition/midlet/MIDlet",
+        "notifyPaused", "()V",
+        "AMS pause lifecycle not modelled",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // Spec: returns false if the platform can't handle the URL. We don't
+    // support opening URLs, making calls, launching other MIDlets, etc.
+    vm.register_noop("javax/microedition/midlet/MIDlet",
+        "platformRequest", "(Ljava/lang/String;)Z",
+        "no external URL/dial handler — false is the spec-legal answer",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+
+    vm.register_noop("javax/microedition/midlet/MIDlet",
+        "resumeRequest", "()V",
+        "no paused-state tracking, nothing to resume",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // Controllable is the superinterface of Player. getControl(name) returns
+    // null when the named control isn't available — spec-legal, and lets
+    // games fall through to unguarded-feature paths.
+    vm.register_noop("javax/microedition/media/Controllable",
+        "getControl", "(Ljava/lang/String;)Ljavax/microedition/media/Control;",
+        "no Controllable-interface control lookup; null = no such control",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+
     // ── javax.microedition.lcdui.Display ──────────────────────────────────────
 
     vm.register_native("javax/microedition/lcdui/Display",
@@ -2343,6 +2609,28 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/lcdui/Display",
         "numColors", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(65536); });
+
+    vm.register_native("javax/microedition/lcdui/Display",
+        "getCurrent", "()Ljavax/microedition/lcdui/Displayable;",
+        [](VM&, Frame& f, std::span<Slot>) {
+            extern ObjRef g_current_displayable;
+            f.push_ref(g_current_displayable);
+        });
+
+    // Alert variant: games with an optional Alert dialog. We don't render
+    // Alerts; just route to the underlying Displayable.
+    vm.register_native("javax/microedition/lcdui/Display",
+        "setCurrent",
+        "(Ljavax/microedition/lcdui/Alert;Ljavax/microedition/lcdui/Displayable;)V",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            // args: this, alert, nextDisplayable  → forward the 2nd.
+            MethodDef* base = v.loader().find("javax/microedition/lcdui/Display")
+                               ->find_method("setCurrent",
+                                   "(Ljavax/microedition/lcdui/Displayable;)V");
+            if (!base) return;
+            Slot fwd[2] = { args[0], args[2] };
+            v.invoke(base, base->owner, std::span<const Slot>(fwd, 2));
+        });
 
     vm.register_native("javax/microedition/lcdui/Display",
         "setCurrent", "(Ljavax/microedition/lcdui/Displayable;)V",
@@ -2636,14 +2924,23 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
     // ── GameCanvas ────────────────────────────────────────────────────────────
 
-    vm.register_native("javax/microedition/lcdui/game/GameCanvas",
+    vm.register_noop("javax/microedition/lcdui/game/GameCanvas",
         "<init>", "(Z)V",
+        "suppressKeyEvents arg ignored; we always deliver key events",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // BIOS GameCanvas.<init>(boolean) calls this package-private static leaf.
+    vm.register_noop("javax/microedition/lcdui/game/GameCanvas",
+        "setSuppressKeyEvents",
+        "(Ljavax/microedition/lcdui/Canvas;Z)V",
+        "suppressKeyEvents not tracked; we always deliver key events",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("javax/microedition/lcdui/game/GameCanvas",
         "getKeyStates", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
-    vm.register_native("javax/microedition/lcdui/game/GameCanvas",
+    vm.register_noop("javax/microedition/lcdui/game/GameCanvas",
         "flushGraphics", "()V",
+        "we draw direct to Display surface; no back-buffer to flip",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("javax/microedition/lcdui/game/GameCanvas",
         "getGraphics", "()Ljavax/microedition/lcdui/Graphics;",
@@ -2654,45 +2951,50 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
     // ── Canvas ────────────────────────────────────────────────────────────────
 
-    vm.register_native("javax/microedition/lcdui/Canvas",
+    vm.register_noop("javax/microedition/lcdui/Canvas",
         "setFullScreenMode", "(Z)V",
+        "single window size; no chrome to hide",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/lcdui/Canvas",
+    vm.register_noop("javax/microedition/lcdui/Canvas",
         "showNotify", "()V",
+        "base-class hook; Java subclasses override",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/lcdui/Canvas",
+    vm.register_noop("javax/microedition/lcdui/Canvas",
         "hideNotify", "()V",
+        "base-class hook; Java subclasses override",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/lcdui/Canvas",
+    vm.register_noop("javax/microedition/lcdui/Canvas",
         "sizeChanged", "(II)V",
+        "base-class hook; Java subclasses override",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // Alert — stub dialogs as no-ops (games use these for info/error popups)
-    vm.register_native("javax/microedition/lcdui/Alert",
+    vm.register_stub("javax/microedition/lcdui/Alert",
         "<init>", "(Ljava/lang/String;)V",
+        "Alert UI not implemented; title discarded",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/lcdui/Alert",
+    vm.register_stub("javax/microedition/lcdui/Alert",
         "<init>",
         "(Ljava/lang/String;Ljava/lang/String;Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V",
+        "Alert UI not implemented; all args discarded",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/lcdui/Alert",
+    vm.register_stub("javax/microedition/lcdui/Alert",
         "setType", "(Ljavax/microedition/lcdui/AlertType;)V",
+        "Alert UI not implemented; type discarded",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/lcdui/Alert",
+    vm.register_stub("javax/microedition/lcdui/Alert",
         "setTimeout", "(I)V",
+        "Alert UI not implemented; timeout discarded",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("javax/microedition/lcdui/Alert",
+    vm.register_stub("javax/microedition/lcdui/Alert",
         "setString", "(Ljava/lang/String;)V",
+        "Alert UI not implemented; text discarded",
         [](VM&, Frame&, std::span<Slot>) {});
     vm.register_native("javax/microedition/lcdui/Alert",
         "getDefaultTimeout", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(2000); });
-    vm.register_native("javax/microedition/lcdui/Canvas",
-        "getWidth", "()I",
-        [](VM&, Frame& f, std::span<Slot>) { f.push_int(240); });
-    vm.register_native("javax/microedition/lcdui/Canvas",
-        "getHeight", "()I",
-        [](VM&, Frame& f, std::span<Slot>) { f.push_int(320); });
+    // Canvas.getWidth/getHeight are registered in graphics_natives.cpp
+    // (they need Display::instance() which lives there).
 
     // getGameAction maps key codes to MIDP game actions.
     // MIDP game action constants: UP=1, LEFT=2, RIGHT=5, DOWN=6, FIRE=8, A=9, B=10, C=11, D=12
@@ -2712,6 +3014,87 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_int(action);
         });
 
+    // BIOS's Canvas.getKeyCode/getGameAction call into a static helper class
+    // KeyConverter for platform-specific mappings. Mirror our Canvas logic.
+    vm.register_native("javax/microedition/lcdui/KeyConverter",
+        "getKeyCode", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            // Game action → key code (inverse of Canvas.getGameAction).
+            // Cover all MIDP game actions so BIOS's Canvas.getKeyCode never
+            // sees a 0 return (which it treats as an invalid action).
+            int32_t action = args[0].as_int();
+            int32_t key = 0;
+            switch (action) {
+                case 1:  key = -1;  break;  // UP
+                case 2:  key = -3;  break;  // LEFT
+                case 5:  key = -4;  break;  // RIGHT
+                case 6:  key = -2;  break;  // DOWN
+                case 8:  key = -5;  break;  // FIRE
+                case 9:  key = -10; break;  // GAME_A
+                case 10: key = -11; break;  // GAME_B
+                case 11: key = -12; break;  // GAME_C
+                case 12: key = -13; break;  // GAME_D
+            }
+            f.push_int(key);
+        });
+    vm.register_native("javax/microedition/lcdui/KeyConverter",
+        "getGameAction", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            int32_t key = args[0].as_int();
+            int32_t action = 0;
+            switch (key) {
+                case -1: case '2': action = 1; break;
+                case -3: case '4': action = 2; break;
+                case -4: case '6': action = 5; break;
+                case -2: case '8': action = 6; break;
+                case -5: case '5': action = 8; break;
+            }
+            f.push_int(action);
+        });
+    vm.register_native("javax/microedition/lcdui/KeyConverter",
+        "getSystemKey", "(I)I",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+    vm.register_native("javax/microedition/lcdui/KeyConverter",
+        "getKeyName", "(I)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            int32_t k = args[0].as_int();
+            const char* n = "";
+            switch (k) {
+                case -1: n = "Up"; break;
+                case -2: n = "Down"; break;
+                case -3: n = "Left"; break;
+                case -4: n = "Right"; break;
+                case -5: n = "Select"; break;
+                case -6: n = "Soft1"; break;
+                case -7: n = "Soft2"; break;
+                default:
+                    if (k >= '0' && k <= '9') {
+                        char buf[2] = { (char)k, 0 };
+                        f.push_ref(v.new_string(buf)); return;
+                    }
+                    if (k == '*') { f.push_ref(v.new_string("*")); return; }
+                    if (k == '#') { f.push_ref(v.new_string("#")); return; }
+                    break;
+            }
+            f.push_ref(v.new_string(n));
+        });
+
+    // Nokia DirectGraphicsImp: ARGB setter used by games that render with
+    // alpha. Our Graphics.setColor accepts ARGB already; route through.
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "setARGBColor", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            // self is the DirectGraphics wrapper; second slot is the ARGB int.
+            // The wrapper holds a ref to the underlying Graphics, but our
+            // setColor is keyed on Graphics ObjRef. Without the wrapper ref
+            // we just best-effort — set on the most-recent Graphics ref.
+            // For now, no-op: most games also call Graphics.setColor.
+            (void)args;
+        });
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "setARGBColor", "(III)V",
+        [](VM&, Frame&, std::span<Slot> args) { (void)args; });
+
     // ── javax.microedition.rms.RecordStore ───────────────────────────────────
     // Simple in-memory record store: g_record_stores[name] = list of byte arrays.
     // Records are 1-based: id 1 = index 0.
@@ -2729,9 +3112,23 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "(Ljava/lang/String;Z)Ljavax/microedition/rms/RecordStore;",
         [rs_name](VM& v, Frame& f, std::span<Slot> args) {
             std::string name = v.string_value(args[0].as_ref());
+            bool createIfNeeded = args[1].as_int() != 0;
             if (g_record_stores.find(name) == g_record_stores.end()) {
-                g_record_stores[name]; // create entry
-                rms_load(name);        // load from disk if available
+                // Try loading from disk; if nothing was loaded and
+                // createIfNeeded is false, throw RecordStoreNotFoundException
+                // so games can detect "no save yet" correctly. Wolfenstein RPG
+                // opens SDFWORLD with createIfNeeded=false on startup to
+                // check for an existing save; without this the dummy empty
+                // store is returned and the first readInt() throws
+                // EOFException → error screen.
+                rms_load(name);
+                if (g_record_stores.find(name) == g_record_stores.end()) {
+                    if (!createIfNeeded) {
+                        throw JvmException{NULL_REF,
+                            "RecordStoreNotFoundException", ""};
+                    }
+                    g_record_stores[name]; // create empty entry
+                }
             }
             ObjRef rs = v.heap().alloc_object(
                 v.loader().find_or_stub("javax/microedition/rms/RecordStore"), 0);
@@ -2784,6 +3181,33 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(arr);
         });
 
+    // Buffer-copy variant: read record `id` into buffer[offset..]. Returns
+    // the number of bytes copied (spec). Many games prefer this to avoid
+    // allocating a fresh byte[] per read.
+    vm.register_native("javax/microedition/rms/RecordStore",
+        "getRecord", "(I[BI)I",
+        [rs_name](VM& v, Frame& f, std::span<Slot> args) {
+            const std::string& name = rs_name(args[0].as_ref());
+            int32_t id     = args[1].as_int();
+            ObjRef buf_ref = args[2].as_ref();
+            int32_t offset = args[3].as_int();
+            auto it = g_record_stores.find(name);
+            if (it == g_record_stores.end() ||
+                id < 1 || id > (int32_t)it->second.size() ||
+                buf_ref == NULL_REF) {
+                f.push_int(0); return;
+            }
+            const auto& bytes = it->second[id - 1];
+            HeapObject* buf = v.heap().deref(buf_ref);
+            if (!buf || offset < 0) { f.push_int(0); return; }
+            int32_t cap = buf->array_length() - offset;
+            int32_t n   = (int32_t)bytes.size();
+            if (n > cap) n = cap < 0 ? 0 : cap;
+            if (n > 0)
+                std::memcpy(buf->array_bytes() + offset, bytes.data(), n);
+            f.push_int(n);
+        });
+
     vm.register_native("javax/microedition/rms/RecordStore",
         "setRecord", "(I[BII)V",
         [rs_name](VM& v, Frame&, std::span<Slot> args) {
@@ -2814,8 +3238,9 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             rms_save(name);
         });
 
-    vm.register_native("javax/microedition/rms/RecordStore",
+    vm.register_noop("javax/microedition/rms/RecordStore",
         "closeRecordStore", "()V",
+        "records persisted on every write; nothing to close",
         [](VM&, Frame&, std::span<Slot>) {});
 
     vm.register_native("javax/microedition/rms/RecordStore",
@@ -3124,8 +3549,9 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             g_players.erase(it);
         });
 
-    vm.register_native("javax/microedition/media/Player",
+    vm.register_noop("javax/microedition/media/Player",
         "deallocate", "()V",
+        "SDL_mixer resources reclaimed when ObjRef is collected",
         [](VM&, Frame&, std::span<Slot>) {});
 
     vm.register_native("javax/microedition/media/Player",
@@ -3140,6 +3566,17 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "getState", "()I",
         [](VM&, Frame& f, std::span<Slot>) {
             f.push_int(300); // PREFETCHED
+        });
+
+    // Real seeking would require backend support (Mix_SetMusicPosition is
+    // format-specific, EAS has no seek). Echoing the requested time keeps
+    // games that check the return value happy; playback won't actually jump.
+    vm.register_stub("javax/microedition/media/Player",
+        "setMediaTime", "(J)J",
+        "echoes requested time; does not actually seek",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            Slot2 s2; s2.lo = args[1].raw; s2.hi = args[2].raw;
+            f.push_long(s2.as_long());
         });
 
     // getControl("VolumeControl") → returns a VolumeControl object
@@ -3171,4 +3608,87 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         [](VM&, Frame& f, std::span<Slot>) {
             f.push_int(Mix_VolumeMusic(-1) * 100 / MIX_MAX_VOLUME);
         });
+
+    // ── BIOS LFImpl leaf natives ──────────────────────────────────────────────
+    // phoneME's javax.microedition.lcdui.*LFImpl classes route through these
+    // private native leaves for platform-side rendering. A "native resource
+    // ID" (NRID) is an int handle the framework uses to refer to a created
+    // widget. For now we return monotonic IDs and do no real work — enough
+    // to progress past the exceptions. Real impls come later, leaf by leaf.
+    static int32_t g_nrid = 1;
+    auto next_nrid = []() -> int32_t { return g_nrid++; };
+
+    // DisplayableLFImpl: class init, destroy, title/ticker setters
+    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+        "initialize0", "()V",
+        "BIOS LFImpl class init — no platform setup needed",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+        "finalize", "()V",
+        "no platform resources to reclaim",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+        "deleteNativeResource0", "(I)V",
+        "no backing resource to free",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+        "setTitle0", "(ILjava/lang/String;)V",
+        "title stored in Java-side Displayable; no window chrome",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+        "setTicker0", "(ILjava/lang/String;)V",
+        "tickers not rendered",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // CanvasLFImpl: one createNativeResource0 call per Canvas
+    vm.register_stub("javax/microedition/lcdui/CanvasLFImpl",
+        "createNativeResource0",
+        "(Ljava/lang/String;Ljava/lang/String;)I",
+        "Canvas paints through our Graphics natives; NRID is opaque",
+        [next_nrid](VM&, Frame& f, std::span<Slot>) { f.push_int(next_nrid()); });
+
+    // FormLFImpl: scroll/viewport/item-focus plumbing
+    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+        "createNativeResource0",
+        "(Ljava/lang/String;Ljava/lang/String;)I",
+        "Form layout handled by BIOS Java code",
+        [next_nrid](VM&, Frame& f, std::span<Slot>) { f.push_int(next_nrid()); });
+    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+        "showNativeResource0", "(IIII)V",
+        "no framed form window",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+        "setCurrentItem0", "(III)V",
+        "focus tracking in Java side",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+        "getScrollPosition0", "()I",
+        "no scroll viewport",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+        "setScrollPosition0", "(I)V",
+        "no scroll viewport",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+        "getViewportHeight0", "()I",
+        "report full screen height as viewport",
+        [](VM&, Frame& f, std::span<Slot>) {
+            extern int g_screen_h; f.push_int(g_screen_h);
+        });
+
+    // AlertLFImpl: popup dialog
+    vm.register_stub("javax/microedition/lcdui/AlertLFImpl",
+        "createNativeResource0",
+        "(Ljava/lang/String;Ljava/lang/String;I)I",
+        "Alert UI not drawn; NRID opaque",
+        [next_nrid](VM&, Frame& f, std::span<Slot>) { f.push_int(next_nrid()); });
+    vm.register_stub("javax/microedition/lcdui/AlertLFImpl",
+        "showNativeResource0", "(I)V",
+        "no Alert dialog presented",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/lcdui/AlertLFImpl",
+        "setNativeContents0",
+        "(ILjavax/microedition/lcdui/ImageData;[ILjava/lang/String;)Z",
+        "Alert contents discarded; return false (not fully set)",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
 }

@@ -21,6 +21,10 @@ extern std::unordered_map<ObjRef, ObjRef> g_command_listeners;
 // Commands added to each Displayable (first=left soft key, rest=right soft key menu)
 static std::unordered_map<ObjRef, std::vector<ObjRef>> g_commands;
 
+// Per-Command metadata, populated from the (String, int, int) ctor.
+struct CommandInfo { ObjRef label = NULL_REF; int type = 0; int priority = 0; };
+static std::unordered_map<ObjRef, CommandInfo> g_command_info;
+
 static std::unordered_map<ObjRef, SDL_Surface*> g_images;   // Image ref → surface
 static std::unordered_map<ObjRef, uint32_t>     g_colors;   // Graphics ref → current color (ARGB)
 static std::unordered_map<ObjRef, SDL_Surface*> g_gfx_surf; // Graphics ref → target surface
@@ -302,6 +306,36 @@ static void draw_hline(SDL_Surface* surf, uint32_t color, int x, int y, int w) {
 // Draw a vertical line
 static void draw_vline(SDL_Surface* surf, uint32_t color, int x, int y, int h) {
     fill_rect_on(surf, color, x, y, 1, h);
+}
+
+// Scanline triangle fill. Sort vertices by y, then for each row compute the
+// two edges' x-intersections and fill that span with a single hline.
+static void fill_triangle_on(SDL_Surface* surf, uint32_t color,
+                             int x1, int y1, int x2, int y2, int x3, int y3) {
+    if (!surf) return;
+    // Sort so y1 <= y2 <= y3
+    if (y2 < y1) { std::swap(y1, y2); std::swap(x1, x2); }
+    if (y3 < y1) { std::swap(y1, y3); std::swap(x1, x3); }
+    if (y3 < y2) { std::swap(y2, y3); std::swap(x2, x3); }
+    if (y1 == y3) {  // Degenerate: flat line
+        int xa = std::min({x1, x2, x3});
+        int xb = std::max({x1, x2, x3});
+        draw_hline(surf, color, xa, y1, xb - xa + 1);
+        return;
+    }
+    // For each scanline y in [y1..y3], compute x on the long edge (v1→v3) and
+    // x on the active short edge (v1→v2 for upper half, v2→v3 for lower).
+    auto interp = [](int y, int ya, int xa, int yb, int xb) -> int {
+        if (yb == ya) return xa;
+        return xa + (xb - xa) * (y - ya) / (yb - ya);
+    };
+    for (int y = y1; y <= y3; ++y) {
+        int xl = interp(y, y1, x1, y3, x3);
+        int xr = (y < y2) ? interp(y, y1, x1, y2, x2)
+                          : interp(y, y2, x2, y3, x3);
+        if (xr < xl) std::swap(xl, xr);
+        draw_hline(surf, color, xl, y, xr - xl + 1);
+    }
 }
 
 // Is the given point's angle (in degrees, 0°=3-o'clock, CCW) inside the arc?
@@ -611,6 +645,17 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         });
 
     vm.register_native("javax/microedition/lcdui/Graphics",
+        "fillTriangle", "(IIIIII)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            auto t = gfx_tx(self);
+            fill_triangle_on(gfx_surface(self), gfx_color(self),
+                             args[1].as_int() + t.x, args[2].as_int() + t.y,
+                             args[3].as_int() + t.x, args[4].as_int() + t.y,
+                             args[5].as_int() + t.x, args[6].as_int() + t.y);
+        });
+
+    vm.register_native("javax/microedition/lcdui/Graphics",
         "fillArc", "(IIIIII)V",
         [](VM&, Frame&, std::span<Slot> args) {
             ObjRef self = args[0].as_ref();
@@ -748,6 +793,99 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
                              nullptr, gfx_tx(self));
         });
 
+    // Encode a UTF-16 code unit into UTF-8. Games overwhelmingly use BMP
+    // characters; unpaired surrogates are rendered as U+FFFD.
+    auto append_u16_utf8 = [](std::string& out, uint16_t cu) {
+        if (cu < 0x80) {
+            out.push_back((char)cu);
+        } else if (cu < 0x800) {
+            out.push_back((char)(0xC0 | (cu >> 6)));
+            out.push_back((char)(0x80 | (cu & 0x3F)));
+        } else if (cu >= 0xD800 && cu <= 0xDFFF) {
+            out.append("\xEF\xBF\xBD"); // U+FFFD
+        } else {
+            out.push_back((char)(0xE0 | (cu >> 12)));
+            out.push_back((char)(0x80 | ((cu >> 6) & 0x3F)));
+            out.push_back((char)(0x80 | (cu & 0x3F)));
+        }
+    };
+
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "drawChar", "(CIII)V",
+        [append_u16_utf8](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            uint16_t ch = (uint16_t)args[1].as_int();
+            int x      = args[2].as_int();
+            int y      = args[3].as_int();
+            int anchor = args[4].as_int();
+
+            SDL_Surface* target = gfx_surface(self);
+            if (!target) return;
+            TTF_Font* font = font_for_gfx(self);
+            if (!font) return;
+
+            std::string text;
+            append_u16_utf8(text, ch);
+            if (has_cjk(text)) {
+                int px = TTF_FontHeight(font) - 2;
+                if (px < 9) px = 9;
+                TTF_Font* cjk = get_cjk_font(px);
+                if (cjk) font = cjk;
+            }
+
+            uint32_t argb = 0xFF000000u;
+            auto cit = g_colors.find(self);
+            if (cit != g_colors.end()) argb = cit->second;
+
+            draw_text_cached(target, font, text, x, y, anchor, argb,
+                             nullptr, gfx_tx(self));
+        });
+
+    vm.register_native("javax/microedition/lcdui/Graphics",
+        "drawChars", "([CIIIII)V",
+        [append_u16_utf8](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            ObjRef arr  = args[1].as_ref();
+            int offset = args[2].as_int();
+            int len    = args[3].as_int();
+            int x      = args[4].as_int();
+            int y      = args[5].as_int();
+            int anchor = args[6].as_int();
+
+            if (len <= 0 || arr == NULL_REF) return;
+            HeapObject* ao = v.heap().deref(arr);
+            if (!ao) return;
+            int32_t src_len = ao->array_length();
+            if (offset < 0 || offset >= src_len) return;
+            if (offset + len > src_len) len = src_len - offset;
+            if (len <= 0) return;
+
+            SDL_Surface* target = gfx_surface(self);
+            if (!target) return;
+            TTF_Font* font = font_for_gfx(self);
+            if (!font) return;
+
+            std::string text;
+            uint16_t* src = ao->array_shorts();
+            text.reserve((size_t)len);
+            for (int i = 0; i < len; ++i)
+                append_u16_utf8(text, src[offset + i]);
+
+            if (has_cjk(text)) {
+                int px = TTF_FontHeight(font) - 2;
+                if (px < 9) px = 9;
+                TTF_Font* cjk = get_cjk_font(px);
+                if (cjk) font = cjk;
+            }
+
+            uint32_t argb = 0xFF000000u;
+            auto cit = g_colors.find(self);
+            if (cit != g_colors.end()) argb = cit->second;
+
+            draw_text_cached(target, font, text, x, y, anchor, argb,
+                             nullptr, gfx_tx(self));
+        });
+
     vm.register_native("javax/microedition/lcdui/Graphics",
         "setClip", "(IIII)V",
         [](VM&, Frame&, std::span<Slot> args) {
@@ -866,6 +1004,13 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             int anchor = args[9].as_int();
             auto it = g_images.find(img);
             if (it == g_images.end()) return;
+            if (getenv("J2ME_TRACE_GLYPH") && sw == 9 && sh == 12) {
+                static int s_g = 0;
+                if (s_g < 60) {
+                    fprintf(stderr, "[glyph] sx=%d sy=%d dx=%d dy=%d\n", sx, sy, dx, dy);
+                    s_g++;
+                }
+            }
             // Compute drawn dimensions after transform
             int dw = sw, dh = sh;
             if (t == 4 || t == 5 || t == 6 || t == 7) { dw = sh; dh = sw; }
@@ -988,8 +1133,9 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
     vm.register_native("javax/microedition/lcdui/Graphics",
         "getStrokeStyle", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); /* SOLID */ });
-    vm.register_native("javax/microedition/lcdui/Graphics",
+    vm.register_noop("javax/microedition/lcdui/Graphics",
         "setStrokeStyle", "(I)V",
+        "only solid strokes supported; dotted style ignored",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // ── Font ─────────────────────────────────────────────────────────────────
@@ -1102,6 +1248,14 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             ObjRef self = args[0].as_ref();
             TTF_Font* ttf = font_for_obj(self);
             f.push_int(ttf ? TTF_FontHeight(ttf) : 12);
+        });
+
+    vm.register_native("javax/microedition/lcdui/Font",
+        "getBaselinePosition", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            TTF_Font* ttf = font_for_obj(self);
+            f.push_int(ttf ? TTF_FontAscent(ttf) : 10);
         });
 
     vm.register_native("javax/microedition/lcdui/Font",
@@ -1317,6 +1471,50 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             f.push_int(it != g_images.end() ? it->second->h : 0);
         });
 
+    // Image.getRGB(int[] rgb, int off, int scanlen, int x, int y, int w, int h)
+    // Read a rectangle of pixels out of the image into an int[] as 0xAARRGGBB.
+    // Doom II RPG uses this to sample its bitmap font atlas for stats/menu text.
+    vm.register_native("javax/microedition/lcdui/Image",
+        "getRGB", "([IIIIIII)V",
+        [](VM& vm_, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            ObjRef buf  = args[1].as_ref();
+            int32_t off  = args[2].as_int();
+            int32_t scan = args[3].as_int();
+            int32_t x    = args[4].as_int();
+            int32_t y    = args[5].as_int();
+            int32_t w    = args[6].as_int();
+            int32_t h    = args[7].as_int();
+            auto it = g_images.find(self);
+            if (it == g_images.end()) return;
+            SDL_Surface* src = it->second;
+            HeapObject* arr = vm_.heap().deref(buf);
+            if (!arr) return;
+            int32_t alen = arr->array_length();
+            Slot* dst = arr->array_slots();
+            SDL_LockSurface(src);
+            uint32_t* pixels = (uint32_t*)src->pixels;
+            int pitch = src->pitch / 4;
+            for (int row = 0; row < h; ++row) {
+                int sy = y + row;
+                for (int col = 0; col < w; ++col) {
+                    int sx = x + col;
+                    int idx = off + row * scan + col;
+                    if (idx < 0 || idx >= alen) continue;
+                    uint32_t p = 0;
+                    if (sx >= 0 && sx < src->w && sy >= 0 && sy < src->h) {
+                        p = pixels[sy * pitch + sx];
+                        uint8_t r, g, b, a;
+                        SDL_GetRGBA(p, src->format, &r, &g, &b, &a);
+                        p = (uint32_t(a) << 24) | (uint32_t(r) << 16)
+                          | (uint32_t(g) << 8)  |  uint32_t(b);
+                    }
+                    dst[idx] = Slot::from_int((int32_t)p);
+                }
+            }
+            SDL_UnlockSurface(src);
+        });
+
     // Image.getGraphics() — mutable image → get a Graphics for it
     vm.register_native("javax/microedition/lcdui/Image",
         "getGraphics", "()Ljavax/microedition/lcdui/Graphics;",
@@ -1495,22 +1693,25 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
     vm.register_native("javax/microedition/lcdui/Canvas",
         "getWidth", "()I",
         [](VM&, Frame& f, std::span<Slot>) {
-            f.push_int(Display::instance().width());
+            // Report g_screen_w (the logical canvas) rather than
+            // Display::width(), which is 240 until the window opens and would
+            // make the game lay out at 240 if called during startup.
+            f.push_int(g_screen_w);
         });
     vm.register_native("javax/microedition/lcdui/Canvas",
         "getHeight", "()I",
         [](VM&, Frame& f, std::span<Slot>) {
-            f.push_int(Display::instance().height());
+            f.push_int(g_screen_h);
         });
     vm.register_native("javax/microedition/lcdui/Displayable",
         "getWidth", "()I",
         [](VM&, Frame& f, std::span<Slot>) {
-            f.push_int(Display::instance().width());
+            f.push_int(g_screen_w);
         });
     vm.register_native("javax/microedition/lcdui/Displayable",
         "getHeight", "()I",
         [](VM&, Frame& f, std::span<Slot>) {
-            f.push_int(Display::instance().height());
+            f.push_int(g_screen_h);
         });
     // Helper lambda shared by repaint() and serviceRepaints()
     auto do_repaint = [deliver_key_events](VM& v, ObjRef canvas_ref) {
@@ -1583,8 +1784,9 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
 
     // ── Canvas/Displayable stubs ───────────────────────────────────────────────
 
-    vm.register_native("javax/microedition/lcdui/Canvas",
+    vm.register_noop("javax/microedition/lcdui/Canvas",
         "<init>", "()V",
+        "no Canvas-level fields to init",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // ── Nokia FullCanvas ─────────────────────────────────────────────────────
@@ -1595,19 +1797,23 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         ClassDef* canvas = vm.loader().find_or_stub("javax/microedition/lcdui/Canvas");
         if (!fullCanvas->super) fullCanvas->super = canvas;
     }
-    vm.register_native("com/nokia/mid/ui/FullCanvas",
+    vm.register_noop("com/nokia/mid/ui/FullCanvas",
         "<init>", "()V",
+        "no fields to init; we run full-screen by default",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // Nokia Sound stub
-    vm.register_native("com/nokia/mid/sound/Sound",
+    vm.register_stub("com/nokia/mid/sound/Sound",
         "<init>", "([BI)V",
+        "Nokia OTT tone format not decoded; sound silently created",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("com/nokia/mid/sound/Sound",
+    vm.register_stub("com/nokia/mid/sound/Sound",
         "play", "(I)V",
+        "Nokia Sound decoding not implemented; silent",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_native("com/nokia/mid/sound/Sound",
+    vm.register_stub("com/nokia/mid/sound/Sound",
         "stop", "()V",
+        "Nokia Sound not playing anyway",
         [](VM&, Frame&, std::span<Slot>) {});
 
     vm.register_native("javax/microedition/lcdui/Canvas",
@@ -1636,16 +1842,44 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
 
     vm.register_native("javax/microedition/lcdui/Command",
         "<init>", "(Ljava/lang/String;II)V",
-        [](VM&, Frame&, std::span<Slot>) {});
+        [](VM&, Frame&, std::span<Slot> args) {
+            CommandInfo& ci = g_command_info[args[0].as_ref()];
+            ci.label    = args[1].as_ref();
+            ci.type     = args[2].as_int();
+            ci.priority = args[3].as_int();
+        });
+
+    vm.register_native("javax/microedition/lcdui/Command",
+        "getLabel", "()Ljava/lang/String;",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_command_info.find(args[0].as_ref());
+            f.push_ref(it != g_command_info.end() ? it->second.label : NULL_REF);
+        });
+
+    vm.register_native("javax/microedition/lcdui/Command",
+        "getCommandType", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_command_info.find(args[0].as_ref());
+            f.push_int(it != g_command_info.end() ? it->second.type : 0);
+        });
+
+    vm.register_native("javax/microedition/lcdui/Command",
+        "getPriority", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_command_info.find(args[0].as_ref());
+            f.push_int(it != g_command_info.end() ? it->second.priority : 0);
+        });
 
     // ── Timer / TimerTask ────────────────────────────────────────────────────
     // J2ME Timer.schedule(task, delay, period) runs task.run() repeatedly.
     // We implement this as a loop inside the deferred thread system.
 
-    vm.register_native("java/util/TimerTask", "<init>", "()V",
+    vm.register_noop("java/util/TimerTask", "<init>", "()V",
+        "state captured on schedule(); nothing to init here",
         [](VM&, Frame&, std::span<Slot>) {});
 
-    vm.register_native("java/util/Timer", "<init>", "()V",
+    vm.register_noop("java/util/Timer", "<init>", "()V",
+        "Timer backed by scheduler-thread loops; no init state",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // Timer state: store task + period for the timer loop runner
@@ -1839,6 +2073,20 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             // Static method: args[0]=lo, args[1]=hi of the long milliseconds argument
             Slot2 s; s.lo = args[0].raw; s.hi = args[1].raw;
             int64_t ms = s.as_long();
+            if (getenv("J2ME_TRACE_SLEEP_CALLER")) {
+                // Walk up the current thread's frame stack to see who's calling.
+                auto* jt = v.scheduler.current();
+                if (jt) {
+                    fprintf(stderr, "[sleep caller] ms=%ld frames:\n", (long)ms);
+                    int d = 0;
+                    for (auto it = jt->frames.rbegin(); it != jt->frames.rend() && d < 5; ++it, ++d) {
+                        fprintf(stderr, "  %s.%s pc=%u\n",
+                                it->klass ? it->klass->name.c_str() : "?",
+                                it->method ? it->method->name.c_str() : "?",
+                                it->pc);
+                    }
+                }
+            }
             if (ms <= 0) ms = 1;  // 0 means "yield" in our model
             // Sleep on the green-thread scheduler, not SDL_Delay. This
             // blocks only THIS thread — other Java threads get to run.
