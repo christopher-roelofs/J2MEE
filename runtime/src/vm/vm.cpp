@@ -16,6 +16,20 @@ VM::VM(const std::string& jar_path)
         m_string_class->instance_slot_count = 2;
 }
 
+VM::VM(const std::string& jar_path, const std::string& bios_jar_path)
+    : m_jar(jar_path)
+    , m_bios_jar(std::in_place, bios_jar_path)
+    // BIOS adds ~788 framework classes whose <clinit>s eagerly allocate
+    // (time-zone tables, default resource caches, etc.) — bump the heap.
+    , m_heap(64 * 1024 * 1024)
+    , m_loader(m_jar, *m_bios_jar)
+{
+    m_object_class = m_loader.find_or_stub("java/lang/Object");
+    m_string_class = m_loader.find_or_stub("java/lang/String");
+    if (m_string_class->instance_slot_count < 2)
+        m_string_class->instance_slot_count = 2;
+}
+
 // ─── Class initialization ─────────────────────────────────────────────────────
 
 void VM::initialize_class(ClassDef* klass) {
@@ -88,12 +102,21 @@ std::string VM::string_value(ObjRef ref) {
     if (char_arr == NULL_REF) return "";
 
     HeapObject* arr  = m_heap.deref(char_arr);
+    if (!arr) return "";
     int32_t  len    = arr->array_length();
+    if (len <= 0) return "";
+    // Clamp: Java char[] length is bounded by heap size; anything above a
+    // megabyte-ish here is heap corruption — don't trust it.
+    if (len > (1 << 24)) len = 0;
+    // Respect the String's count field (field(1)) as the logical length,
+    // since games may grow the char[] beyond count.
+    int32_t str_len = sobj->data_words >= 2 ? sobj->field(1).as_int() : len;
+    if (str_len < 0 || str_len > len) str_len = len;
     uint16_t* chars = arr->array_shorts();
 
     std::string out;
-    out.reserve(len);
-    for (int32_t i = 0; i < len; ++i)
+    out.reserve(str_len);
+    for (int32_t i = 0; i < str_len; ++i)
         out += static_cast<char>(chars[i] & 0xFF);
     return out;
 }
@@ -269,7 +292,18 @@ std::vector<Slot> VM::invoke(MethodDef* method, ClassDef* klass,
 
     auto& stk = call_stack();
     stk.push_back(std::move(frame));
-    exec_frame(stk.back());
+    try {
+        exec_frame(stk.back());
+    } catch (...) {
+        // Exception propagating out of exec_frame: pop our frame first so
+        // the caller's stk.back() resolves to the right outer frame.
+        // Without this, subsequent invokes see a leaked frame and use it
+        // as their "caller" — corrupting locals/sp of whichever frame
+        // catches the exception downstream. Hit by Wolfenstein RPG when
+        // openRecordStore throws RecordStoreNotFoundException through t.a.
+        stk.pop_back();
+        throw;
+    }
     Frame completed = std::move(stk.back());
     stk.pop_back();
 

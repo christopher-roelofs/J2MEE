@@ -11,12 +11,62 @@ ClassLoader::ClassLoader(const JarFile& jar) {
     resolve_methods();
 }
 
+ClassLoader::ClassLoader(const JarFile& game_jar, const JarFile& bios_jar) {
+    parse_classes(game_jar);
+    size_t before = m_classes.size();
+    parse_classes(bios_jar, /*skip_existing=*/true);
+    size_t added = m_classes.size() - before;
+    fprintf(stderr, "[bios] loaded %zu classes from BIOS jar (game provided %zu)\n",
+            added, before);
+    link_hierarchy();
+    layout_fields();
+    resolve_methods();
+}
+
 // ─── Phase 1: parse ───────────────────────────────────────────────────────────
 
-void ClassLoader::parse_classes(const JarFile& jar) {
+// BIOS-only class filter. These are MIDP/CLDC supervisor classes whose
+// bootstrap (suite loader, state handler, isolate manager) expects
+// infrastructure we don't model — loading them drags the whole AMS into
+// MIDlet.<init>. Games' direct MIDP API surface lives under javax/java/com.nokia
+// etc. which are kept.
+static bool is_bios_excluded(const std::string& name) {
+    static const char* kExcludePrefixes[] = {
+        "com/sun/midp/",          // MIDlet state handler, suite loader, AMS
+        "com/sun/cldchi/",        // CLDC-HI VM internals
+        "com/sun/j2me/",          // J2ME security/property handlers
+        "com/sun/cdc/",           // CDC file/io handlers
+        "com/sun/satsa/",         // smart-card APIs
+        "org/recompile/",         // FreeJ2ME's own platform code
+        "org/objectweb/asm/",     // bytecode manipulation; not needed
+        "org/mozilla/",           // pluotsorbet-specific
+        // BIOS RecordStore.java delegates to supervisor rms/RecordStoreFile
+        // machinery we excluded; keep our native RMS impl instead.
+        "javax/microedition/rms/",
+    };
+    for (auto* p : kExcludePrefixes)
+        if (name.rfind(p, 0) == 0) return true;
+
+    // Specific class exclusions — BIOS's TextBox/TextField pull in supervisor
+    // chains (DisplayEventHandler, TextFieldLFImpl native resources). Our
+    // stub natives handle them well enough for games that just construct one.
+    static const char* kExcludeExact[] = {
+        "javax/microedition/lcdui/TextBox",
+        "javax/microedition/lcdui/TextField",
+    };
+    for (auto* n : kExcludeExact)
+        if (name == n) return true;
+    return false;
+}
+
+void ClassLoader::parse_classes(const JarFile& jar, bool skip_existing) {
     for (auto& entry : jar.entries_with_suffix(".class")) {
         const auto& bytes = jar.get(entry);
         auto cf = std::make_unique<ClassFile>(parse_class_file(bytes));
+        if (skip_existing) {
+            if (m_classes.count(cf->this_class)) continue;
+            if (is_bios_excluded(cf->this_class)) continue;
+        }
         ClassFile* raw = cf.get();
         m_class_files.push_back(std::move(cf));
         build_class_def(raw);
@@ -194,13 +244,23 @@ ClassDef* ClassLoader::make_stub(const std::string& name) {
 void ClassLoader::register_native(const std::string& class_name,
                                   const std::string& method_name,
                                   const std::string& descriptor,
-                                  NativeFunc fn) {
+                                  NativeFunc fn,
+                                  BindMode mode) {
     ClassDef* klass = find_or_stub(class_name);
 
-    // If the method already exists (from a loaded class file), bind to it
-    // and force the NATIVE flag so the interpreter dispatches to native_impl
-    // instead of the original bytecode.
     if (auto* md = klass->find_method(method_name, descriptor)) {
+        bool declared_native = (md->access_flags & AccessFlags::NATIVE) != 0;
+        // FillGap: someone else's bytecode impl (BIOS or game) wins; our
+        // noop/stub only fires if no real impl exists OR the method was
+        // declared native in its classfile (leaf primitive).
+        if (mode == BindMode::FillGap && md->code && !declared_native) {
+            if (std::getenv("J2ME_TRACE_BIOS"))
+                fprintf(stderr,
+                    "[bios] keeping bytecode impl for %s.%s%s (fill-gap stub deferred)\n",
+                    class_name.c_str(), method_name.c_str(), descriptor.c_str());
+            return;
+        }
+        // Override (default) or fill-gap-into-native-leaf: bind our impl.
         md->native_impl   = std::move(fn);
         md->access_flags  = md->access_flags | AccessFlags::NATIVE;
         return;

@@ -2,11 +2,13 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unistd.h>
 #include <vector>
 #include "util/jar.hpp"
 #include "vm/vm.hpp"
+#include "vm/stub_registry.hpp"
 #include "midp/natives.hpp"
 #include "backend/display.hpp"
 
@@ -60,7 +62,10 @@ void print_usage(const char* argv0) {
         "                       Each key gets a press/release pair spaced\n"
         "                       J2ME_KEY_INTERVAL ticks apart (default 15)\n"
         "                       and held J2ME_KEY_HOLD ticks (default 3).\n"
-        "  --quiet              Silence startup banner.\n";
+        "  --quiet              Silence startup banner.\n"
+        "  --bios PATH          Optional classes.jar with MIDP/CLDC framework\n"
+        "                       impls (e.g. compiled phoneME sources). Game\n"
+        "                       jar shadows BIOS on name collision.\n";
 }
 
 int avk_from_name(const std::string& s) {
@@ -124,6 +129,7 @@ int main(int argc, char* argv[]) {
     uint32_t tick_ms = 0;
     std::string ppm_path;
     std::string keys_arg;
+    std::string bios_path;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -141,6 +147,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--tick-ms")  tick_ms    = (uint32_t)std::strtoul (need("--tick-ms"), nullptr, 10);
         else if (a == "--ppm")      ppm_path   = need("--ppm");
         else if (a == "--keys")     keys_arg   = need("--keys");
+        else if (a == "--bios")     bios_path  = need("--bios");
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
         else if (!a.empty() && a[0] == '-') {
             std::cerr << "unknown option: " << a << "\n";
@@ -187,7 +194,14 @@ int main(int argc, char* argv[]) {
 
     try {
         JarFile jar(pos[0]);
-        VM vm(pos[0]);
+        std::unique_ptr<VM> vm_up;
+        if (bios_path.empty()) {
+            vm_up = std::make_unique<VM>(pos[0]);
+        } else {
+            if (!quiet) std::cout << "[bios] " << bios_path << "\n";
+            vm_up = std::make_unique<VM>(pos[0], bios_path);
+        }
+        VM& vm = *vm_up;
 
         register_natives(vm, jar);
         register_graphics_natives(vm, jar);
@@ -238,9 +252,11 @@ int main(int argc, char* argv[]) {
                     invoke_if("constructorMainApp");
                     invoke_if("startMainApp");
                 });
-            vm.register_native("VservManager", "showAtStart", "()V",
+            vm.register_noop("VservManager", "showAtStart", "()V",
+                "ad-network hook; we never display ads",
                 [](VM&, Frame&, std::span<Slot>) {});
-            vm.register_native("VservManager", "showAtEnd", "()V",
+            vm.register_noop("VservManager", "showAtEnd", "()V",
+                "ad-network hook; we never display ads",
                 [](VM&, Frame&, std::span<Slot>) {});
         }
 
@@ -255,13 +271,16 @@ int main(int argc, char* argv[]) {
         if (!e.location.empty()) std::cerr << " at " << e.location;
         std::cerr << "\n";
         dump_ppm();
+        dump_stub_report();
         return 1;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         dump_ppm();
+        dump_stub_report();
         return 1;
     }
 
     dump_ppm();
+    dump_stub_report();
     return 0;
 }

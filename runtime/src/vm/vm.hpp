@@ -4,6 +4,7 @@
 #include "class_loader.hpp"
 #include "frame.hpp"
 #include "scheduler.hpp"
+#include "stub_registry.hpp"
 #include "util/jar.hpp"
 
 #include <deque>
@@ -33,6 +34,10 @@ struct QuitRequest {};
 class VM {
 public:
     explicit VM(const std::string& jar_path);
+
+    // Game jar + BIOS jar (phoneME-style framework classes). Classes in the
+    // game jar shadow BIOS names on collision.
+    VM(const std::string& jar_path, const std::string& bios_jar_path);
 
     // Run the MIDlet: find the main class, call startApp().
     void run(const std::string& midlet_class);
@@ -93,14 +98,48 @@ public:
         m_loader.register_native(cls, name, desc, std::move(fn));
     }
 
+    // Like register_native but defers to any existing bytecode impl (BIOS or
+    // game-provided). Use this for "reference" implementations of framework
+    // classes (Hashtable, Vector, etc.) that a BIOS would otherwise provide.
+    // Without BIOS our impl fills in; with BIOS the real Java code runs.
+    void register_fallback(const std::string& cls, const std::string& name,
+                           const std::string& desc, NativeFunc fn) {
+        m_loader.register_native(cls, name, desc, std::move(fn),
+                                 ClassLoader::BindMode::FillGap);
+    }
+
+    // Register a no-op / spec-legal default (e.g. platformRequest → false,
+    // Controllable.getControl → null). Logs first call + counts hits for the
+    // end-of-run report. `note` should briefly explain why the default is
+    // spec-correct.
+    void register_noop(const std::string& cls, const std::string& name,
+                       const std::string& desc, const char* note, NativeFunc fn) {
+        m_loader.register_native(cls, name, desc,
+            wrap_stub(StubKind::Noop,
+                      cls + "." + name + desc, note, std::move(fn)),
+            ClassLoader::BindMode::FillGap);
+    }
+
+    // Register a placeholder — returns a plausible value but doesn't do the
+    // real work (e.g. setMediaTime echoing the requested time without seeking).
+    // `note` should say exactly what's faked so future-us can revisit.
+    void register_stub(const std::string& cls, const std::string& name,
+                       const std::string& desc, const char* note, NativeFunc fn) {
+        m_loader.register_native(cls, name, desc,
+            wrap_stub(StubKind::Placeholder,
+                      cls + "." + name + desc, note, std::move(fn)),
+            ClassLoader::BindMode::FillGap);
+    }
+
     // Pre-set a static field (creates it if missing). Used to init System.out etc.
     void set_static(const std::string& class_name, const std::string& field_name,
                     const std::string& desc, Slot value);
 
 private:
-    JarFile     m_jar;
-    Heap        m_heap;
-    ClassLoader m_loader;
+    JarFile                m_jar;
+    std::optional<JarFile> m_bios_jar;
+    Heap                   m_heap;
+    ClassLoader            m_loader;
 
     ClassDef*   m_string_class = nullptr;
     ClassDef*   m_object_class = nullptr;
