@@ -165,6 +165,10 @@ enum Opcode : uint8_t {
     I2C             = 0x92,
     I2S             = 0x93,
     LCMP            = 0x94,
+    FCMPL           = 0x95,
+    FCMPG           = 0x96,
+    DCMPL           = 0x97,
+    DCMPG           = 0x98,
     IFEQ            = 0x99,
     IFNE            = 0x9a,
     IFLT            = 0x9b,
@@ -184,6 +188,8 @@ enum Opcode : uint8_t {
     LOOKUPSWITCH    = 0xab,
     IRETURN         = 0xac,
     LRETURN         = 0xad,
+    FRETURN         = 0xae,
+    DRETURN         = 0xaf,
     ARETURN         = 0xb0,
     RETURN          = 0xb1,
     GETSTATIC       = 0xb2,
@@ -384,7 +390,9 @@ static void do_invoke(VM& vm, Frame& f,
 
     // Args are already contiguous on the operand stack at positions
     // [sp - total_slots .. sp). Pass as a span, skip the std::vector alloc.
-    Slot* args_ptr = &f.stack[f.sp - total_slots];
+    // For total_slots==0 the span is empty; f.stack may also be empty, in
+    // which case &stack[0] is UB — hand in a null pointer instead.
+    Slot* args_ptr = total_slots ? &f.stack[f.sp - total_slots] : nullptr;
     // vm.invoke may re-enter the interpreter and push new frames, but our
     // caller's frame won't be relocated (m_call_stack uses std::deque which
     // keeps pointers stable across push_back/pop_back).
@@ -538,6 +546,10 @@ void VM::exec_frame(Frame& f) {
         dispatch_table[LOR]       = &&L_LOR;
         dispatch_table[LXOR]      = &&L_LXOR;
         dispatch_table[LCMP]      = &&L_LCMP;
+        dispatch_table[FCMPL]     = &&L_FCMPL;
+        dispatch_table[FCMPG]     = &&L_FCMPG;
+        dispatch_table[DCMPL]     = &&L_DCMPL;
+        dispatch_table[DCMPG]     = &&L_DCMPG;
         dispatch_table[I2L]       = &&L_I2L;
         dispatch_table[I2F]       = &&L_I2F;
         dispatch_table[I2D]       = &&L_I2D;
@@ -576,6 +588,8 @@ void VM::exec_frame(Frame& f) {
         dispatch_table[RETURN]    = &&L_RETURN;
         dispatch_table[IRETURN]   = &&L_RETURN;
         dispatch_table[LRETURN]   = &&L_RETURN;
+        dispatch_table[FRETURN]   = &&L_RETURN;
+        dispatch_table[DRETURN]   = &&L_RETURN;
         dispatch_table[ARETURN]   = &&L_RETURN;
         dispatch_table[GETSTATIC] = &&L_GETSTATIC;
         dispatch_table[PUTSTATIC] = &&L_PUTSTATIC;
@@ -912,6 +926,27 @@ void VM::exec_frame(Frame& f) {
             int64_t b=f.pop_long(), a=f.pop_long();
             f.push_int(a>b ? 1 : a<b ? -1 : 0); DISPATCH();
         }
+        // Float/double compare: L variants push -1 if NaN, G push +1.
+        L_FCMPL: {
+            float b=f.pop_float(), a=f.pop_float();
+            f.push_int((std::isnan(a)||std::isnan(b)) ? -1 : a>b ? 1 : a<b ? -1 : 0);
+            DISPATCH();
+        }
+        L_FCMPG: {
+            float b=f.pop_float(), a=f.pop_float();
+            f.push_int((std::isnan(a)||std::isnan(b)) ? 1 : a>b ? 1 : a<b ? -1 : 0);
+            DISPATCH();
+        }
+        L_DCMPL: {
+            double b=f.pop_double(), a=f.pop_double();
+            f.push_int((std::isnan(a)||std::isnan(b)) ? -1 : a>b ? 1 : a<b ? -1 : 0);
+            DISPATCH();
+        }
+        L_DCMPG: {
+            double b=f.pop_double(), a=f.pop_double();
+            f.push_int((std::isnan(a)||std::isnan(b)) ? 1 : a>b ? 1 : a<b ? -1 : 0);
+            DISPATCH();
+        }
 
         // ── Conversions ───────────────────────────────────────────────────────
         L_I2L:  f.push_long  (f.pop_int());                                 DISPATCH();
@@ -1246,6 +1281,12 @@ void VM::exec_frame(Frame& f) {
         if (e.location.empty() && cf_ptr)
             e.location = cf_ptr->this_class + "." +
                          (f.method ? f.method->name : "?") + "@" + std::to_string(throw_pc);
+        if (getenv("J2ME_TRACE_EXC")) {
+            fprintf(stderr, "[exc] %s at %s (pc=%u, frame %s.%s)\n",
+                    e.message.c_str(), e.location.c_str(), f.pc,
+                    cf_ptr ? cf_ptr->this_class.c_str() : "?",
+                    f.method ? f.method->name.c_str() : "?");
+        }
         for (const auto& entry : ex_tbl) {
             if (throw_pc < entry.start_pc || throw_pc >= entry.end_pc) continue;
             // catch_type == 0 means "catch all" (finally)
@@ -1297,6 +1338,13 @@ void VM::exec_frame(Frame& f) {
                         matches = (e.message == "ArrayIndexOutOfBoundsException" ||
                                    e.message == "StringIndexOutOfBoundsException" ||
                                    e.message == "IndexOutOfBoundsException");
+                    }
+                    if (!matches && cn == "javax/microedition/rms/RecordStoreException") {
+                        matches = (e.message == "RecordStoreNotFoundException" ||
+                                   e.message == "RecordStoreNotOpenException" ||
+                                   e.message == "RecordStoreFullException" ||
+                                   e.message == "InvalidRecordIDException" ||
+                                   e.message == "RecordStoreException");
                     }
                 }
             }

@@ -160,6 +160,28 @@ static std::vector<CpEntry> parse_constant_pool(ClassReader& r, uint16_t count) 
             case CpTag::NameAndType:
                 pool[i] = CpNameAndType{r.u2(), r.u2()};
                 break;
+            // Java 7+ tags — skip the payload so modern class files load.
+            // CLDC games don't actually use invokedynamic; if bytecode does
+            // reference these, the interpreter will fail at decode time,
+            // which is better than refusing the whole class.
+            case static_cast<CpTag>(15):  // MethodHandle: u1+u2
+                r.u1(); r.u2();
+                pool[i] = std::monostate{};
+                break;
+            case static_cast<CpTag>(16):  // MethodType: u2
+                r.u2();
+                pool[i] = std::monostate{};
+                break;
+            case static_cast<CpTag>(17):  // Dynamic: u2+u2
+            case static_cast<CpTag>(18):  // InvokeDynamic: u2+u2
+                r.u2(); r.u2();
+                pool[i] = std::monostate{};
+                break;
+            case static_cast<CpTag>(19):  // Module: u2
+            case static_cast<CpTag>(20):  // Package: u2
+                r.u2();
+                pool[i] = std::monostate{};
+                break;
             default:
                 throw std::runtime_error("Unknown constant pool tag: " +
                                          std::to_string(tag) + " at index " +
