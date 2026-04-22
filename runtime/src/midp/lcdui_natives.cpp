@@ -248,6 +248,301 @@ void register_lcdui_natives(VM& vm) {
             g_image_item_alt_text[args[0].as_ref()] = args[1].as_ref();
         });
 
+    // ── ChoiceGroup (also covers Choice interface methods) ───────────────────
+    // EXCLUSIVE=1, MULTIPLE=2, IMPLICIT=3, POPUP=4
+    struct ChoiceState {
+        int type = 1;
+        std::vector<ObjRef> texts;     // String refs
+        std::vector<ObjRef> images;    // Image refs (parallel)
+        std::vector<bool>   selected;  // parallel; for EXCLUSIVE/IMPLICIT/POPUP
+                                       // exactly one is true at a time
+        int fit_policy = 0;
+    };
+    static std::unordered_map<ObjRef, ChoiceState> g_choices;
+    auto choice_for = [](ObjRef r) -> ChoiceState* {
+        auto it = g_choices.find(r);
+        return it == g_choices.end() ? nullptr : &it->second;
+    };
+
+    auto choice_init_arrays = [](VM& v, ObjRef self, int type,
+                                 ObjRef texts_arr, ObjRef images_arr) {
+        ChoiceState& cs = g_choices[self];
+        cs.type = type;
+        if (texts_arr != NULL_REF) {
+            HeapObject* a = v.heap().deref(texts_arr);
+            if (a) {
+                int n = a->array_length();
+                Slot* s = a->array_slots();
+                for (int i = 0; i < n; ++i) cs.texts.push_back(s[i].as_ref());
+            }
+        }
+        if (images_arr != NULL_REF) {
+            HeapObject* a = v.heap().deref(images_arr);
+            if (a) {
+                int n = a->array_length();
+                Slot* s = a->array_slots();
+                for (int i = 0; i < n && i < (int)cs.texts.size(); ++i)
+                    cs.images.push_back(s[i].as_ref());
+            }
+        }
+        while (cs.images.size() < cs.texts.size()) cs.images.push_back(NULL_REF);
+        cs.selected.resize(cs.texts.size(), false);
+        if (!cs.selected.empty() && (type == 1 || type == 3 || type == 4))
+            cs.selected[0] = true;
+    };
+
+    for (const char* k : {
+        "javax/microedition/lcdui/ChoiceGroup",
+        "javax/microedition/lcdui/List",  // List is also a Choice
+    }) {
+        vm.register_native(k, "<init>",
+            "(Ljava/lang/String;I)V",
+            [choice_init_arrays](VM& v, Frame&, std::span<Slot> args) {
+                choice_init_arrays(v, args[0].as_ref(), args[2].as_int(),
+                                   NULL_REF, NULL_REF);
+                item_for(args[0].as_ref()).label = args[1].as_ref();
+            });
+        vm.register_native(k, "<init>",
+            "(Ljava/lang/String;I[Ljava/lang/String;[Ljavax/microedition/lcdui/Image;)V",
+            [choice_init_arrays](VM& v, Frame&, std::span<Slot> args) {
+                choice_init_arrays(v, args[0].as_ref(), args[2].as_int(),
+                                   args[3].as_ref(), args[4].as_ref());
+                item_for(args[0].as_ref()).label = args[1].as_ref();
+            });
+
+        vm.register_native(k, "append",
+            "(Ljava/lang/String;Ljavax/microedition/lcdui/Image;)I",
+            [choice_for](VM&, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs) { f.push_int(-1); return; }
+                cs->texts.push_back(args[1].as_ref());
+                cs->images.push_back(args[2].as_ref());
+                cs->selected.push_back(false);
+                f.push_int((int)cs->texts.size() - 1);
+            });
+        vm.register_native(k, "insert",
+            "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V",
+            [choice_for](VM&, Frame&, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs) return;
+                int i = args[1].as_int();
+                if (i < 0) i = 0;
+                if (i > (int)cs->texts.size()) i = (int)cs->texts.size();
+                cs->texts.insert(cs->texts.begin() + i, args[2].as_ref());
+                cs->images.insert(cs->images.begin() + i, args[3].as_ref());
+                cs->selected.insert(cs->selected.begin() + i, false);
+            });
+        vm.register_native(k, "delete", "(I)V",
+            [choice_for](VM&, Frame&, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs) return;
+                int i = args[1].as_int();
+                if (i < 0 || i >= (int)cs->texts.size()) return;
+                cs->texts.erase(cs->texts.begin() + i);
+                cs->images.erase(cs->images.begin() + i);
+                cs->selected.erase(cs->selected.begin() + i);
+            });
+        vm.register_native(k, "deleteAll", "()V",
+            [choice_for](VM&, Frame&, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (cs) { cs->texts.clear(); cs->images.clear(); cs->selected.clear(); }
+            });
+        vm.register_native(k, "set",
+            "(ILjava/lang/String;Ljavax/microedition/lcdui/Image;)V",
+            [choice_for](VM&, Frame&, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs) return;
+                int i = args[1].as_int();
+                if (i < 0 || i >= (int)cs->texts.size()) return;
+                cs->texts[i]  = args[2].as_ref();
+                cs->images[i] = args[3].as_ref();
+            });
+        vm.register_native(k, "size", "()I",
+            [choice_for](VM&, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                f.push_int(cs ? (int)cs->texts.size() : 0);
+            });
+        vm.register_native(k, "getString", "(I)Ljava/lang/String;",
+            [choice_for](VM&, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                int i = args[1].as_int();
+                f.push_ref((cs && i >= 0 && i < (int)cs->texts.size())
+                           ? cs->texts[i] : NULL_REF);
+            });
+        vm.register_native(k, "getImage", "(I)Ljavax/microedition/lcdui/Image;",
+            [choice_for](VM&, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                int i = args[1].as_int();
+                f.push_ref((cs && i >= 0 && i < (int)cs->images.size())
+                           ? cs->images[i] : NULL_REF);
+            });
+        vm.register_native(k, "isSelected", "(I)Z",
+            [choice_for](VM&, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                int i = args[1].as_int();
+                f.push_int((cs && i >= 0 && i < (int)cs->selected.size()
+                            && cs->selected[i]) ? 1 : 0);
+            });
+        vm.register_native(k, "setSelectedIndex", "(IZ)V",
+            [choice_for](VM&, Frame&, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs) return;
+                int i = args[1].as_int();
+                bool v = args[2].as_int() != 0;
+                if (i < 0 || i >= (int)cs->selected.size()) return;
+                if (cs->type == 1 || cs->type == 3 || cs->type == 4) {
+                    // EXCLUSIVE/IMPLICIT/POPUP: exactly one true
+                    for (auto&& b : cs->selected) b = false;
+                    cs->selected[i] = true;
+                } else {
+                    cs->selected[i] = v;
+                }
+            });
+        vm.register_native(k, "getSelectedIndex", "()I",
+            [choice_for](VM&, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs) { f.push_int(-1); return; }
+                for (int i = 0; i < (int)cs->selected.size(); ++i)
+                    if (cs->selected[i]) { f.push_int(i); return; }
+                f.push_int(-1);
+            });
+        vm.register_native(k, "setSelectedFlags", "([Z)V",
+            [choice_for](VM& v, Frame&, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs || args[1].as_ref() == NULL_REF) return;
+                HeapObject* a = v.heap().deref(args[1].as_ref());
+                if (!a) return;
+                int n = std::min(a->array_length(), (int)cs->selected.size());
+                uint8_t* src = a->array_bytes();
+                for (int i = 0; i < n; ++i) cs->selected[i] = src[i] != 0;
+            });
+        vm.register_native(k, "getSelectedFlags", "([Z)I",
+            [choice_for](VM& v, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (!cs || args[1].as_ref() == NULL_REF) { f.push_int(0); return; }
+                HeapObject* a = v.heap().deref(args[1].as_ref());
+                if (!a) { f.push_int(0); return; }
+                int n = std::min(a->array_length(), (int)cs->selected.size());
+                int count = 0;
+                uint8_t* dst = a->array_bytes();
+                for (int i = 0; i < n; ++i) {
+                    dst[i] = cs->selected[i] ? 1 : 0;
+                    if (cs->selected[i]) count++;
+                }
+                f.push_int(count);
+            });
+        vm.register_native(k, "setFitPolicy", "(I)V",
+            [choice_for](VM&, Frame&, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                if (cs) cs->fit_policy = args[1].as_int();
+            });
+        vm.register_native(k, "getFitPolicy", "()I",
+            [choice_for](VM&, Frame& f, std::span<Slot> args) {
+                ChoiceState* cs = choice_for(args[0].as_ref());
+                f.push_int(cs ? cs->fit_policy : 0);
+            });
+    }
+
+    // ── Gauge ────────────────────────────────────────────────────────────────
+    struct GaugeState {
+        int value = 0;
+        int max_value = 100;
+        bool interactive = false;
+    };
+    static std::unordered_map<ObjRef, GaugeState> g_gauges;
+    vm.register_native("javax/microedition/lcdui/Gauge",
+        "<init>", "(Ljava/lang/String;ZII)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            item_for(self).label = args[1].as_ref();
+            GaugeState& gs = g_gauges[self];
+            gs.interactive = args[2].as_int() != 0;
+            gs.max_value = args[3].as_int();
+            gs.value = args[4].as_int();
+        });
+    vm.register_native("javax/microedition/lcdui/Gauge",
+        "getValue", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_gauges.find(args[0].as_ref());
+            f.push_int(it != g_gauges.end() ? it->second.value : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/Gauge",
+        "setValue", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            g_gauges[args[0].as_ref()].value = args[1].as_int();
+        });
+    vm.register_native("javax/microedition/lcdui/Gauge",
+        "getMaxValue", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_gauges.find(args[0].as_ref());
+            f.push_int(it != g_gauges.end() ? it->second.max_value : 100);
+        });
+    vm.register_native("javax/microedition/lcdui/Gauge",
+        "setMaxValue", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            g_gauges[args[0].as_ref()].max_value = args[1].as_int();
+        });
+    vm.register_native("javax/microedition/lcdui/Gauge",
+        "isInteractive", "()Z",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_gauges.find(args[0].as_ref());
+            f.push_int((it != g_gauges.end() && it->second.interactive) ? 1 : 0);
+        });
+
+    // ── DateField ────────────────────────────────────────────────────────────
+    // mode: DATE=1, TIME=2, DATE_TIME=3
+    struct DateFieldState {
+        int mode = 1;
+        int64_t millis = 0;            // 0 means "uninitialized" per spec
+        bool initialized = false;
+    };
+    static std::unordered_map<ObjRef, DateFieldState> g_date_fields;
+    vm.register_native("javax/microedition/lcdui/DateField",
+        "<init>", "(Ljava/lang/String;I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            item_for(self).label = args[1].as_ref();
+            g_date_fields[self].mode = args[2].as_int();
+        });
+    vm.register_native("javax/microedition/lcdui/DateField",
+        "<init>", "(Ljava/lang/String;ILjava/util/TimeZone;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            item_for(self).label = args[1].as_ref();
+            g_date_fields[self].mode = args[2].as_int();
+            // TimeZone arg ignored — we always render in local time
+        });
+    vm.register_native("javax/microedition/lcdui/DateField",
+        "getInputMode", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_date_fields.find(args[0].as_ref());
+            f.push_int(it != g_date_fields.end() ? it->second.mode : 1);
+        });
+    vm.register_native("javax/microedition/lcdui/DateField",
+        "setInputMode", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            g_date_fields[args[0].as_ref()].mode = args[1].as_int();
+        });
+    vm.register_native("javax/microedition/lcdui/DateField",
+        "getDate", "()Ljava/util/Date;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            auto it = g_date_fields.find(args[0].as_ref());
+            if (it == g_date_fields.end() || !it->second.initialized) {
+                f.push_ref(NULL_REF); return;
+            }
+            ClassDef* k = v.loader().find_or_stub("java/util/Date");
+            f.push_ref(v.heap().alloc_object(k, 0));
+            // Date contents not stored here; getTime() returns wall clock per
+            // our existing Date.getTime native. Roundtripping would need real
+            // Date storage — out of scope for the LCDUI pass.
+        });
+    vm.register_native("javax/microedition/lcdui/DateField",
+        "setDate", "(Ljava/util/Date;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            DateFieldState& ds = g_date_fields[args[0].as_ref()];
+            ds.initialized = (args[1].as_ref() != NULL_REF);
+        });
+
     // ── Spacer ───────────────────────────────────────────────────────────────
 
     vm.register_native("javax/microedition/lcdui/Spacer",
