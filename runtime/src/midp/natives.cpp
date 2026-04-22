@@ -2344,6 +2344,38 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "getLength", "()J",
         [](VM&, Frame& f, std::span<Slot>) { f.push_long(0); });
 
+    // HttpConnection inherits InputConnection / OutputConnection / Stream
+    // openInput/openOutput methods. Methodref counts on HttpConnection for
+    // ~1100 JARs combined.
+    vm.register_noop("javax/microedition/io/HttpConnection",
+        "openInputStream", "()Ljava/io/InputStream;",
+        "fake HTTP — empty (EOF) input stream",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/InputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+    vm.register_noop("javax/microedition/io/HttpConnection",
+        "openDataInputStream", "()Ljava/io/DataInputStream;",
+        "fake HTTP — empty (EOF) DataInputStream",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/DataInputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+    vm.register_noop("javax/microedition/io/HttpConnection",
+        "openOutputStream", "()Ljava/io/OutputStream;",
+        "fake HTTP — sink OutputStream",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/OutputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+    vm.register_noop("javax/microedition/io/HttpConnection",
+        "openDataOutputStream", "()Ljava/io/DataOutputStream;",
+        "fake HTTP — sink DataOutputStream",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/DataOutputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+
     // ── javax.wireless.messaging (WMA / JSR-120): fake SMS ─────────────
     // Trial-gated feature-phone games (KimCuong2, Vietnamese / Southeast
     // Asian titles) send a premium SMS to a short code to "register" and
@@ -3068,6 +3100,26 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "pointerDragged", "(II)V",
         "base-class no-op; subclasses override",
         [](VM&, Frame&, std::span<Slot>) {});
+
+    // Canvas.getKeyCode(gameAction) — inverse of getGameAction.
+    vm.register_native("javax/microedition/lcdui/Canvas",
+        "getKeyCode", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            int32_t a = args[1].as_int();
+            int32_t k = 0;
+            switch (a) {
+                case 1:  k = -1; break;  // UP
+                case 2:  k = -3; break;  // LEFT
+                case 5:  k = -4; break;  // RIGHT
+                case 6:  k = -2; break;  // DOWN
+                case 8:  k = -5; break;  // FIRE
+                case 9:  k = -10; break; // GAME_A
+                case 10: k = -11; break; // GAME_B
+                case 11: k = -12; break; // GAME_C
+                case 12: k = -13; break; // GAME_D
+            }
+            f.push_int(k);
+        });
 
     // Canvas.getKeyName: Same mapping as KeyConverter.getKeyName but called
     // directly off Canvas in many games.
@@ -3879,6 +3931,32 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         [](VM&, Frame& f, std::span<Slot>) {
             f.push_int(Mix_VolumeMusic(-1) * 100 / MIX_MAX_VOLUME);
         });
+    vm.register_native("javax/microedition/media/control/VolumeControl",
+        "setMute", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            int vol = args[1].as_int() != 0 ? 0 : MIX_MAX_VOLUME;
+            Mix_VolumeMusic(vol);
+            Mix_Volume(-1, vol);
+        });
+    vm.register_native("javax/microedition/media/control/VolumeControl",
+        "isMuted", "()Z",
+        [](VM&, Frame& f, std::span<Slot>) {
+            f.push_int(Mix_VolumeMusic(-1) == 0 ? 1 : 0);
+        });
+
+    vm.register_stub("javax/microedition/media/Player",
+        "getDuration", "()J",
+        "no per-player duration tracking; -1 = TIME_UNKNOWN per spec",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_long(-1); });
+
+    // CommandListener interface — bytecode at the call site uses invokeinterface
+    // CommandListener.commandAction. Spec-callback method; games' impls always
+    // override. Register a no-op so super-call-chains don't auto-stub-noise.
+    vm.register_noop("javax/microedition/lcdui/CommandListener",
+        "commandAction",
+        "(Ljavax/microedition/lcdui/Command;Ljavax/microedition/lcdui/Displayable;)V",
+        "interface base — game's impl always overrides",
+        [](VM&, Frame&, std::span<Slot>) {});
 
     // ── BIOS LFImpl leaf natives ──────────────────────────────────────────────
     // phoneME's javax.microedition.lcdui.*LFImpl classes route through these

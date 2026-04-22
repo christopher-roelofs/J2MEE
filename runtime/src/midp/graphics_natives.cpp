@@ -2708,4 +2708,200 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             TiledData* td = tiled_for(args[0].as_ref());
             f.push_int(td && td->visible ? 1 : 0);
         });
+
+    // ── javax.microedition.lcdui.game.LayerManager ───────────────────────────
+    // Container for Layer instances with a viewport. paint(g, x, y) iterates
+    // layers in z-order (last-appended draws first per spec) within the
+    // current viewport, calling each Layer's paint with the right offset.
+    struct LMState {
+        std::vector<ObjRef> layers;
+        int view_x = 0, view_y = 0, view_w = 0, view_h = 0;
+    };
+    static std::unordered_map<ObjRef, LMState> g_lms;
+    auto lm_for = [](ObjRef r) -> LMState* {
+        auto it = g_lms.find(r);
+        return it == g_lms.end() ? nullptr : &it->second;
+    };
+
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "<init>", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            g_lms[args[0].as_ref()] = {};
+        });
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "append", "(Ljavax/microedition/lcdui/game/Layer;)V",
+        [lm_for](VM&, Frame&, std::span<Slot> args) {
+            LMState* lm = lm_for(args[0].as_ref());
+            if (lm) lm->layers.push_back(args[1].as_ref());
+        });
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "insert", "(Ljavax/microedition/lcdui/game/Layer;I)V",
+        [lm_for](VM&, Frame&, std::span<Slot> args) {
+            LMState* lm = lm_for(args[0].as_ref());
+            if (!lm) return;
+            int i = args[2].as_int();
+            if (i < 0) i = 0;
+            if (i > (int)lm->layers.size()) i = (int)lm->layers.size();
+            lm->layers.insert(lm->layers.begin() + i, args[1].as_ref());
+        });
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "remove", "(Ljavax/microedition/lcdui/game/Layer;)V",
+        [lm_for](VM&, Frame&, std::span<Slot> args) {
+            LMState* lm = lm_for(args[0].as_ref());
+            if (!lm) return;
+            ObjRef target = args[1].as_ref();
+            auto it = std::find(lm->layers.begin(), lm->layers.end(), target);
+            if (it != lm->layers.end()) lm->layers.erase(it);
+        });
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "getLayerAt", "(I)Ljavax/microedition/lcdui/game/Layer;",
+        [lm_for](VM&, Frame& f, std::span<Slot> args) {
+            LMState* lm = lm_for(args[0].as_ref());
+            int i = args[1].as_int();
+            f.push_ref((lm && i >= 0 && i < (int)lm->layers.size())
+                       ? lm->layers[i] : NULL_REF);
+        });
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "getSize", "()I",
+        [lm_for](VM&, Frame& f, std::span<Slot> args) {
+            LMState* lm = lm_for(args[0].as_ref());
+            f.push_int(lm ? (int)lm->layers.size() : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "setViewWindow", "(IIII)V",
+        [lm_for](VM&, Frame&, std::span<Slot> args) {
+            LMState* lm = lm_for(args[0].as_ref());
+            if (!lm) return;
+            lm->view_x = args[1].as_int();
+            lm->view_y = args[2].as_int();
+            lm->view_w = args[3].as_int();
+            lm->view_h = args[4].as_int();
+        });
+    // paint(Graphics, int x, int y): paint all layers in z-order (highest
+    // index = back-most per spec; we iterate in reverse so the first-added
+    // ends up on top).
+    vm.register_native("javax/microedition/lcdui/game/LayerManager",
+        "paint", "(Ljavax/microedition/lcdui/Graphics;II)V",
+        [lm_for, sprite_for, tiled_for](VM& v, Frame&, std::span<Slot> args) {
+            LMState* lm = lm_for(args[0].as_ref());
+            if (!lm || lm->layers.empty()) return;
+            ObjRef gfx = args[1].as_ref();
+            SDL_Surface* dst = gfx_surface(gfx);
+            if (!dst) return;
+            int paint_x = args[2].as_int(), paint_y = args[3].as_int();
+            // Iterate back-to-front (last-appended on top per spec)
+            for (auto it = lm->layers.rbegin(); it != lm->layers.rend(); ++it) {
+                ObjRef layer = *it;
+                // Sprite
+                if (SpriteData* sd = sprite_for(layer)) {
+                    if (!sd->visible || !sd->img) continue;
+                    int raw = (sd->frame >= 0 && sd->frame < (int)sd->seq.size())
+                                ? sd->seq[sd->frame] : 0;
+                    if (raw < 0 || raw >= sd->frame_count) raw = 0;
+                    int sx = (raw % sd->cols) * sd->frame_w;
+                    int sy = (raw / sd->cols) * sd->frame_h;
+                    auto t = gfx_tx(gfx);
+                    blit_image(dst, sd->img,
+                               paint_x + sd->x - lm->view_x + t.x,
+                               paint_y + sd->y - lm->view_y + t.y,
+                               sx, sy, sd->frame_w, sd->frame_h, sd->transform);
+                    continue;
+                }
+                // TiledLayer
+                if (TiledData* td = tiled_for(layer)) {
+                    if (!td->visible || !td->img) continue;
+                    auto t = gfx_tx(gfx);
+                    for (int r = 0; r < td->rows; ++r) {
+                        for (int c = 0; c < td->cols; ++c) {
+                            int v = td->cells[(size_t)r * td->cols + c];
+                            if (v == 0) continue;
+                            if (v < 0) {
+                                int idx = -v - 1;
+                                if (idx < 0 || idx >= (int)td->animated.size()) continue;
+                                v = td->animated[idx];
+                                if (v <= 0) continue;
+                            }
+                            if (v > td->static_tile_count) continue;
+                            int tile = v - 1;
+                            int sx = (tile % td->strip_cols) * td->tile_w;
+                            int sy = (tile / td->strip_cols) * td->tile_h;
+                            blit_image(dst, td->img,
+                                       paint_x + td->x + c * td->tile_w - lm->view_x + t.x,
+                                       paint_y + td->y + r * td->tile_h - lm->view_y + t.y,
+                                       sx, sy, td->tile_w, td->tile_h, 0);
+                        }
+                    }
+                    continue;
+                }
+                // Custom Layer subclass — invoke its paint(Graphics)
+                HeapObject* ho = v.heap().deref(layer);
+                if (!ho || !ho->klass) continue;
+                if (auto* m = ho->klass->resolve_virtual("paint",
+                        "(Ljavax/microedition/lcdui/Graphics;)V")) {
+                    Slot args2[2] = { Slot::from_ref(layer), Slot::from_ref(gfx) };
+                    v.invoke(m, ho->klass, std::span<const Slot>(args2, 2));
+                }
+            }
+        });
+
+    // ── Sprite.collidesWith — bounding-box variants ──────────────────────────
+    auto sprite_bbox = [sprite_for](ObjRef ref, int& x, int& y, int& w, int& h) {
+        SpriteData* sd = sprite_for(ref);
+        if (!sd) return false;
+        x = sd->x; y = sd->y;
+        if (sd->transform == 4 || sd->transform == 5 ||
+            sd->transform == 6 || sd->transform == 7) {
+            w = sd->frame_h; h = sd->frame_w;
+        } else {
+            w = sd->frame_w; h = sd->frame_h;
+        }
+        return true;
+    };
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "collidesWith", "(Ljavax/microedition/lcdui/game/Sprite;Z)Z",
+        [sprite_bbox](VM&, Frame& f, std::span<Slot> args) {
+            int ax, ay, aw, ah, bx, by, bw, bh;
+            if (!sprite_bbox(args[0].as_ref(), ax, ay, aw, ah) ||
+                !sprite_bbox(args[1].as_ref(), bx, by, bw, bh)) {
+                f.push_int(0); return;
+            }
+            // bool pixelLevel = args[2].as_int() != 0;
+            // Always do bbox; pixel-level upgrade can come later.
+            bool overlap = ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+            f.push_int(overlap ? 1 : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "collidesWith",
+        "(Ljavax/microedition/lcdui/game/TiledLayer;Z)Z",
+        [sprite_bbox, tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            int ax, ay, aw, ah;
+            if (!sprite_bbox(args[0].as_ref(), ax, ay, aw, ah)) {
+                f.push_int(0); return;
+            }
+            TiledData* td = tiled_for(args[1].as_ref());
+            if (!td) { f.push_int(0); return; }
+            int tw = td->cols * td->tile_w, th = td->rows * td->tile_h;
+            bool overlap = ax < td->x+tw && ax+aw > td->x &&
+                           ay < td->y+th && ay+ah > td->y;
+            f.push_int(overlap ? 1 : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "collidesWith",
+        "(Ljavax/microedition/lcdui/Image;IIZ)Z",
+        [sprite_bbox](VM& v, Frame& f, std::span<Slot> args) {
+            int ax, ay, aw, ah;
+            if (!sprite_bbox(args[0].as_ref(), ax, ay, aw, ah)) {
+                f.push_int(0); return;
+            }
+            ObjRef img_ref = args[1].as_ref();
+            int ix = args[2].as_int(), iy = args[3].as_int();
+            int iw = 0, ih = 0;
+            auto img_it = g_images.find(img_ref);
+            if (img_it != g_images.end() && img_it->second) {
+                iw = img_it->second->w; ih = img_it->second->h;
+            }
+            (void)v;
+            bool overlap = ax < ix+iw && ax+aw > ix && ay < iy+ih && ay+ah > iy;
+            f.push_int(overlap ? 1 : 0);
+        });
 }

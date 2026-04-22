@@ -422,12 +422,22 @@ void register_m3g_natives(VM& vm) {
 
     // ── CompositingMode additions (depth, alpha-write) ──────────────────────
     vm.register_native("javax/microedition/m3g/CompositingMode",
+        "setDepthTestEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GCompositingMode c = handle_for<M3GCompositingMode>(args[0].as_ref());
+            if (c) m3gEnableDepthTest(c, args[1].as_int() != 0);
+        });
+    vm.register_native("javax/microedition/m3g/CompositingMode",
         "setDepthWriteEnable", "(Z)V",
         [](VM&, Frame&, std::span<Slot> args) {
-            // M3G core uses CompositingMode for depth via setDepthOffset only;
-            // depth-write toggle isn't a separate API. No-op preserves the
-            // game's call without affecting rendering.
-            (void)args;
+            M3GCompositingMode c = handle_for<M3GCompositingMode>(args[0].as_ref());
+            if (c) m3gEnableDepthWrite(c, args[1].as_int() != 0);
+        });
+    vm.register_native("javax/microedition/m3g/CompositingMode",
+        "setColorWriteEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GCompositingMode c = handle_for<M3GCompositingMode>(args[0].as_ref());
+            if (c) m3gEnableColorWrite(c, args[1].as_int() != 0);
         });
     vm.register_native("javax/microedition/m3g/CompositingMode",
         "setAlphaWriteEnable", "(Z)V",
@@ -587,6 +597,66 @@ void register_m3g_natives(VM& vm) {
             M3GGroup g = handle_for<M3GGroup>(args[0].as_ref());
             f.push_int(g ? m3gGetChildCount(g) : 0);
         });
+    vm.register_native("javax/microedition/m3g/Group",
+        "removeChild", "(Ljavax/microedition/m3g/Node;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GGroup g = handle_for<M3GGroup>(args[0].as_ref());
+            if (!g) return;
+            M3GNode n = handle_for<M3GNode>(args[1].as_ref());
+            if (n) m3gRemoveChild(g, n);
+        });
+    vm.register_native("javax/microedition/m3g/Group",
+        "getChild", "(I)Ljavax/microedition/m3g/Node;",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            // M3G returns the underlying handle but Java needs an ObjRef. We
+            // don't currently round-trip Node ObjRefs, so return null.
+            (void)args;
+            f.push_ref(NULL_REF);
+        });
+
+    // ── Object3D additions ──────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Object3D",
+        "find", "(I)Ljavax/microedition/m3g/Object3D;",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            // m3gFind walks a scene tree by user ID. We return null since
+            // we don't round-trip Object3D ObjRefs from the C handle.
+            (void)args;
+            f.push_ref(NULL_REF);
+        });
+
+    // ── Mesh.getVertexBuffer ────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Mesh",
+        "getVertexBuffer", "()Ljavax/microedition/m3g/VertexBuffer;",
+        [](VM&, Frame& f, std::span<Slot>) {
+            f.push_ref(NULL_REF);  // Mesh.<init> doesn't bind geometry yet
+        });
+
+    // ── Appearance.getCompositingMode ───────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Appearance",
+        "getCompositingMode", "()Ljavax/microedition/m3g/CompositingMode;",
+        [](VM&, Frame& f, std::span<Slot>) {
+            f.push_ref(NULL_REF);  // C handle round-trip not modelled
+        });
+
+    // ── Transformable.setTranslation / setOrientation / setScale ────────────
+    // Transformable is the base class for Node (and thus Camera, Light, Mesh,
+    // Group, etc.). Methods route to the underlying M3GTransformable handle.
+    vm.register_native("javax/microedition/m3g/Transformable",
+        "setTranslation", "(FFF)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GTransformable t = handle_for<M3GTransformable>(args[0].as_ref());
+            if (t) m3gSetTranslation(t, args[1].as_float(),
+                                     args[2].as_float(), args[3].as_float());
+        });
+
+    // ── Node.setRenderingEnable ─────────────────────────────────────────────
+    // No direct M3G API — game's call is just a hint we accept and discard.
+    vm.register_native("javax/microedition/m3g/Node",
+        "setRenderingEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/m3g/Node",
+        "setPickingEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot>) {});
 
     // ── Graphics3D additions (clear, setCamera, setViewport) ────────────────
     vm.register_native("javax/microedition/m3g/Graphics3D",
@@ -605,6 +675,75 @@ void register_m3g_natives(VM& vm) {
             // if available, else no-op.
             (void)args;
         });
+    vm.register_native("javax/microedition/m3g/Graphics3D",
+        "render",
+        "(Ljavax/microedition/m3g/Node;Ljavax/microedition/m3g/Transform;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            if (!g_render_context) return;
+            M3GNode n = handle_for<M3GNode>(args[1].as_ref());
+            if (!n) return;
+            auto t_it = g_transforms.find(args[2].as_ref());
+            const M3GMatrix* tx = (t_it != g_transforms.end()) ? &t_it->second : nullptr;
+            m3gRenderNode(g_render_context, n, tx);
+        });
+    vm.register_native("javax/microedition/m3g/Graphics3D",
+        "render",
+        "(Ljavax/microedition/m3g/VertexBuffer;Ljavax/microedition/m3g/IndexBuffer;Ljavax/microedition/m3g/Appearance;Ljavax/microedition/m3g/Transform;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            if (!g_render_context) return;
+            M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[1].as_ref());
+            M3GIndexBuffer ib = handle_for<M3GIndexBuffer>(args[2].as_ref());
+            M3GAppearance ap = handle_for<M3GAppearance>(args[3].as_ref());
+            if (!vb || !ib || !ap) return;
+            auto t_it = g_transforms.find(args[4].as_ref());
+            const M3GMatrix* tx = (t_it != g_transforms.end()) ? &t_it->second : nullptr;
+            m3gRender(g_render_context, vb, ib, ap, tx, 1.0f, -1);
+        });
+
+    // ── TriangleStripArray ─────────────────────────────────────────────────
+    // Two ctors:
+    //   <init>(int firstIndex, int[] stripLengths)   — implicit indices
+    //   <init>(int[] indices,  int[] stripLengths)   — explicit indices
+    // Both create an M3GIndexBuffer.
+    vm.register_native("javax/microedition/m3g/TriangleStripArray",
+        "<init>", "(I[I)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            M3GInterface itf = j2me_m3g_interface();
+            if (!itf) return;
+            int firstIndex = args[1].as_int();
+            ObjRef arr = args[2].as_ref();
+            if (arr == NULL_REF) return;
+            HeapObject* a = v.heap().deref(arr);
+            if (!a) return;
+            int n = a->array_length();
+            std::vector<M3Gsizei> lengths(n);
+            int32_t* src = (int32_t*)a->array_bytes();
+            for (int i = 0; i < n; ++i) lengths[i] = (M3Gsizei)src[i];
+            M3GIndexBuffer ib = m3gCreateImplicitStripBuffer(itf, n,
+                lengths.data(), firstIndex);
+            if (ib) store_handle(args[0].as_ref(), (uintptr_t)ib);
+        });
+    vm.register_native("javax/microedition/m3g/TriangleStripArray",
+        "<init>", "([I[I)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            M3GInterface itf = j2me_m3g_interface();
+            if (!itf) return;
+            ObjRef idx_arr = args[1].as_ref();
+            ObjRef len_arr = args[2].as_ref();
+            if (idx_arr == NULL_REF || len_arr == NULL_REF) return;
+            HeapObject* idx = v.heap().deref(idx_arr);
+            HeapObject* len = v.heap().deref(len_arr);
+            if (!idx || !len) return;
+            int idx_n = idx->array_length();
+            int len_n = len->array_length();
+            std::vector<M3Gsizei> lengths(len_n);
+            int32_t* len_src = (int32_t*)len->array_bytes();
+            for (int i = 0; i < len_n; ++i) lengths[i] = (M3Gsizei)len_src[i];
+            M3GIndexBuffer ib = m3gCreateStripBuffer(itf, M3G_TRIANGLE_STRIPS,
+                len_n, lengths.data(), M3G_INT, idx_n, idx->array_bytes());
+            if (ib) store_handle(args[0].as_ref(), (uintptr_t)ib);
+        });
+
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "setViewport", "(IIII)V",
         [](VM&, Frame&, std::span<Slot> args) {
@@ -631,6 +770,43 @@ void register_m3g_natives(VM& vm) {
             auto& dst = g_transforms[args[0].as_ref()];
             auto it = g_transforms.find(args[1].as_ref());
             if (it != g_transforms.end()) m3gCopyMatrix(&dst, &it->second);
+        });
+    vm.register_native("javax/microedition/m3g/Transform",
+        "get", "([F)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            auto it = g_transforms.find(args[0].as_ref());
+            if (it == g_transforms.end()) return;
+            ObjRef arr = args[1].as_ref();
+            if (arr == NULL_REF) return;
+            HeapObject* a = v.heap().deref(arr);
+            if (!a || a->array_length() < 16) return;
+            m3gGetMatrixRows(&it->second, (float*)a->array_bytes());
+        });
+    vm.register_native("javax/microedition/m3g/Transform",
+        "transform", "([F)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            auto it = g_transforms.find(args[0].as_ref());
+            if (it == g_transforms.end()) return;
+            ObjRef arr = args[1].as_ref();
+            if (arr == NULL_REF) return;
+            HeapObject* a = v.heap().deref(arr);
+            if (!a) return;
+            int len = a->array_length();
+            // Treat as packed [x0,y0,z0,w0, x1,y1,z1,w1, ...]; transform in-place.
+            float* p = (float*)a->array_bytes();
+            for (int i = 0; i + 4 <= len; i += 4) {
+                M3GVec4 v4{ p[i], p[i+1], p[i+2], p[i+3] };
+                m3gTransformVec4(&it->second, &v4);
+                p[i] = v4.x; p[i+1] = v4.y; p[i+2] = v4.z; p[i+3] = v4.w;
+            }
+        });
+    vm.register_native("javax/microedition/m3g/Transform",
+        "postMultiply", "(Ljavax/microedition/m3g/Transform;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto dst_it = g_transforms.find(args[0].as_ref());
+            auto src_it = g_transforms.find(args[1].as_ref());
+            if (dst_it == g_transforms.end() || src_it == g_transforms.end()) return;
+            m3gPostMultiplyMatrix(&dst_it->second, &src_it->second);
         });
 
     // ── Mesh ─────────────────────────────────────────────────────────────────
