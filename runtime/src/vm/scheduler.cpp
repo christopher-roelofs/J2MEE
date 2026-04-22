@@ -98,6 +98,13 @@ JavaThread* Scheduler::pick_next() {
     for (auto& thr : m_threads) {
         if (thr->state == JavaThread::State::Sleeping && t >= thr->wake_at_ms)
             thr->state = JavaThread::State::Ready;
+        // Timed waiters also wake on their deadline.
+        if (thr->state == JavaThread::State::Waiting
+            && thr->wake_at_ms != 0 && t >= thr->wake_at_ms) {
+            thr->state      = JavaThread::State::Ready;
+            thr->wait_on    = NULL_REF;
+            thr->wake_at_ms = 0;
+        }
     }
     for (auto& thr : m_threads) {
         if (thr->state == JavaThread::State::Ready) return thr.get();
@@ -120,6 +127,9 @@ void Scheduler::run_to_completion() {
             for (auto& thr : m_threads) {
                 if (thr->state != JavaThread::State::Dead) any_alive = true;
                 if (thr->state == JavaThread::State::Sleeping)
+                    earliest_wake = std::min(earliest_wake, thr->wake_at_ms);
+                if (thr->state == JavaThread::State::Waiting
+                    && thr->wake_at_ms != 0)
                     earliest_wake = std::min(earliest_wake, thr->wake_at_ms);
             }
             if (!any_alive) break;
@@ -182,8 +192,25 @@ void Scheduler::wait_current(ObjRef monitor) {
     if (!self) return;
     if (std::getenv("J2ME_TRACE_SCHED"))
         fprintf(stderr, "[sched t=%d] wait(obj=%d)\n", self->java_ref, monitor);
-    self->state   = JavaThread::State::Waiting;
-    self->wait_on = monitor;
+    self->state      = JavaThread::State::Waiting;
+    self->wait_on    = monitor;
+    self->wake_at_ms = 0;  // untimed; only notify can wake
+    swapcontext(&self->ctx, &m_scheduler_ctx);
+}
+
+void Scheduler::wait_current_timed(ObjRef monitor, uint64_t ms) {
+    JavaThread* self = m_current;
+    if (!self) return;
+    // Cap deadline same as Thread.sleep — long timeouts on modern hardware
+    // would stall games unnecessarily. Notifies still wake immediately.
+    uint64_t capped = std::min<uint64_t>(ms, 50);
+    if (std::getenv("J2ME_TRACE_SCHED"))
+        fprintf(stderr, "[sched t=%d] wait(obj=%d, %lu ms, capped %lu)\n",
+                self->java_ref, monitor,
+                (unsigned long)ms, (unsigned long)capped);
+    self->state      = JavaThread::State::Waiting;
+    self->wait_on    = monitor;
+    self->wake_at_ms = now_ms() + capped;
     swapcontext(&self->ctx, &m_scheduler_ctx);
 }
 

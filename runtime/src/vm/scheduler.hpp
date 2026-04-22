@@ -78,6 +78,9 @@ public:
     // then yields.
     void sleep_current(uint64_t ms);
     void wait_current(ObjRef monitor);
+    // Like wait_current, but with a deadline — wakes either on notify or
+    // when `ms` milliseconds elapse. Used by Object.wait(long) for timed waits.
+    void wait_current_timed(ObjRef monitor, uint64_t ms);
 
     // Wake exactly one / all waiters on `monitor`. Safe to call from any
     // thread (i.e. the currently-running one).
