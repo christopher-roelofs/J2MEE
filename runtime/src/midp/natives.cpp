@@ -2241,6 +2241,78 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(make_fake_http(v, args));
         });
 
+    // ── Interface methods on Connection/InputConnection/OutputConnection ────
+    // The MIDP IO type hierarchy:
+    //   Connection (close)
+    //     ├── InputConnection (openInputStream / openDataInputStream)
+    //     └── OutputConnection (openOutputStream / openDataOutputStream)
+    // Concrete classes (HttpConnection, ContentConnection, FileConnection,
+    // SocketConnection) all extend these. Many games hold their refs as
+    // the interface type, so the constant-pool methodref is on the interface,
+    // not the concrete class. Register on the interfaces directly.
+    //
+    // Defensive-call pattern (very common at startup):
+    //   try { Connection c = Connector.open(url); c.close(); }
+    // We give them all the interface methods they need to no-op cleanly.
+
+    vm.register_noop("javax/microedition/io/Connection",
+        "close", "()V",
+        "no real network/file connection; close is a no-op",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    auto stub_input_stream = [](VM& v, Frame& f, std::span<Slot>) {
+        ClassDef* k = v.loader().find_or_stub("java/io/InputStream");
+        ObjRef ref = v.heap().alloc_object(k, 0);
+        // No backing data — read() returns -1 (EOF) via existing default.
+        f.push_ref(ref);
+    };
+    vm.register_noop("javax/microedition/io/InputConnection",
+        "openInputStream", "()Ljava/io/InputStream;",
+        "no real connection; returns empty (EOF) stream",
+        stub_input_stream);
+    vm.register_noop("javax/microedition/io/InputConnection",
+        "openDataInputStream", "()Ljava/io/DataInputStream;",
+        "no real connection; returns empty (EOF) DataInputStream",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/DataInputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+
+    auto stub_output_stream = [](VM& v, Frame& f, std::span<Slot>) {
+        ClassDef* k = v.loader().find_or_stub("java/io/OutputStream");
+        f.push_ref(v.heap().alloc_object(k, 0));
+    };
+    vm.register_noop("javax/microedition/io/OutputConnection",
+        "openOutputStream", "()Ljava/io/OutputStream;",
+        "no real connection; returns sink OutputStream that swallows writes",
+        stub_output_stream);
+    vm.register_noop("javax/microedition/io/OutputConnection",
+        "openDataOutputStream", "()Ljava/io/DataOutputStream;",
+        "no real connection; returns sink DataOutputStream",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/DataOutputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+
+    // ContentConnection adds getType/getLength/getEncoding on top.
+    vm.register_noop("javax/microedition/io/ContentConnection",
+        "getType", "()Ljava/lang/String;",
+        "no real content; null content-type",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+    vm.register_noop("javax/microedition/io/ContentConnection",
+        "getLength", "()J",
+        "no real content; length unknown",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_long(-1); });
+    vm.register_noop("javax/microedition/io/ContentConnection",
+        "getEncoding", "()Ljava/lang/String;",
+        "no real content; null encoding",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+
+    // StreamConnection inherits both Input and Output. The interface itself
+    // has no own methods — coverage above suffices. Same for
+    // StreamConnectionNotifier (server-side) — games using it would block
+    // forever waiting for a connection, but we just satisfy the type lookup.
+
     // Fake HttpConnection methods.
     vm.register_stub("javax/microedition/io/HttpConnection",
         "setRequestMethod", "(Ljava/lang/String;)V",
