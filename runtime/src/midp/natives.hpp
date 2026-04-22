@@ -18,3 +18,8 @@ void register_natives(VM& vm, const JarFile& jar);
 // Register SDL2-backed graphics, image, and canvas natives.
 // Call this after register_natives() and before vm.run().
 void register_graphics_natives(VM& vm, const JarFile& jar);
+
+// Register M3G (JSR-184) native bridge. Routes javax/microedition/m3g/*
+// methods through to the vendored Khronos M3G core (third_party/m3g).
+// Call after register_natives() / register_graphics_natives().
+void register_m3g_natives(VM& vm);
