@@ -206,6 +206,7 @@ int main(int argc, char* argv[]) {
         register_natives(vm, jar);
         register_graphics_natives(vm, jar);
         register_m3g_natives(vm);
+        register_lcdui_natives(vm);
 
         // Some titles (e.g. Jamdat framework games) draw via direct Graphics
         // calls and never invoke Canvas.repaint()/GameCanvas.flushGraphics().

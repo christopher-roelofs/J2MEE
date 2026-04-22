@@ -36,6 +36,7 @@ set(SOURCES
     src/midp/audio_eas.cpp
     src/midp/m3g_backend.cpp
     src/midp/m3g_natives.cpp
+    src/midp/lcdui_natives.cpp
     src/backend/display.cpp
 )
 

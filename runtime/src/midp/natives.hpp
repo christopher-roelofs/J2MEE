@@ -23,3 +23,8 @@ void register_graphics_natives(VM& vm, const JarFile& jar);
 // methods through to the vendored Khronos M3G core (third_party/m3g).
 // Call after register_natives() / register_graphics_natives().
 void register_m3g_natives(VM& vm);
+
+// Register LCDUI form/textfield/textbox/StringItem/Item native impls.
+// State-only (no visual rendering of Form items yet — that needs full
+// LFImpl-equivalent layout work).
+void register_lcdui_natives(VM& vm);
