@@ -2132,4 +2132,257 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             if (!Display::instance().flush())
                 throw QuitRequest{};
         });
+
+    // ── javax.microedition.lcdui.game.Sprite + Layer ─────────────────────────
+    // Sprite is the dominant 2D-game class in the MIDP corpus (1442+ JARs use
+    // its <init>(Image,II) alone). Layer is the abstract base; Sprite extends
+    // it. We track everything in one SpriteData per ObjRef and have Layer's
+    // accessors read the same data — Sprite IS-A Layer at the bytecode level.
+    struct SpriteData {
+        SDL_Surface* img = nullptr;  // not owned; points into g_images
+        int frame_w = 0, frame_h = 0;
+        int cols    = 1;             // frames per row in the strip
+        int frame_count = 1;
+        int x = 0, y = 0;            // top-left position (in target coords)
+        int ref_x = 0, ref_y = 0;    // reference pixel (in frame-local coords)
+        int frame = 0;               // index into seq[]
+        int transform = 0;           // MIDP TRANS_* constant
+        bool visible = true;
+        std::vector<int> seq;        // raw-frame indices; default 0..frame_count-1
+    };
+    static std::unordered_map<ObjRef, SpriteData> g_sprites;
+
+    auto sprite_for = [](ObjRef ref) -> SpriteData* {
+        auto it = g_sprites.find(ref);
+        return it == g_sprites.end() ? nullptr : &it->second;
+    };
+
+    auto sprite_init_strip = [](SpriteData& sd, SDL_Surface* img,
+                                int fw, int fh) {
+        sd.img = img;
+        sd.frame_w = fw > 0 ? fw : (img ? img->w : 0);
+        sd.frame_h = fh > 0 ? fh : (img ? img->h : 0);
+        sd.cols = (sd.frame_w > 0 && img) ? (img->w / sd.frame_w) : 1;
+        int rows = (sd.frame_h > 0 && img) ? (img->h / sd.frame_h) : 1;
+        sd.frame_count = sd.cols * rows;
+        if (sd.frame_count <= 0) sd.frame_count = 1;
+        sd.seq.resize(sd.frame_count);
+        for (int i = 0; i < sd.frame_count; ++i) sd.seq[i] = i;
+        sd.frame = 0;
+    };
+
+    // Sprite(Image)
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "<init>", "(Ljavax/microedition/lcdui/Image;)V",
+        [sprite_init_strip](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            SDL_Surface* img = nullptr;
+            auto it = g_images.find(args[1].as_ref());
+            if (it != g_images.end()) img = it->second;
+            SpriteData& sd = g_sprites[self];
+            sprite_init_strip(sd, img, img ? img->w : 0, img ? img->h : 0);
+        });
+
+    // Sprite(Image, frameWidth, frameHeight)
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "<init>", "(Ljavax/microedition/lcdui/Image;II)V",
+        [sprite_init_strip](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            SDL_Surface* img = nullptr;
+            auto it = g_images.find(args[1].as_ref());
+            if (it != g_images.end()) img = it->second;
+            int fw = args[2].as_int(), fh = args[3].as_int();
+            SpriteData& sd = g_sprites[self];
+            sprite_init_strip(sd, img, fw, fh);
+        });
+
+    // Sprite(Sprite) — copy ctor; rarely used but games occasionally clone
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "<init>", "(Ljavax/microedition/lcdui/game/Sprite;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref(), src = args[1].as_ref();
+            auto it = g_sprites.find(src);
+            if (it != g_sprites.end()) g_sprites[self] = it->second;
+        });
+
+    // setFrame / getFrame / getRawFrameCount / getFrameSequenceLength
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "setFrame", "(I)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (!sd || sd->seq.empty()) return;
+            int n = args[1].as_int();
+            if (n < 0) n = 0;
+            if (n >= (int)sd->seq.size()) n = (int)sd->seq.size() - 1;
+            sd->frame = n;
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getFrame", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? sd->frame : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getRawFrameCount", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? sd->frame_count : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getFrameSequenceLength", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? (int)sd->seq.size() : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "setFrameSequence", "([I)V",
+        [sprite_for](VM& v, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (!sd) return;
+            ObjRef arr = args[1].as_ref();
+            if (arr == NULL_REF) {
+                // Reset to identity sequence
+                sd->seq.resize(sd->frame_count);
+                for (int i = 0; i < sd->frame_count; ++i) sd->seq[i] = i;
+            } else {
+                HeapObject* a = v.heap().deref(arr);
+                if (!a) return;
+                int n = a->array_length();
+                Slot* s = a->array_slots();
+                sd->seq.resize(n);
+                for (int i = 0; i < n; ++i) sd->seq[i] = s[i].as_int();
+            }
+            sd->frame = 0;
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "nextFrame", "()V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (!sd || sd->seq.empty()) return;
+            sd->frame = (sd->frame + 1) % (int)sd->seq.size();
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "prevFrame", "()V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (!sd || sd->seq.empty()) return;
+            sd->frame = (sd->frame + (int)sd->seq.size() - 1) % (int)sd->seq.size();
+        });
+
+    // Transform
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "setTransform", "(I)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) sd->transform = args[1].as_int();
+        });
+
+    // Reference pixel
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "defineReferencePixel", "(II)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) { sd->ref_x = args[1].as_int(); sd->ref_y = args[2].as_int(); }
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "setRefPixelPosition", "(II)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (!sd) return;
+            // Spec: position the sprite so the reference pixel ends up at (x,y)
+            sd->x = args[1].as_int() - sd->ref_x;
+            sd->y = args[2].as_int() - sd->ref_y;
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getRefPixelX", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? (sd->x + sd->ref_x) : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getRefPixelY", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? (sd->y + sd->ref_y) : 0);
+        });
+
+    // Layer base-class accessors — all keyed off the same SpriteData map
+    // (Sprite extends Layer; both use the same ObjRef).
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "setPosition", "(II)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) { sd->x = args[1].as_int(); sd->y = args[2].as_int(); }
+        });
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "move", "(II)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) { sd->x += args[1].as_int(); sd->y += args[2].as_int(); }
+        });
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "getX", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? sd->x : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "getY", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? sd->y : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "getWidth", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            // Rotated transforms swap w/h
+            if (sd && (sd->transform == 4 || sd->transform == 5 ||
+                       sd->transform == 6 || sd->transform == 7))
+                f.push_int(sd->frame_h);
+            else
+                f.push_int(sd ? sd->frame_w : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "getHeight", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd && (sd->transform == 4 || sd->transform == 5 ||
+                       sd->transform == 6 || sd->transform == 7))
+                f.push_int(sd->frame_w);
+            else
+                f.push_int(sd ? sd->frame_h : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "setVisible", "(Z)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) sd->visible = args[1].as_int() != 0;
+        });
+    vm.register_native("javax/microedition/lcdui/game/Layer",
+        "isVisible", "()Z",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd && sd->visible ? 1 : 0);
+        });
+
+    // The actual draw — locate the current frame in the strip, route through
+    // blit_image (which already handles all 8 MIDP transforms + clipping).
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "paint", "(Ljavax/microedition/lcdui/Graphics;)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (!sd || !sd->visible || !sd->img) return;
+            ObjRef gfx = args[1].as_ref();
+            SDL_Surface* dst = gfx_surface(gfx);
+            if (!dst) return;
+            int raw = (sd->frame >= 0 && sd->frame < (int)sd->seq.size())
+                        ? sd->seq[sd->frame] : 0;
+            if (raw < 0 || raw >= sd->frame_count) raw = 0;
+            int sx = (raw % sd->cols) * sd->frame_w;
+            int sy = (raw / sd->cols) * sd->frame_h;
+            auto t = gfx_tx(gfx);
+            blit_image(dst, sd->img, sd->x + t.x, sd->y + t.y,
+                       sx, sy, sd->frame_w, sd->frame_h, sd->transform);
+        });
 }
