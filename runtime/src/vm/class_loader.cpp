@@ -47,12 +47,26 @@ static bool is_bios_excluded(const std::string& name) {
     for (auto* p : kExcludePrefixes)
         if (name.rfind(p, 0) == 0) return true;
 
-    // Specific class exclusions — BIOS's TextBox/TextField pull in supervisor
-    // chains (DisplayEventHandler, TextFieldLFImpl native resources). Our
-    // stub natives handle them well enough for games that just construct one.
+    // Specific class exclusions. Some BIOS classes work; some pull supervisor
+    // chains we filter out; some collide with comprehensive native impls we
+    // already have. Exclude the ones where our native impl is a better answer
+    // than BIOS's bytecode (BIOS uses instance fields, we use side-channel
+    // maps — they don't compose).
     static const char* kExcludeExact[] = {
+        // Supervisor-dependent
         "javax/microedition/lcdui/TextBox",
         "javax/microedition/lcdui/TextField",
+        // Our native game-API impls (Sprite + Layer) conflict with BIOS bytecode
+        "javax/microedition/lcdui/game/Sprite",
+        "javax/microedition/lcdui/game/Layer",
+        "javax/microedition/lcdui/game/LayerManager",
+        "javax/microedition/lcdui/game/TiledLayer",
+        // Our IO impls are complete; BIOS's would need supervisor (Reader,
+        // ConnectionBaseAdapter, etc.) we filtered out.
+        "java/io/DataInputStream",
+        "java/io/DataOutputStream",
+        "java/io/ByteArrayInputStream",
+        "java/io/ByteArrayOutputStream",
     };
     for (auto* n : kExcludeExact)
         if (name == n) return true;

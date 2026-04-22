@@ -3167,6 +3167,28 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "setARGBColor", "(III)V",
         [](VM&, Frame&, std::span<Slot> args) { (void)args; });
 
+    // Nokia DirectGraphics.drawPixels: blits a raw pixel buffer (short[] in
+    // RGB565 form) into the underlying Graphics. Common in older Nokia/S40
+    // titles for fast off-screen composition. We ignore the pixel data for
+    // now (treating it as a no-op render); games still progress past the
+    // call instead of UnimplementedNative-aborting.
+    vm.register_stub("com/nokia/mid/ui/DirectGraphicsImp",
+        "drawPixels", "([SZIIIIIIII)V",
+        "Nokia drawPixels(short[]) — bytes ignored; games proceed without blit",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("com/nokia/mid/ui/DirectGraphicsImp",
+        "drawPixels", "([BIIIIIIIII)V",
+        "Nokia drawPixels(byte[]) variant — same no-op handling",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("com/nokia/mid/ui/DirectGraphicsImp",
+        "drawPixels", "([IZIIIIIIII)V",
+        "Nokia drawPixels(int[]) variant — same no-op handling",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("com/nokia/mid/ui/DirectGraphicsImp",
+        "getPixels", "([SIIIIIIIII)V",
+        "Nokia getPixels(short[]) — read-back not modelled; leaves buffer untouched",
+        [](VM&, Frame&, std::span<Slot>) {});
+
     // ── javax.microedition.rms.RecordStore ───────────────────────────────────
     // Simple in-memory record store: g_record_stores[name] = list of byte arrays.
     // Records are 1-based: id 1 = index 0.
