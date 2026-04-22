@@ -580,7 +580,8 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
 
 int  g_screen_w = 240;
 int  g_screen_h = 320;
-bool g_screen_explicit = false;  // set by main.cpp when user passes WxH
+bool g_screen_explicit = false;  // user passed WxH on command line
+bool g_auto_res = false;         // user passed --auto-res
 
 // ─── Auto-detect screen resolution ───────────────────────────────────────────
 // J2ME has no standard manifest field for target screen size, but several
@@ -591,7 +592,15 @@ bool g_screen_explicit = false;  // set by main.cpp when user passes WxH
 //      whose dimensions match the target Canvas
 // We only override the default 240x320 if the signal is unambiguous.
 static void try_detect_screen_resolution(const JarFile& jar) {
-    if (g_screen_explicit) return;  // user told us; trust them
+    if (g_screen_explicit) {
+        fprintf(stderr, "[display] resolution: %dx%d (explicit)\n",
+                g_screen_w, g_screen_h);
+        return;
+    }
+    // boxal.inf is BoxAL-specific and the game won't render at all without
+    // the right size, so always honor it. Other signals (manifest extensions,
+    // PNG mode) only run with --auto-res because they sometimes pick the
+    // wrong size and break visual layout — too coarse to be the default.
 
     // Signal 1: boxal.inf
     if (jar.has("boxal.inf")) {
@@ -613,6 +622,13 @@ static void try_detect_screen_resolution(const JarFile& jar) {
             pos = eol;
             while (pos < inf.size() && (inf[pos] == '\r' || inf[pos] == '\n')) ++pos;
         }
+    }
+
+    if (!g_auto_res) {
+        fprintf(stderr,
+            "[display] resolution: %dx%d (default; pass WxH or --auto-res to change)\n",
+            g_screen_w, g_screen_h);
+        return;
     }
 
     // Signal 2: vendor manifest extensions. None are standard, but several
@@ -680,6 +696,11 @@ static void try_detect_screen_resolution(const JarFile& jar) {
         int h = (int)be32((uint8_t*)data.data() + 20);
         if (w < 96 || h < 96) continue;  // skip icons / sprites
         if (w > 1024 || h > 1024) continue; // skip oversize
+        // Aspect-ratio filter: phone screens cluster between 0.5:1 and 2:1.
+        // Sprite atlases (long horizontal strips) routinely break this — e.g.
+        // a 479x122 frame strip is not a screen. Drop anything more elongated.
+        double aspect = (double)w / h;
+        if (aspect < 0.5 || aspect > 2.0) continue;
         dim_counts[((uint64_t)w << 32) | (uint32_t)h]++;
         if ((int64_t)w * h > (int64_t)max_w * max_h) { max_w = w; max_h = h; }
     }

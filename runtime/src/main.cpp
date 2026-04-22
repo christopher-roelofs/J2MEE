@@ -65,7 +65,11 @@ void print_usage(const char* argv0) {
         "  --quiet              Silence startup banner.\n"
         "  --bios PATH          Optional classes.jar with MIDP/CLDC framework\n"
         "                       impls (e.g. compiled phoneME sources). Game\n"
-        "                       jar shadows BIOS on name collision.\n";
+        "                       jar shadows BIOS on name collision.\n"
+        "  --auto-res           Try to detect target screen resolution from\n"
+        "                       manifest hints + PNG-mode dimensions. Off by\n"
+        "                       default — heuristic, sometimes wrong; pass\n"
+        "                       an explicit WxH for guaranteed-correct sizing.\n";
 }
 
 int avk_from_name(const std::string& s) {
@@ -148,6 +152,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--ppm")      ppm_path   = need("--ppm");
         else if (a == "--keys")     keys_arg   = need("--keys");
         else if (a == "--bios")     bios_path  = need("--bios");
+        else if (a == "--auto-res") { extern bool g_auto_res; g_auto_res = true; }
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
         else if (!a.empty() && a[0] == '-') {
             std::cerr << "unknown option: " << a << "\n";
