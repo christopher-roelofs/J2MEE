@@ -641,7 +641,7 @@ void register_m3g_natives(VM& vm) {
             f.push_ref(NULL_REF);  // C handle round-trip not modelled
         });
 
-    // ── Transformable.setTranslation / setOrientation / setScale ────────────
+    // ── Transformable.setTranslation / setOrientation / setTransform ────────
     // Transformable is the base class for Node (and thus Camera, Light, Mesh,
     // Group, etc.). Methods route to the underlying M3GTransformable handle.
     vm.register_native("javax/microedition/m3g/Transformable",
@@ -650,6 +650,22 @@ void register_m3g_natives(VM& vm) {
             M3GTransformable t = handle_for<M3GTransformable>(args[0].as_ref());
             if (t) m3gSetTranslation(t, args[1].as_float(),
                                      args[2].as_float(), args[3].as_float());
+        });
+    vm.register_native("javax/microedition/m3g/Transformable",
+        "setOrientation", "(FFFF)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GTransformable t = handle_for<M3GTransformable>(args[0].as_ref());
+            if (t) m3gSetOrientation(t, args[1].as_float(),
+                                     args[2].as_float(), args[3].as_float(),
+                                     args[4].as_float());
+        });
+    vm.register_native("javax/microedition/m3g/Transformable",
+        "setTransform", "(Ljavax/microedition/m3g/Transform;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GTransformable t = handle_for<M3GTransformable>(args[0].as_ref());
+            if (!t) return;
+            auto it = g_transforms.find(args[1].as_ref());
+            if (it != g_transforms.end()) m3gSetTransform(t, &it->second);
         });
 
     // ── Node.setRenderingEnable ─────────────────────────────────────────────
@@ -848,5 +864,97 @@ void register_m3g_natives(VM& vm) {
         [](VM& v, Frame& f, std::span<Slot>) {
             f.push_ref(v.heap().alloc_ref_array(0,
                 v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;")));
+        });
+
+    // ── Object3D.animate / duplicate ────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Object3D", "animate", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            M3GObject o = handle_for<M3GObject>(args[0].as_ref());
+            f.push_int(o ? m3gAnimate(o, args[1].as_int()) : 0);
+        });
+    vm.register_native("javax/microedition/m3g/Object3D",
+        "duplicate", "()Ljavax/microedition/m3g/Object3D;",
+        [](VM&, Frame& f, std::span<Slot>) {
+            // m3gDuplicate takes a reference-tracking ulong array; returning
+            // the Java-side duplicate requires round-tripping the new M3G
+            // handle back to an ObjRef, which we don't model. Null for now.
+            f.push_ref(NULL_REF);
+        });
+
+    // ── Transform.invert ────────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Transform", "invert", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto it = g_transforms.find(args[0].as_ref());
+            if (it != g_transforms.end()) m3gInvertMatrix(&it->second);
+        });
+
+    // ── Camera.getProjection — populates a Transform with the projection ──
+    vm.register_native("javax/microedition/m3g/Camera",
+        "getProjection", "(Ljavax/microedition/m3g/Transform;)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            M3GCamera c = handle_for<M3GCamera>(args[0].as_ref());
+            if (!c) { f.push_int(0); return; }
+            M3GMatrix* dst = nullptr;
+            ObjRef t_ref = args[1].as_ref();
+            if (t_ref != NULL_REF) {
+                auto it = g_transforms.find(t_ref);
+                if (it != g_transforms.end()) dst = &it->second;
+            }
+            f.push_int(m3gGetProjectionAsMatrix(c, dst));
+        });
+
+    // ── Mesh.getSubmeshCount ────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Mesh",
+        "getSubmeshCount", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            M3GMesh m = handle_for<M3GMesh>(args[0].as_ref());
+            f.push_int(m ? m3gGetSubmeshCount(m) : 0);
+        });
+
+    // ── Graphics3D.resetLights ──────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Graphics3D", "resetLights", "()V",
+        [](VM&, Frame&, std::span<Slot>) {
+            if (g_render_context) m3gClearLights(g_render_context);
+        });
+
+    // ── Appearance.getPolygonMode ──────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Appearance",
+        "getPolygonMode", "()Ljavax/microedition/m3g/PolygonMode;",
+        [](VM&, Frame& f, std::span<Slot>) {
+            // Handle-to-ObjRef round-trip not modelled; null is spec-legal.
+            f.push_ref(NULL_REF);
+        });
+
+    // ── Sprite3D ────────────────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Sprite3D",
+        "<init>",
+        "(ZLjavax/microedition/m3g/Image2D;Ljavax/microedition/m3g/Appearance;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GInterface itf = j2me_m3g_interface();
+            if (!itf) return;
+            bool scaled = args[1].as_int() != 0;
+            M3GImage img = handle_for<M3GImage>(args[2].as_ref());
+            M3GAppearance ap = handle_for<M3GAppearance>(args[3].as_ref());
+            M3GSprite s = m3gCreateSprite(itf, scaled, img, ap);
+            if (s) store_handle(args[0].as_ref(), (uintptr_t)s);
+        });
+
+    // ── Texture2D.setImage ─────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Texture2D",
+        "setImage", "(Ljavax/microedition/m3g/Image2D;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GTexture t = handle_for<M3GTexture>(args[0].as_ref());
+            if (!t) return;
+            M3GImage img = handle_for<M3GImage>(args[1].as_ref());
+            m3gSetTextureImage(t, img);
+        });
+
+    // ── Background.setCrop ─────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Background",
+        "setCrop", "(IIII)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GBackground b = handle_for<M3GBackground>(args[0].as_ref());
+            if (b) m3gSetBgCrop(b, args[1].as_int(), args[2].as_int(),
+                               args[3].as_int(), args[4].as_int());
         });
 }

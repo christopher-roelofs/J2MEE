@@ -2343,6 +2343,24 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/io/HttpConnection",
         "getLength", "()J",
         [](VM&, Frame& f, std::span<Slot>) { f.push_long(0); });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getHeaderFieldKey", "(I)Ljava/lang/String;",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getType", "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            f.push_ref(v.new_string("text/html"));
+        });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getRequestMethod", "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            f.push_ref(v.new_string("GET"));
+        });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getURL", "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            f.push_ref(v.new_string(""));
+        });
 
     // HttpConnection inherits InputConnection / OutputConnection / Stream
     // openInput/openOutput methods. Methodref counts on HttpConnection for
@@ -2728,6 +2746,9 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/lcdui/Display",
         "numColors", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(65536); });
+    vm.register_native("javax/microedition/lcdui/Display",
+        "numAlphaLevels", "()I",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(256); });
 
     vm.register_native("javax/microedition/lcdui/Display",
         "getCurrent", "()Ljavax/microedition/lcdui/Displayable;",
@@ -3047,6 +3068,23 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "<init>", "(Z)V",
         "suppressKeyEvents arg ignored; we always deliver key events",
         [](VM&, Frame&, std::span<Slot>) {});
+
+    // GameCanvas inherits Canvas.getGameAction; games call it via GameCanvas
+    // class directly in ~230 cases — mirror.
+    vm.register_native("javax/microedition/lcdui/game/GameCanvas",
+        "getGameAction", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            int32_t key = args[1].as_int();
+            int32_t action = 0;
+            switch (key) {
+                case -1: case '2': action = 1; break;  // UP
+                case -3: case '4': action = 2; break;  // LEFT
+                case -4: case '6': action = 5; break;  // RIGHT
+                case -2: case '8': action = 6; break;  // DOWN
+                case -5: case '5': action = 8; break;  // FIRE
+            }
+            f.push_int(action);
+        });
 
     // BIOS GameCanvas.<init>(boolean) calls this package-private static leaf.
     vm.register_noop("javax/microedition/lcdui/game/GameCanvas",
@@ -3963,6 +4001,44 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "getDuration", "()J",
         "no per-player duration tracking; -1 = TIME_UNKNOWN per spec",
         [](VM&, Frame& f, std::span<Slot>) { f.push_long(-1); });
+
+    // VideoControl — MIDP 2.1 MMAPI. We don't decode video, so stub all the
+    // common methods so games probing for VideoControl get usable defaults
+    // instead of "Unimplemented native".
+    vm.register_stub("javax/microedition/media/control/VideoControl",
+        "initDisplayMode", "(ILjava/lang/Object;)Ljava/lang/Object;",
+        "no video backend; return the Displayable arg or null",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            // Spec: mode 1 (USE_DIRECT_VIDEO) gets a Canvas arg and returns
+            // nothing meaningful. Mode 0 (USE_GUI_PRIMITIVE) returns an Item.
+            // Echo the arg for mode 1, null for mode 0.
+            int mode = args[1].as_int();
+            f.push_ref(mode == 1 ? args[2].as_ref() : NULL_REF);
+        });
+    vm.register_stub("javax/microedition/media/control/VideoControl",
+        "setVisible", "(Z)V",
+        "no video backend; visibility ignored",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/media/control/VideoControl",
+        "setDisplayLocation", "(II)V",
+        "no video backend; location ignored",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/media/control/VideoControl",
+        "setDisplaySize", "(II)V",
+        "no video backend; size ignored",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/media/control/VideoControl",
+        "setDisplayFullScreen", "(Z)V",
+        "no video backend",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_stub("javax/microedition/media/control/VideoControl",
+        "getDisplayWidth", "()I",
+        "no video backend; 0",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+    vm.register_stub("javax/microedition/media/control/VideoControl",
+        "getDisplayHeight", "()I",
+        "no video backend; 0",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
 
     // CommandListener interface — bytecode at the call site uses invokeinterface
     // CommandListener.commandAction. Spec-callback method; games' impls always

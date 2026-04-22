@@ -1623,6 +1623,13 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             f.push_int(it != g_images.end() ? it->second->h : 0);
         });
 
+    // Image.isMutable — we don't distinguish mutable/immutable yet; return
+    // false (immutable) so games that gate drawing on mutability take the
+    // "createImage then blit" path rather than "modify in place".
+    vm.register_native("javax/microedition/lcdui/Image",
+        "isMutable", "()Z",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+
     // Image.getRGB(int[] rgb, int off, int scanlen, int x, int y, int w, int h)
     // Read a rectangle of pixels out of the image into an int[] as 0xAARRGGBB.
     // Doom II RPG uses this to sample its bitmap font atlas for stats/menu text.
@@ -2541,6 +2548,32 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         [sprite_for](VM&, Frame& f, std::span<Slot> args) {
             SpriteData* sd = sprite_for(args[0].as_ref());
             f.push_int(sd && sd->visible ? 1 : 0);
+        });
+
+    // Sprite.setImage: change backing image (and optionally re-grid frames).
+    // Spec: preserves current frame and ref-pixel if the new frame grid has
+    // at least the current frame index.
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "setImage", "(Ljavax/microedition/lcdui/Image;II)V",
+        [sprite_for, sprite_init_strip](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (!sd) return;
+            SDL_Surface* img = nullptr;
+            auto it = g_images.find(args[1].as_ref());
+            if (it != g_images.end()) img = it->second;
+            int fw = args[2].as_int(), fh = args[3].as_int();
+            // Preserve x, y, ref pixel, transform, visibility across re-init.
+            int save_x = sd->x, save_y = sd->y;
+            int save_rx = sd->ref_x, save_ry = sd->ref_y;
+            int save_t = sd->transform;
+            bool save_v = sd->visible;
+            int save_frame = sd->frame;
+            sprite_init_strip(*sd, img, fw, fh);
+            sd->x = save_x; sd->y = save_y;
+            sd->ref_x = save_rx; sd->ref_y = save_ry;
+            sd->transform = save_t;
+            sd->visible = save_v;
+            if (save_frame < (int)sd->seq.size()) sd->frame = save_frame;
         });
 
     // The actual draw — locate the current frame in the strip, route through
