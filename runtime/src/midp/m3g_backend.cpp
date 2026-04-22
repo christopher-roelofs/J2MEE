@@ -142,8 +142,17 @@ extern "C" M3Gsizei m3gSymbianInflateBlock(M3Gsizei srcLength,
 }
 
 // Lazily create the singleton M3GInterface. Returns nullptr on failure.
+// m3gCreateInterface internally calls m3gConfigureGL → glGetString(GL_EXTENSIONS)
+// → strstr() on the result. Without a current GLES1 context the extensions
+// string is null and strstr SEGVs. We must ensure a GL context first; in
+// headless mode that fails cleanly and we return nullptr. Callers no-op when
+// the interface is null, so M3G object constructors become silent no-ops.
 M3GInterface j2me_m3g_interface() {
     if (g_interface) return g_interface;
+    if (!j2me_m3g_make_current()) {
+        // No window / no GL context — skip m3gCreateInterface entirely.
+        return nullptr;
+    }
     M3Gparams p{};
     p.mallocFunc        = m3g_malloc;
     p.freeFunc          = m3g_free;
