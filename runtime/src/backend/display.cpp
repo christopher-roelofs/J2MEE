@@ -6,17 +6,20 @@
 volatile std::sig_atomic_t g_quit_requested = 0;
 
 // ─── GameCanvas key state bits (MIDP 2.0 spec) ───────────────────────────────
-// These must match the values the game expects from getKeyStates().
+// MIDP GameCanvas.getKeyStates() bitfield: each bit is 1 << Canvas.<action>.
+// Canvas action constants are UP=1, LEFT=2, RIGHT=5, DOWN=6, FIRE=8,
+// GAME_A=9..GAME_D=12 (JSR-118). Games AND the returned mask against
+// these *_PRESSED constants, so bit positions must match exactly.
 namespace Key {
-    constexpr int UP    = 1 << 0;   // 1
-    constexpr int DOWN  = 1 << 1;   // 2
-    constexpr int LEFT  = 1 << 2;   // 4
-    constexpr int RIGHT = 1 << 3;   // 8
-    constexpr int FIRE  = 1 << 4;   // 16
-    constexpr int GAME_A= 1 << 5;   // 32
-    constexpr int GAME_B= 1 << 6;   // 64
-    constexpr int GAME_C= 1 << 7;   // 128
-    constexpr int GAME_D= 1 << 8;   // 256
+    constexpr int UP    = 1 << 1;   // 0x0002
+    constexpr int LEFT  = 1 << 2;   // 0x0004
+    constexpr int RIGHT = 1 << 5;   // 0x0020
+    constexpr int DOWN  = 1 << 6;   // 0x0040
+    constexpr int FIRE  = 1 << 8;   // 0x0100
+    constexpr int GAME_A= 1 << 9;   // 0x0200
+    constexpr int GAME_B= 1 << 10;  // 0x0400
+    constexpr int GAME_C= 1 << 11;  // 0x0800
+    constexpr int GAME_D= 1 << 12;  // 0x1000
 }
 
 // ─── Singleton ────────────────────────────────────────────────────────────────

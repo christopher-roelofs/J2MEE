@@ -2241,6 +2241,44 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(make_fake_http(v, args));
         });
 
+    // Connector.openDataInputStream(String) — open + get stream in one call.
+    vm.register_native("javax/microedition/io/Connector",
+        "openDataInputStream",
+        "(Ljava/lang/String;)Ljava/io/DataInputStream;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/DataInputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+    vm.register_native("javax/microedition/io/Connector",
+        "openOutputStream",
+        "(Ljava/lang/String;)Ljava/io/OutputStream;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/OutputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+    vm.register_native("javax/microedition/io/Connector",
+        "openInputStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/InputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+    vm.register_native("javax/microedition/io/Connector",
+        "openDataOutputStream",
+        "(Ljava/lang/String;)Ljava/io/DataOutputStream;",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            ClassDef* k = v.loader().find_or_stub("java/io/DataOutputStream");
+            f.push_ref(v.heap().alloc_object(k, 0));
+        });
+
+    // StreamConnectionNotifier.acceptAndOpen — server socket accept. We have
+    // no real network stack; return null which games typically treat as
+    // "no connection yet" and retry (or bail cleanly).
+    vm.register_stub("javax/microedition/io/StreamConnectionNotifier",
+        "acceptAndOpen", "()Ljavax/microedition/io/StreamConnection;",
+        "no real network backend; accept never completes",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+
     // ── Interface methods on Connection/InputConnection/OutputConnection ────
     // The MIDP IO type hierarchy:
     //   Connection (close)
@@ -2345,6 +2383,9 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         [](VM&, Frame& f, std::span<Slot>) { f.push_long(0); });
     vm.register_native("javax/microedition/io/HttpConnection",
         "getHeaderFieldKey", "(I)Ljava/lang/String;",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+    vm.register_native("javax/microedition/io/HttpConnection",
+        "getHeaderField", "(I)Ljava/lang/String;",
         [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
     vm.register_native("javax/microedition/io/HttpConnection",
         "getType", "()Ljava/lang/String;",
@@ -3215,6 +3256,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "javax/microedition/media/MediaException",
         "javax/microedition/m3g/M3GException",
         "javax/wireless/messaging/MessageConnection",
+        "javax/microedition/midlet/MIDletStateChangeException",
     }) {
         vm.register_noop(k, "printStackTrace", "()V",
             "exception subclass — inherits Throwable's silent printStackTrace",
@@ -3252,6 +3294,73 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/lcdui/Alert",
         "getDefaultTimeout", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(2000); });
+
+    // AlertType.playSound — we don't have system notification tones.
+    vm.register_native("javax/microedition/lcdui/AlertType",
+        "playSound", "(Ljavax/microedition/lcdui/Display;)Z",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
+
+    // ToneControl.setSequence — we don't have a tone synthesizer; swallow.
+    vm.register_stub("javax/microedition/media/control/ToneControl",
+        "setSequence", "([B)V",
+        "no tone synthesizer; sequence discarded",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // List.setFont(int elementNum, Font) — no font routing per element.
+    vm.register_stub("javax/microedition/lcdui/List",
+        "setFont", "(ILjavax/microedition/lcdui/Font;)V",
+        "List per-element fonts not tracked; no visual difference",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // Displayable.setTitle/getTitle on the base class — ~146 JARs bind here.
+    // Form overrides in lcdui_natives; this catches all other subclasses.
+    vm.register_native("javax/microedition/lcdui/Displayable",
+        "setTitle", "(Ljava/lang/String;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/lcdui/Displayable",
+        "getTitle", "()Ljava/lang/String;",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+
+    // GameCanvas.getKeyCode/getKeyName — these are actually on Canvas but the
+    // methodref is pinned to GameCanvas in ~300 JARs. Re-register for GameCanvas.
+    vm.register_native("javax/microedition/lcdui/game/GameCanvas",
+        "getKeyCode", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            int32_t a = args[1].as_int();
+            int32_t k = 0;
+            switch (a) {
+                case 1:  k = -1; break; case 2:  k = -3; break;
+                case 5:  k = -4; break; case 6:  k = -2; break;
+                case 8:  k = -5; break; case 9:  k = -10; break;
+                case 10: k = -11; break; case 11: k = -12; break;
+                case 12: k = -13; break;
+            }
+            f.push_int(k);
+        });
+    vm.register_native("javax/microedition/lcdui/game/GameCanvas",
+        "getKeyName", "(I)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            int32_t k = args[1].as_int();
+            const char* n = "";
+            switch (k) {
+                case -1: n = "Up"; break;
+                case -2: n = "Down"; break;
+                case -3: n = "Left"; break;
+                case -4: n = "Right"; break;
+                case -5: n = "Select"; break;
+                case -6: n = "Soft1"; break;
+                case -7: n = "Soft2"; break;
+                default:
+                    if (k >= '0' && k <= '9') {
+                        char buf[2] = { (char)k, 0 };
+                        f.push_ref(v.new_string(buf)); return;
+                    }
+                    if (k == '*') { f.push_ref(v.new_string("*")); return; }
+                    if (k == '#') { f.push_ref(v.new_string("#")); return; }
+                    break;
+            }
+            f.push_ref(v.new_string(n));
+        });
     // Canvas.getWidth/getHeight are registered in graphics_natives.cpp
     // (they need Display::instance() which lives there).
 
@@ -3428,6 +3537,27 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/rms/RecordStore",
         "getSizeAvailable", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(8 * 1024 * 1024); });
+
+    // 4-arg openRecordStore(name, create, authmode, writable) — delegate to
+    // 2-arg impl, ignoring authmode/writable which we don't enforce.
+    vm.register_native("javax/microedition/rms/RecordStore",
+        "openRecordStore",
+        "(Ljava/lang/String;ZIZ)Ljavax/microedition/rms/RecordStore;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            ClassDef* k = v.loader().find_or_stub("javax/microedition/rms/RecordStore");
+            MethodDef* m = k->find_method("openRecordStore",
+                "(Ljava/lang/String;Z)Ljavax/microedition/rms/RecordStore;");
+            if (!m) { f.push_ref(NULL_REF); return; }
+            auto r = v.invoke(m, k, std::vector<Slot>{args[0], args[1]});
+            f.push_ref(r.empty() ? NULL_REF : r[0].as_ref());
+        });
+
+    vm.register_native("javax/microedition/rms/RecordStore",
+        "getLastModified", "()J",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_long(0); });
+    vm.register_native("javax/microedition/rms/RecordStore",
+        "getVersion", "()I",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_int(1); });
 
     vm.register_native("javax/microedition/rms/RecordStore",
         "getSize", "()I",
