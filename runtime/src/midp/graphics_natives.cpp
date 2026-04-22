@@ -578,16 +578,25 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
 
 // ─── Registration ─────────────────────────────────────────────────────────────
 
-int g_screen_w = 240;
-int g_screen_h = 320;
+int  g_screen_w = 240;
+int  g_screen_h = 320;
+bool g_screen_explicit = false;  // set by main.cpp when user passes WxH
 
-void register_graphics_natives(VM& vm, const JarFile& jar) {
+// ─── Auto-detect screen resolution ───────────────────────────────────────────
+// J2ME has no standard manifest field for target screen size, but several
+// signals work in practice:
+//   1. boxal.inf key 21,W,H (BoxAL framework — Connect2Media titles)
+//   2. Vendor-specific manifest extensions (Nokia/Samsung/SE on some titles)
+//   3. PNG modal dimension — many games include a splash/background PNG
+//      whose dimensions match the target Canvas
+// We only override the default 240x320 if the signal is unambiguous.
+static void try_detect_screen_resolution(const JarFile& jar) {
+    if (g_screen_explicit) return;  // user told us; trust them
 
-    // Try to read screen resolution from boxal.inf key 21 (w,h)
+    // Signal 1: boxal.inf
     if (jar.has("boxal.inf")) {
         auto& data = jar.get("boxal.inf");
         std::string inf(data.begin(), data.end());
-        // Parse line by line looking for "21,W,H"
         size_t pos = 0;
         while (pos < inf.size()) {
             size_t eol = inf.find_first_of("\r\n", pos);
@@ -596,15 +605,101 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             if (line.substr(0, 3) == "21,") {
                 int w = 0, h = 0;
                 if (sscanf(line.c_str(), "21,%d,%d", &w, &h) == 2 && w > 0 && h > 0) {
-                    g_screen_w = w;
-                    g_screen_h = h;
+                    g_screen_w = w; g_screen_h = h;
                     fprintf(stderr, "[display] resolution from boxal.inf: %dx%d\n", w, h);
+                    return;
                 }
             }
             pos = eol;
             while (pos < inf.size() && (inf[pos] == '\r' || inf[pos] == '\n')) ++pos;
         }
     }
+
+    // Signal 2: vendor manifest extensions. None are standard, but several
+    // SDKs include them. Parse the manifest once and look up the keys.
+    if (jar.has("META-INF/MANIFEST.MF")) {
+        const auto& data = jar.get("META-INF/MANIFEST.MF");
+        std::string mf(data.begin(), data.end());
+        // Same WxH parser
+        auto try_parse_size = [](const std::string& v, int& w, int& h) -> bool {
+            return sscanf(v.c_str(), "%dx%d", &w, &h) == 2 && w > 0 && h > 0;
+        };
+        std::unordered_map<std::string, std::string> kv;
+        size_t pos = 0;
+        while (pos < mf.size()) {
+            size_t eol = mf.find_first_of("\r\n", pos);
+            if (eol == std::string::npos) eol = mf.size();
+            std::string line = mf.substr(pos, eol - pos);
+            size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string k = line.substr(0, colon);
+                std::string val = line.substr(colon + 1);
+                while (!val.empty() && (val[0] == ' ' || val[0] == '\t'))
+                    val.erase(0, 1);
+                kv[k] = val;
+            }
+            pos = eol;
+            while (pos < mf.size() && (mf[pos] == '\r' || mf[pos] == '\n')) ++pos;
+        }
+        for (const char* key : {
+            "Nokia-MIDlet-Original-Display-Size",
+            "Nokia-MIDlet-Target-Display-Size",
+            "MIDxlet-Display-Size",
+            "Display-Size",
+        }) {
+            auto it = kv.find(key);
+            int w = 0, h = 0;
+            if (it != kv.end() && try_parse_size(it->second, w, h)) {
+                g_screen_w = w; g_screen_h = h;
+                fprintf(stderr, "[display] resolution from manifest %s: %dx%d\n",
+                        key, w, h);
+                return;
+            }
+        }
+    }
+
+    // Signal 3: PNG modal dimension. Many games include their splash /
+    // background as a top-level PNG sized to the target screen. We pick the
+    // mode of all non-icon PNGs (>= 96 in both dims). Only override if at
+    // least 3 PNGs share the same dimension (high-confidence signal — tiny
+    // sprites won't dominate, and a single large image could be a wallpaper
+    // unrelated to screen size).
+    std::unordered_map<uint64_t, int> dim_counts;
+    int max_w = 0, max_h = 0;
+    for (auto& entry : jar.entries_with_suffix(".png")) {
+        const auto& data = jar.get(entry);
+        if (data.size() < 24) continue;
+        // PNG signature + IHDR length(4) + type "IHDR"(4) + width(4) + height(4)
+        if (std::memcmp(data.data(), "\x89PNG\r\n\x1a\n", 8) != 0) continue;
+        // Big-endian width at offset 16, height at 20
+        auto be32 = [](const uint8_t* p) {
+            return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                   ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+        };
+        int w = (int)be32((uint8_t*)data.data() + 16);
+        int h = (int)be32((uint8_t*)data.data() + 20);
+        if (w < 96 || h < 96) continue;  // skip icons / sprites
+        if (w > 1024 || h > 1024) continue; // skip oversize
+        dim_counts[((uint64_t)w << 32) | (uint32_t)h]++;
+        if ((int64_t)w * h > (int64_t)max_w * max_h) { max_w = w; max_h = h; }
+    }
+    int best_count = 0; uint64_t best_key = 0;
+    for (auto& [k, c] : dim_counts) if (c > best_count) { best_count = c; best_key = k; }
+    if (best_count >= 3) {
+        g_screen_w = (int)(best_key >> 32);
+        g_screen_h = (int)(best_key & 0xFFFFFFFFu);
+        fprintf(stderr, "[display] resolution from %d PNGs at common size: %dx%d\n",
+                best_count, g_screen_w, g_screen_h);
+        return;
+    }
+
+    fprintf(stderr, "[display] resolution: defaulting to %dx%d (no signal)\n",
+            g_screen_w, g_screen_h);
+}
+
+void register_graphics_natives(VM& vm, const JarFile& jar) {
+
+    try_detect_screen_resolution(jar);
 
     // ── Graphics ─────────────────────────────────────────────────────────────
 

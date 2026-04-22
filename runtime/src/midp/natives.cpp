@@ -2704,6 +2704,21 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/lcdui/Display",
         "isColor", "()Z",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(1); });
+
+    // Orientation hints — Nokia/Samsung extensions some games query to decide
+    // between portrait/landscape asset paths. Always report portrait (0) unless
+    // the screen is wider than tall (which our default 240x320 is not).
+    auto report_portrait = [](VM&, Frame& f, std::span<Slot>) {
+        extern int g_screen_w, g_screen_h;
+        // 0=portrait-up, 90=landscape-CW, 180=portrait-down, 270=landscape-CCW
+        f.push_int(g_screen_w > g_screen_h ? 90 : 0);
+    };
+    vm.register_native("javax/microedition/lcdui/Display",
+        "getOrientation", "()I", report_portrait);
+    vm.register_native("com/nokia/mid/ui/DeviceControl",
+        "getOrientation", "()I", report_portrait);
+    vm.register_native("com/nokia/mid/ui/orientation/Orientation",
+        "getOrientation", "()I", report_portrait);
     vm.register_native("javax/microedition/lcdui/Display",
         "vibrate", "(I)Z",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });

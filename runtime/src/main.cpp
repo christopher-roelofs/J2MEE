@@ -163,11 +163,13 @@ int main(int argc, char* argv[]) {
     }
 
     // Optional resolution override: "176x220"
+    extern bool g_screen_explicit;
     if (pos.size() >= 3) {
         int w = 0, h = 0;
         if (sscanf(pos[2], "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
             g_screen_w = w;
             g_screen_h = h;
+            g_screen_explicit = true;
         }
     }
 
