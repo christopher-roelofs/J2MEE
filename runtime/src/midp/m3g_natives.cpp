@@ -80,12 +80,15 @@ void register_m3g_natives(VM& vm) {
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "getInstance", "()Ljavax/microedition/m3g/Graphics3D;",
         [](VM& v, Frame& f, std::span<Slot>) {
+            // Defer m3gCreateInterface + GL context creation until something
+            // actually tries to render. Many games (e.g. Bejeweled 3) call
+            // getInstance() during boot just to probe whether 3D is present,
+            // then never use it; eagerly initing M3G triggers GLES extension
+            // queries that crash on systems without GLES1 set up.
             static ObjRef g3d = NULL_REF;
             if (g3d == NULL_REF) {
                 ClassDef* k = v.loader().find_or_stub("javax/microedition/m3g/Graphics3D");
                 g3d = v.heap().alloc_object(k, 0);
-                M3GRenderContext ctx = ensure_render_context();
-                if (ctx) store_handle(g3d, (uintptr_t)ctx);
             }
             f.push_ref(g3d);
         });
