@@ -2366,6 +2366,67 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             f.push_int(sd && sd->visible ? 1 : 0);
         });
 
+    // Layer methods on Sprite directly. Our existing Layer registrations are
+    // hierarchy-resolved at runtime, but the scanner (and some early-bound
+    // bytecode) looks up constant-pool methodrefs on the exact class name —
+    // so duplicate the registrations on Sprite specifically.
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "setPosition", "(II)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) { sd->x = args[1].as_int(); sd->y = args[2].as_int(); }
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "move", "(II)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) { sd->x += args[1].as_int(); sd->y += args[2].as_int(); }
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getX", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? sd->x : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getY", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd ? sd->y : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getWidth", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd && (sd->transform == 4 || sd->transform == 5 ||
+                       sd->transform == 6 || sd->transform == 7))
+                f.push_int(sd->frame_h);
+            else
+                f.push_int(sd ? sd->frame_w : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "getHeight", "()I",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd && (sd->transform == 4 || sd->transform == 5 ||
+                       sd->transform == 6 || sd->transform == 7))
+                f.push_int(sd->frame_w);
+            else
+                f.push_int(sd ? sd->frame_h : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "setVisible", "(Z)V",
+        [sprite_for](VM&, Frame&, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            if (sd) sd->visible = args[1].as_int() != 0;
+        });
+    vm.register_native("javax/microedition/lcdui/game/Sprite",
+        "isVisible", "()Z",
+        [sprite_for](VM&, Frame& f, std::span<Slot> args) {
+            SpriteData* sd = sprite_for(args[0].as_ref());
+            f.push_int(sd && sd->visible ? 1 : 0);
+        });
+
     // The actual draw — locate the current frame in the strip, route through
     // blit_image (which already handles all 8 MIDP transforms + clipping).
     vm.register_native("javax/microedition/lcdui/game/Sprite",
@@ -2384,5 +2445,267 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             auto t = gfx_tx(gfx);
             blit_image(dst, sd->img, sd->x + t.x, sd->y + t.y,
                        sx, sy, sd->frame_w, sd->frame_h, sd->transform);
+        });
+
+    // ── javax.microedition.lcdui.game.TiledLayer ──────────────────────────────
+    // Tile-map renderer — the other half of the game-API 2D stack alongside
+    // Sprite. A TiledLayer is a (cols × rows) grid where each cell holds an
+    // index into a tile strip cut from a source Image. Heavily used by
+    // platformers, RPG overworlds, and isometric tile puzzles.
+    //
+    // Cell values:
+    //   0       — empty cell, draw nothing
+    //   1..N    — static tile (1-based index into the strip)
+    //   <0      — animated-tile id; lookup current static tile via setAnimatedTile
+    struct TiledData {
+        SDL_Surface* img = nullptr;       // not owned; into g_images
+        int tile_w = 0, tile_h = 0;
+        int strip_cols = 1;               // tiles per row in source image
+        int static_tile_count = 0;        // count of base (1..N) tiles
+        int cols = 0, rows = 0;           // map dimensions
+        int x = 0, y = 0;
+        bool visible = true;
+        std::vector<int> cells;           // row-major; size = cols*rows
+        std::vector<int> animated;        // animated[id-1] -> static tile index
+    };
+    static std::unordered_map<ObjRef, TiledData> g_tiled;
+    auto tiled_for = [](ObjRef ref) -> TiledData* {
+        auto it = g_tiled.find(ref);
+        return it == g_tiled.end() ? nullptr : &it->second;
+    };
+
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "<init>", "(IILjavax/microedition/lcdui/Image;II)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            int cols = args[1].as_int();
+            int rows = args[2].as_int();
+            SDL_Surface* img = nullptr;
+            auto it = g_images.find(args[3].as_ref());
+            if (it != g_images.end()) img = it->second;
+            int tw = args[4].as_int(), th = args[5].as_int();
+            TiledData& td = g_tiled[self];
+            td.img = img;
+            td.tile_w = tw;
+            td.tile_h = th;
+            td.strip_cols = (img && tw > 0) ? (img->w / tw) : 1;
+            int strip_rows = (img && th > 0) ? (img->h / th) : 1;
+            td.static_tile_count = td.strip_cols * strip_rows;
+            td.cols = cols;
+            td.rows = rows;
+            td.cells.assign((size_t)cols * (size_t)rows, 0);
+        });
+
+    // setCell / getCell — indices: col 0..cols-1, row 0..rows-1.
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "setCell", "(III)V",
+        [tiled_for](VM&, Frame&, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (!td) return;
+            int c = args[1].as_int(), r = args[2].as_int(), v = args[3].as_int();
+            if (c < 0 || r < 0 || c >= td->cols || r >= td->rows) return;
+            td->cells[(size_t)r * td->cols + c] = v;
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getCell", "(II)I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            int c = args[1].as_int(), r = args[2].as_int();
+            if (!td || c < 0 || r < 0 || c >= td->cols || r >= td->rows) {
+                f.push_int(0); return;
+            }
+            f.push_int(td->cells[(size_t)r * td->cols + c]);
+        });
+
+    // fillCells(col, row, numCols, numRows, tileIndex)
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "fillCells", "(IIIII)V",
+        [tiled_for](VM&, Frame&, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (!td) return;
+            int c0 = args[1].as_int(), r0 = args[2].as_int();
+            int nc = args[3].as_int(), nr = args[4].as_int();
+            int v  = args[5].as_int();
+            for (int r = r0; r < r0 + nr && r < td->rows; ++r) {
+                if (r < 0) continue;
+                for (int c = c0; c < c0 + nc && c < td->cols; ++c) {
+                    if (c < 0) continue;
+                    td->cells[(size_t)r * td->cols + c] = v;
+                }
+            }
+        });
+
+    // Animated tiles: createAnimatedTile(staticTile) returns negative id;
+    // setAnimatedTile(id, staticTile) updates which static tile the id maps to.
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "createAnimatedTile", "(I)I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (!td) { f.push_int(0); return; }
+            td->animated.push_back(args[1].as_int());
+            f.push_int(-(int)td->animated.size());  // -1, -2, -3, ...
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "setAnimatedTile", "(II)V",
+        [tiled_for](VM&, Frame&, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (!td) return;
+            int id = args[1].as_int();
+            int v  = args[2].as_int();
+            int idx = -id - 1;
+            if (idx >= 0 && idx < (int)td->animated.size())
+                td->animated[idx] = v;
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getAnimatedTile", "(I)I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            int id = args[1].as_int();
+            int idx = -id - 1;
+            if (!td || idx < 0 || idx >= (int)td->animated.size()) {
+                f.push_int(0); return;
+            }
+            f.push_int(td->animated[idx]);
+        });
+
+    // Dimensions and counts
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getColumns", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->cols : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getRows", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->rows : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getCellWidth", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->tile_w : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getCellHeight", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->tile_h : 0);
+        });
+
+    // Layer base: setPosition / move / getX / getY / getWidth / getHeight /
+    // setVisible / isVisible — keyed off the TiledData via its own Layer
+    // accessors. We registered these on Layer earlier for Sprite; they need
+    // to also work for TiledLayer since Sprite/TiledLayer share Layer methods
+    // through inheritance. The existing Layer registrations look up g_sprites,
+    // which won't find a TiledLayer ObjRef. Re-register with a multi-map
+    // lookup.
+    auto layer_x = [tiled_for](ObjRef ref, int* out_x, int* out_y,
+                               int* out_w, int* out_h, bool* visible) {
+        TiledData* td = tiled_for(ref);
+        if (td) {
+            if (out_x) *out_x = td->x;
+            if (out_y) *out_y = td->y;
+            if (out_w) *out_w = td->cols * td->tile_w;
+            if (out_h) *out_h = td->rows * td->tile_h;
+            if (visible) *visible = td->visible;
+            return true;
+        }
+        return false;
+    };
+    auto layer_set_pos = [tiled_for](ObjRef ref, int x, int y) {
+        TiledData* td = tiled_for(ref);
+        if (td) { td->x = x; td->y = y; }
+    };
+    auto layer_set_visible = [tiled_for](ObjRef ref, bool v) {
+        TiledData* td = tiled_for(ref);
+        if (td) td->visible = v;
+    };
+
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "paint", "(Ljavax/microedition/lcdui/Graphics;)V",
+        [tiled_for](VM&, Frame&, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (!td || !td->visible || !td->img) return;
+            ObjRef gfx = args[1].as_ref();
+            SDL_Surface* dst = gfx_surface(gfx);
+            if (!dst) return;
+            auto t = gfx_tx(gfx);
+            for (int r = 0; r < td->rows; ++r) {
+                for (int c = 0; c < td->cols; ++c) {
+                    int v = td->cells[(size_t)r * td->cols + c];
+                    if (v == 0) continue;
+                    if (v < 0) {
+                        int idx = -v - 1;
+                        if (idx < 0 || idx >= (int)td->animated.size()) continue;
+                        v = td->animated[idx];
+                        if (v <= 0) continue;
+                    }
+                    if (v > td->static_tile_count) continue;
+                    int tile = v - 1;  // strip is 0-based
+                    int sx = (tile % td->strip_cols) * td->tile_w;
+                    int sy = (tile / td->strip_cols) * td->tile_h;
+                    blit_image(dst, td->img,
+                               td->x + c * td->tile_w + t.x,
+                               td->y + r * td->tile_h + t.y,
+                               sx, sy, td->tile_w, td->tile_h, 0);
+                }
+            }
+        });
+
+    (void)layer_x; (void)layer_set_pos; (void)layer_set_visible;
+
+    // The Layer-base method registrations earlier (setPosition, getX, …) only
+    // look up g_sprites; they would no-op for TiledLayer. Re-register the
+    // same six methods directly on TiledLayer so virtual dispatch finds the
+    // TiledData-aware versions first.
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "setPosition", "(II)V",
+        [tiled_for](VM&, Frame&, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (td) { td->x = args[1].as_int(); td->y = args[2].as_int(); }
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "move", "(II)V",
+        [tiled_for](VM&, Frame&, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (td) { td->x += args[1].as_int(); td->y += args[2].as_int(); }
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getX", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->x : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getY", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->y : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getWidth", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->cols * td->tile_w : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "getHeight", "()I",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td ? td->rows * td->tile_h : 0);
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "setVisible", "(Z)V",
+        [tiled_for](VM&, Frame&, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            if (td) td->visible = args[1].as_int() != 0;
+        });
+    vm.register_native("javax/microedition/lcdui/game/TiledLayer",
+        "isVisible", "()Z",
+        [tiled_for](VM&, Frame& f, std::span<Slot> args) {
+            TiledData* td = tiled_for(args[0].as_ref());
+            f.push_int(td && td->visible ? 1 : 0);
         });
 }

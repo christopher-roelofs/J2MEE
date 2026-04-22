@@ -3040,6 +3040,85 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "base-class hook; Java subclasses override",
         [](VM&, Frame&, std::span<Slot>) {});
 
+    // Input callbacks — Canvas defines these as protected hooks. Subclasses
+    // override them; many games' overrides call super.keyPressed(k) which
+    // resolves to this base-class no-op. Without it, super-call hits the
+    // auto-stub fallback (still works but spams logs and bumps scan count).
+    vm.register_noop("javax/microedition/lcdui/Canvas",
+        "keyPressed", "(I)V",
+        "base-class no-op; subclasses override",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("javax/microedition/lcdui/Canvas",
+        "keyReleased", "(I)V",
+        "base-class no-op; subclasses override",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("javax/microedition/lcdui/Canvas",
+        "keyRepeated", "(I)V",
+        "base-class no-op; subclasses override",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("javax/microedition/lcdui/Canvas",
+        "pointerPressed", "(II)V",
+        "base-class no-op; subclasses override",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("javax/microedition/lcdui/Canvas",
+        "pointerReleased", "(II)V",
+        "base-class no-op; subclasses override",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_noop("javax/microedition/lcdui/Canvas",
+        "pointerDragged", "(II)V",
+        "base-class no-op; subclasses override",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // Canvas.getKeyName: Same mapping as KeyConverter.getKeyName but called
+    // directly off Canvas in many games.
+    vm.register_native("javax/microedition/lcdui/Canvas",
+        "getKeyName", "(I)Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            int32_t k = args[1].as_int();
+            const char* n = "";
+            switch (k) {
+                case -1: n = "Up"; break;
+                case -2: n = "Down"; break;
+                case -3: n = "Left"; break;
+                case -4: n = "Right"; break;
+                case -5: n = "Select"; break;
+                case -6: n = "Soft1"; break;
+                case -7: n = "Soft2"; break;
+                default:
+                    if (k >= '0' && k <= '9') {
+                        char buf[2] = { (char)k, 0 };
+                        f.push_ref(v.new_string(buf)); return;
+                    }
+                    if (k == '*') { f.push_ref(v.new_string("*")); return; }
+                    if (k == '#') { f.push_ref(v.new_string("#")); return; }
+                    break;
+            }
+            f.push_ref(v.new_string(n));
+        });
+
+    // RecordStoreException + sibling exception classes inherit Throwable's
+    // printStackTrace, but the methodref is on the subclass so the scan (and
+    // some early-bound bytecode) doesn't see Throwable's registration. Stub
+    // explicitly on the common RMS exception types.
+    for (const char* k : {
+        "javax/microedition/rms/RecordStoreException",
+        "javax/microedition/rms/RecordStoreNotOpenException",
+        "javax/microedition/rms/RecordStoreFullException",
+        "javax/microedition/rms/RecordStoreNotFoundException",
+        "javax/microedition/rms/InvalidRecordIDException",
+        "javax/microedition/io/ConnectionNotFoundException",
+    }) {
+        vm.register_noop(k, "printStackTrace", "()V",
+            "exception subclass — inherits Throwable's silent printStackTrace",
+            [](VM&, Frame&, std::span<Slot>) {});
+        vm.register_noop(k, "<init>", "()V",
+            "exception subclass — no message field",
+            [](VM&, Frame&, std::span<Slot>) {});
+        vm.register_noop(k, "<init>", "(Ljava/lang/String;)V",
+            "exception subclass — message arg discarded",
+            [](VM&, Frame&, std::span<Slot>) {});
+    }
+
     // Alert — stub dialogs as no-ops (games use these for info/error popups)
     vm.register_stub("javax/microedition/lcdui/Alert",
         "<init>", "(Ljava/lang/String;)V",
