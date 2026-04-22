@@ -22,15 +22,50 @@ _REG = re.compile(
     r'register_(?:native|noop|stub)\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"',
     re.DOTALL)
 
+# Loop pattern:  for (const char* IDENT : { "STR1", "STR2", ... }) { BODY }
+# When the loop variable is later passed as the first arg to register_native(),
+# expand to one row per class string. Pretty common in this codebase for
+# registering the same method on multiple class names (List + ChoiceGroup,
+# TextField + TextBox, exception subclasses, etc.).
+_LOOP = re.compile(
+    r'for\s*\(\s*(?:const\s+)?char\s*\*\s*(\w+)\s*:\s*\{([^}]+)\}\s*\)\s*\{',
+    re.DOTALL)
+_REG_VAR = lambda var: re.compile(
+    r'register_(?:native|noop|stub)\(\s*' + re.escape(var) +
+    r'\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"',
+    re.DOTALL)
+
+def _matching_brace(text, open_pos):
+    depth = 1; i = open_pos + 1
+    while i < len(text) and depth:
+        c = text[i]
+        if c == '{': depth += 1
+        elif c == '}': depth -= 1
+        i += 1
+    return i  # index just past the matching close
+
 def load_registered():
     out = set()
+    str_lit = re.compile(r'"([^"]+)"')
     for root, _, files in os.walk(SRC_ROOT):
         for f in files:
             if not f.endswith(('.cpp', '.hpp', '.h')):
                 continue
             text = open(os.path.join(root, f)).read()
+            # Direct literal-arg registrations
             for cls, name, desc in _REG.findall(text):
                 out.add(f"{cls}.{name}{desc}")
+            # Loop-variable-arg registrations
+            for m in _LOOP.finditer(text):
+                var = m.group(1)
+                classes = str_lit.findall(m.group(2))
+                if not classes: continue
+                body_start = m.end() - 1  # the `{`
+                body_end = _matching_brace(text, body_start)
+                body = text[body_start:body_end]
+                for name, desc in _REG_VAR(var).findall(body):
+                    for cls in classes:
+                        out.add(f"{cls}.{name}{desc}")
     return out
 
 # Minimal class-file parser: walks the constant pool and emits every
