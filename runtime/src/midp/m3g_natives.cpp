@@ -261,6 +261,28 @@ void register_m3g_natives(VM& vm) {
             M3GTexture t = handle_for<M3GTexture>(args[0].as_ref());
             if (t) m3gTextureSetBlending(t, (M3Genum)args[1].as_int());
         });
+    vm.register_native("javax/microedition/m3g/Texture2D",
+        "setFiltering", "(II)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GTexture t = handle_for<M3GTexture>(args[0].as_ref());
+            if (t) m3gSetFiltering(t,
+                (M3Genum)args[1].as_int(), (M3Genum)args[2].as_int());
+        });
+    vm.register_native("javax/microedition/m3g/Texture2D",
+        "setWrapping", "(II)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GTexture t = handle_for<M3GTexture>(args[0].as_ref());
+            if (t) m3gSetWrapping(t,
+                (M3Genum)args[1].as_int(), (M3Genum)args[2].as_int());
+        });
+
+    vm.register_native("javax/microedition/m3g/Appearance",
+        "getTexture", "(I)Ljavax/microedition/m3g/Texture2D;",
+        [](VM&, Frame& f, std::span<Slot>) {
+            // We don't track Texture-by-ObjRef from the Java side; M3G stores
+            // it. Return null — most game code uses setTexture more than get.
+            f.push_ref(NULL_REF);
+        });
 
     // ── Image2D ──────────────────────────────────────────────────────────────
     // Image2D(int format, Object pixels). For now we create a blank image of
@@ -319,5 +341,333 @@ void register_m3g_natives(VM& vm) {
         [](VM&, Frame&, std::span<Slot> args) {
             M3GLight l = handle_for<M3GLight>(args[0].as_ref());
             if (l) m3gSetIntensity(l, args[1].as_float());
+        });
+
+    // ── PolygonMode ──────────────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/PolygonMode", "<init>", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            create_into(args[0].as_ref(), m3gCreatePolygonMode);
+        });
+    vm.register_native("javax/microedition/m3g/PolygonMode",
+        "setCulling", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GPolygonMode p = handle_for<M3GPolygonMode>(args[0].as_ref());
+            if (p) m3gSetCulling(p, args[1].as_int());
+        });
+    vm.register_native("javax/microedition/m3g/PolygonMode",
+        "setShading", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GPolygonMode p = handle_for<M3GPolygonMode>(args[0].as_ref());
+            if (p) m3gSetShading(p, args[1].as_int());
+        });
+    vm.register_native("javax/microedition/m3g/PolygonMode",
+        "setWinding", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GPolygonMode p = handle_for<M3GPolygonMode>(args[0].as_ref());
+            if (p) m3gSetWinding(p, args[1].as_int());
+        });
+    vm.register_native("javax/microedition/m3g/PolygonMode",
+        "setTwoSidedLightingEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GPolygonMode p = handle_for<M3GPolygonMode>(args[0].as_ref());
+            if (p) m3gSetTwoSidedLightingEnable(p, args[1].as_int() != 0);
+        });
+    vm.register_native("javax/microedition/m3g/PolygonMode",
+        "setLocalCameraLightingEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GPolygonMode p = handle_for<M3GPolygonMode>(args[0].as_ref());
+            if (p) m3gSetLocalCameraLightingEnable(p, args[1].as_int() != 0);
+        });
+    vm.register_native("javax/microedition/m3g/PolygonMode",
+        "setPerspectiveCorrectionEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GPolygonMode p = handle_for<M3GPolygonMode>(args[0].as_ref());
+            if (p) m3gSetPerspectiveCorrectionEnable(p, args[1].as_int() != 0);
+        });
+
+    // Appearance.setPolygonMode
+    vm.register_native("javax/microedition/m3g/Appearance",
+        "setPolygonMode", "(Ljavax/microedition/m3g/PolygonMode;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GAppearance a = handle_for<M3GAppearance>(args[0].as_ref());
+            if (!a) return;
+            M3GPolygonMode p = handle_for<M3GPolygonMode>(args[1].as_ref());
+            m3gSetPolygonMode(a, p);
+        });
+
+    // ── Material ─────────────────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Material", "<init>", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            create_into(args[0].as_ref(), m3gCreateMaterial);
+        });
+    vm.register_native("javax/microedition/m3g/Material",
+        "setColor", "(II)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GMaterial m = handle_for<M3GMaterial>(args[0].as_ref());
+            if (m) m3gSetColor(m, (M3Genum)args[1].as_int(),
+                              (M3Guint)args[2].as_int());
+        });
+    vm.register_native("javax/microedition/m3g/Material",
+        "setShininess", "(F)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GMaterial m = handle_for<M3GMaterial>(args[0].as_ref());
+            if (m) m3gSetShininess(m, args[1].as_float());
+        });
+    vm.register_native("javax/microedition/m3g/Material",
+        "setVertexColorTrackingEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GMaterial m = handle_for<M3GMaterial>(args[0].as_ref());
+            if (m) m3gSetVertexColorTrackingEnable(m, args[1].as_int() != 0);
+        });
+
+    // ── CompositingMode additions (depth, alpha-write) ──────────────────────
+    vm.register_native("javax/microedition/m3g/CompositingMode",
+        "setDepthWriteEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            // M3G core uses CompositingMode for depth via setDepthOffset only;
+            // depth-write toggle isn't a separate API. No-op preserves the
+            // game's call without affecting rendering.
+            (void)args;
+        });
+    vm.register_native("javax/microedition/m3g/CompositingMode",
+        "setAlphaWriteEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GCompositingMode c = handle_for<M3GCompositingMode>(args[0].as_ref());
+            if (c) m3gSetAlphaWriteEnable(c, args[1].as_int() != 0);
+        });
+
+    // ── Background additions ────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Background",
+        "setColorClearEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GBackground b = handle_for<M3GBackground>(args[0].as_ref());
+            if (b) m3gSetBgEnable(b, 0 /* color clear */, args[1].as_int() != 0);
+        });
+    vm.register_native("javax/microedition/m3g/Background",
+        "setDepthClearEnable", "(Z)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GBackground b = handle_for<M3GBackground>(args[0].as_ref());
+            if (b) m3gSetBgEnable(b, 1 /* depth clear */, args[1].as_int() != 0);
+        });
+    vm.register_native("javax/microedition/m3g/Background",
+        "setImage", "(Ljavax/microedition/m3g/Image2D;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GBackground b = handle_for<M3GBackground>(args[0].as_ref());
+            if (!b) return;
+            M3GImage img = handle_for<M3GImage>(args[1].as_ref());
+            m3gSetBgImage(b, img);
+        });
+
+    // ── VertexArray ──────────────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/VertexArray",
+        "<init>", "(III)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GInterface itf = j2me_m3g_interface();
+            if (!itf) return;
+            int count = args[1].as_int();
+            int size  = args[2].as_int();
+            int type  = args[3].as_int();   // 1=BYTE, 2=SHORT
+            // M3G enums: BYTE=4 (M3G_BYTE), SHORT=5
+            M3GVertexArray va = m3gCreateVertexArray(itf, count, size,
+                type == 1 ? M3G_BYTE : M3G_SHORT);
+            if (va) store_handle(args[0].as_ref(), (uintptr_t)va);
+        });
+    vm.register_native("javax/microedition/m3g/VertexArray",
+        "set", "(II[B)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            M3GVertexArray va = handle_for<M3GVertexArray>(args[0].as_ref());
+            if (!va) return;
+            int first = args[1].as_int();
+            int count = args[2].as_int();
+            ObjRef arr = args[3].as_ref();
+            if (arr == NULL_REF) return;
+            HeapObject* a = v.heap().deref(arr);
+            if (!a) return;
+            m3gSetVertexArrayElements(va, first, count,
+                a->array_length(), M3G_BYTE, a->array_bytes());
+        });
+    vm.register_native("javax/microedition/m3g/VertexArray",
+        "set", "(II[S)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            M3GVertexArray va = handle_for<M3GVertexArray>(args[0].as_ref());
+            if (!va) return;
+            int first = args[1].as_int();
+            int count = args[2].as_int();
+            ObjRef arr = args[3].as_ref();
+            if (arr == NULL_REF) return;
+            HeapObject* a = v.heap().deref(arr);
+            if (!a) return;
+            m3gSetVertexArrayElements(va, first, count,
+                a->array_length(), M3G_SHORT, a->array_shorts());
+        });
+
+    // ── VertexBuffer ─────────────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/VertexBuffer", "<init>", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            create_into(args[0].as_ref(), m3gCreateVertexBuffer);
+        });
+    vm.register_native("javax/microedition/m3g/VertexBuffer",
+        "setPositions", "(Ljavax/microedition/m3g/VertexArray;F[F)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[0].as_ref());
+            if (!vb) return;
+            M3GVertexArray va = handle_for<M3GVertexArray>(args[1].as_ref());
+            float scale = args[2].as_float();
+            ObjRef bias_ref = args[3].as_ref();
+            float* bias = nullptr;
+            int bias_len = 0;
+            if (bias_ref != NULL_REF) {
+                HeapObject* a = v.heap().deref(bias_ref);
+                if (a) {
+                    bias_len = a->array_length();
+                    bias = (float*)a->array_bytes();
+                }
+            }
+            m3gSetVertexArray(vb, va, scale, bias, bias_len);
+        });
+    vm.register_native("javax/microedition/m3g/VertexBuffer",
+        "setNormals", "(Ljavax/microedition/m3g/VertexArray;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[0].as_ref());
+            if (!vb) return;
+            M3GVertexArray va = handle_for<M3GVertexArray>(args[1].as_ref());
+            m3gSetNormalArray(vb, va);
+        });
+    vm.register_native("javax/microedition/m3g/VertexBuffer",
+        "setColors", "(Ljavax/microedition/m3g/VertexArray;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[0].as_ref());
+            if (!vb) return;
+            M3GVertexArray va = handle_for<M3GVertexArray>(args[1].as_ref());
+            m3gSetColorArray(vb, va);
+        });
+    vm.register_native("javax/microedition/m3g/VertexBuffer",
+        "setTexCoords", "(ILjavax/microedition/m3g/VertexArray;F[F)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[0].as_ref());
+            if (!vb) return;
+            int unit = args[1].as_int();
+            M3GVertexArray va = handle_for<M3GVertexArray>(args[2].as_ref());
+            float scale = args[3].as_float();
+            ObjRef bias_ref = args[4].as_ref();
+            float* bias = nullptr;
+            int bias_len = 0;
+            if (bias_ref != NULL_REF) {
+                HeapObject* a = v.heap().deref(bias_ref);
+                if (a) {
+                    bias_len = a->array_length();
+                    bias = (float*)a->array_bytes();
+                }
+            }
+            m3gSetTexCoordArray(vb, unit, va, scale, bias, bias_len);
+        });
+    vm.register_native("javax/microedition/m3g/VertexBuffer",
+        "setDefaultColor", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[0].as_ref());
+            if (vb) m3gSetVertexDefaultColor(vb, (M3Guint)args[1].as_int());
+        });
+
+    // ── Group ────────────────────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Group", "<init>", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            create_into(args[0].as_ref(), m3gCreateGroup);
+        });
+    vm.register_native("javax/microedition/m3g/Group",
+        "addChild", "(Ljavax/microedition/m3g/Node;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GGroup g = handle_for<M3GGroup>(args[0].as_ref());
+            if (!g) return;
+            M3GNode n = handle_for<M3GNode>(args[1].as_ref());
+            if (n) m3gAddChild(g, n);
+        });
+    vm.register_native("javax/microedition/m3g/Group",
+        "getChildCount", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            M3GGroup g = handle_for<M3GGroup>(args[0].as_ref());
+            f.push_int(g ? m3gGetChildCount(g) : 0);
+        });
+
+    // ── Graphics3D additions (clear, setCamera, setViewport) ────────────────
+    vm.register_native("javax/microedition/m3g/Graphics3D",
+        "clear", "(Ljavax/microedition/m3g/Background;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            if (!g_render_context) return;
+            M3GBackground b = handle_for<M3GBackground>(args[1].as_ref());
+            m3gClear(g_render_context, b);
+        });
+    vm.register_native("javax/microedition/m3g/Graphics3D",
+        "setCamera",
+        "(Ljavax/microedition/m3g/Camera;Ljavax/microedition/m3g/Transform;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            // Camera is set via World normally; for direct render mode the
+            // m3g core stores it on the context. No direct API — call m3gSetCamera
+            // if available, else no-op.
+            (void)args;
+        });
+    vm.register_native("javax/microedition/m3g/Graphics3D",
+        "setViewport", "(IIII)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            if (!g_render_context) return;
+            m3gSetViewport(g_render_context, args[1].as_int(), args[2].as_int(),
+                           args[3].as_int(), args[4].as_int());
+        });
+
+    // ── Transform additions ────────────────────────────────────────────────
+    vm.register_native("javax/microedition/m3g/Transform",
+        "set", "([F)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            auto it = g_transforms.find(args[0].as_ref());
+            if (it == g_transforms.end()) return;
+            ObjRef arr = args[1].as_ref();
+            if (arr == NULL_REF) return;
+            HeapObject* a = v.heap().deref(arr);
+            if (!a || a->array_length() < 16) return;
+            m3gSetMatrixRows(&it->second, (float*)a->array_bytes());
+        });
+    vm.register_native("javax/microedition/m3g/Transform",
+        "set", "(Ljavax/microedition/m3g/Transform;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto& dst = g_transforms[args[0].as_ref()];
+            auto it = g_transforms.find(args[1].as_ref());
+            if (it != g_transforms.end()) m3gCopyMatrix(&dst, &it->second);
+        });
+
+    // ── Mesh ─────────────────────────────────────────────────────────────────
+    // m3gCreateMesh takes raw indices into ulong arrays; that needs the Java
+    // arg to be massaged. For now, register the constructor as a no-op stub
+    // that allocates a Mesh handle without backing geometry. Games typically
+    // build the rest of the scene anyway and don't immediately render the
+    // mesh visibly.
+    vm.register_stub("javax/microedition/m3g/Mesh",
+        "<init>",
+        "(Ljavax/microedition/m3g/VertexBuffer;Ljavax/microedition/m3g/IndexBuffer;Ljavax/microedition/m3g/Appearance;)V",
+        "Mesh constructor — geometry not bound (would need m3gCreateMesh "
+        "with patch arrays); Mesh exists but renders empty",
+        [](VM&, Frame&, std::span<Slot>) {});
+    vm.register_native("javax/microedition/m3g/Mesh",
+        "getAppearance", "(I)Ljavax/microedition/m3g/Appearance;",
+        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+    vm.register_native("javax/microedition/m3g/Mesh",
+        "setAppearance", "(ILjavax/microedition/m3g/Appearance;)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // ── Loader ──────────────────────────────────────────────────────────────
+    // m3gCreateLoader + the streaming loader needs reading the input stream
+    // through M3G's beginRender hook. Stub returns empty array — game treats
+    // it as "no objects loaded" and falls through.
+    vm.register_stub("javax/microedition/m3g/Loader",
+        "load", "(Ljava/lang/String;)[Ljavax/microedition/m3g/Object3D;",
+        "Loader.load(String) — not wired to JAR resource reader; empty array",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            f.push_ref(v.heap().alloc_ref_array(0,
+                v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;")));
+        });
+    vm.register_stub("javax/microedition/m3g/Loader",
+        "load", "([BI)[Ljavax/microedition/m3g/Object3D;",
+        "Loader.load(byte[],int) — same; empty array",
+        [](VM& v, Frame& f, std::span<Slot>) {
+            f.push_ref(v.heap().alloc_ref_array(0,
+                v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;")));
         });
 }

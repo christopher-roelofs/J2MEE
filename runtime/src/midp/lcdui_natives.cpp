@@ -658,16 +658,17 @@ void register_lcdui_natives(VM& vm) {
             g_forms[args[0].as_ref()].item_state_listener = args[1].as_ref();
         });
 
-    // Form inherits Displayable.addCommand / setCommandListener at runtime,
-    // but the methodref is on Form for ~1100 JARs each — re-register so the
-    // scan and early-bound bytecode see them on the exact class.
-    extern std::unordered_map<ObjRef, std::vector<ObjRef>>& form_displayable_commands();  // noop forward
-    auto reg_displayable_command_methods = [&vm](const char* klass) {
-        // These mirror the Displayable.* registrations in graphics_natives.cpp;
-        // pulling g_commands directly here would create a cross-TU dependency,
-        // so we rely on the runtime hierarchy walk + register here as no-ops
-        // that get called only if the scanner needs satisfaction. Real
-        // dispatch will hit Displayable's handler via resolve_virtual.
+    // Form/Alert/TextBox/List inherit Displayable.addCommand /
+    // setCommandListener at runtime, but the methodref is on the subclass for
+    // ~1100 JARs each — duplicate so the scanner and early-bound bytecode see
+    // them on the exact class. Use a for-loop pattern (the scanner detects
+    // these and expands to one row per class).
+    for (const char* klass : {
+        "javax/microedition/lcdui/Form",
+        "javax/microedition/lcdui/Alert",
+        "javax/microedition/lcdui/TextBox",
+        "javax/microedition/lcdui/List",
+    }) {
         vm.register_native(klass,
             "setCommandListener", "(Ljavax/microedition/lcdui/CommandListener;)V",
             [](VM&, Frame&, std::span<Slot> args) {
@@ -675,11 +676,11 @@ void register_lcdui_natives(VM& vm) {
             });
         vm.register_noop(klass,
             "addCommand", "(Ljavax/microedition/lcdui/Command;)V",
-            "Form/Alert/TextBox addCommand — Displayable hierarchy walk handles it",
+            "subclass mirror of Displayable.addCommand",
             [](VM&, Frame&, std::span<Slot>) {});
         vm.register_noop(klass,
             "removeCommand", "(Ljavax/microedition/lcdui/Command;)V",
-            "Form/Alert/TextBox removeCommand — Displayable hierarchy walk",
+            "subclass mirror of Displayable.removeCommand",
             [](VM&, Frame&, std::span<Slot>) {});
         vm.register_native(klass,
             "setTitle", "(Ljava/lang/String;)V",
@@ -687,11 +688,7 @@ void register_lcdui_natives(VM& vm) {
         vm.register_native(klass,
             "getTitle", "()Ljava/lang/String;",
             [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
-    };
-    reg_displayable_command_methods("javax/microedition/lcdui/Form");
-    reg_displayable_command_methods("javax/microedition/lcdui/Alert");
-    reg_displayable_command_methods("javax/microedition/lcdui/TextBox");
-    reg_displayable_command_methods("javax/microedition/lcdui/List");
+    }
 
     // Fix Form.setTitle / getTitle to actually use FormState.title
     vm.register_native("javax/microedition/lcdui/Form",
