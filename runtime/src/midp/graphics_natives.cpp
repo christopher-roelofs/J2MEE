@@ -51,11 +51,21 @@ static bool g_ttf_inited = false;
 static std::unordered_map<int, TTF_Font*> g_ttf_cache;
 static std::unordered_map<int, TTF_Font*> g_ttf_bold_cache;
 
+#ifdef __EMSCRIPTEN__
+// Paths resolve inside the MEMFS bundle populated by the --preload-file
+// options in runtime/CMakeLists.txt. CJK is omitted in the POC build.
+static constexpr const char* FONT_PATH       = "/fonts/DejaVuSans.ttf";
+static constexpr const char* FONT_BOLD_PATH   = "/fonts/DejaVuSans-Bold.ttf";
+static constexpr const char* FONT_MONO_PATH   = "/fonts/DejaVuSansMono.ttf";
+static constexpr const char* FONT_MONO_BOLD_PATH = "/fonts/DejaVuSansMono-Bold.ttf";
+static constexpr const char* FONT_CJK_PATH   = "/fonts/DejaVuSans.ttf";
+#else
 static constexpr const char* FONT_PATH       = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
 static constexpr const char* FONT_BOLD_PATH   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
 static constexpr const char* FONT_MONO_PATH   = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
 static constexpr const char* FONT_MONO_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf";
 static constexpr const char* FONT_CJK_PATH   = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+#endif
 
 // CJK font cache (uses TCC index 0 for JP which covers most common CJK)
 static std::unordered_map<int, TTF_Font*> g_ttf_cjk_cache;
@@ -114,6 +124,47 @@ TTF_Font* get_ttf_font(int px_size, bool bold, bool mono) {
     TTF_Font* f = TTF_OpenFont(path, px_size);
     if (!f) f = TTF_OpenFont(FONT_PATH, px_size);  // fallback
     cache[key] = f;
+    return f;
+}
+
+// Font Awesome Free Solid — vendored in runtime/third_party/fontawesome.
+// Used by the on-screen keypad overlay for crisp icon glyphs at any size.
+// Native build reads from the source path directly; emscripten build gets
+// it preloaded into MEMFS at /fonts/fa-solid-900.ttf (see CMakeLists).
+#ifdef __EMSCRIPTEN__
+static constexpr const char* FONT_ICON_PATH = "/fonts/fa-solid-900.ttf";
+#else
+static constexpr const char* FONT_ICON_PATH =
+    "third_party/fontawesome/fa-solid-900.ttf";
+#endif
+
+static std::unordered_map<int, TTF_Font*> g_ttf_icon_cache;
+
+TTF_Font* get_icon_font(int px_size) {
+    if (!g_ttf_inited) { TTF_Init(); g_ttf_inited = true; }
+    auto it = g_ttf_icon_cache.find(px_size);
+    if (it != g_ttf_icon_cache.end()) return it->second;
+    // Try a few paths so the binary works from repo root, build dir, or
+    // a user's install. First hit wins.
+    const char* candidates[] = {
+        FONT_ICON_PATH,
+        "../third_party/fontawesome/fa-solid-900.ttf",
+        "runtime/third_party/fontawesome/fa-solid-900.ttf",
+    };
+    TTF_Font* f = nullptr;
+    const char* used = nullptr;
+    for (const char* p : candidates) {
+        f = TTF_OpenFont(p, px_size);
+        if (f) { used = p; break; }
+    }
+    static bool logged_once = false;
+    if (f && !logged_once) {
+        fprintf(stderr, "[icon] loaded icon font: %s @ %dpx\n", used, px_size);
+        logged_once = true;
+    }
+    if (!f)
+        fprintf(stderr, "[icon] could not open Font Awesome (%s)\n", TTF_GetError());
+    g_ttf_icon_cache[px_size] = f;
     return f;
 }
 

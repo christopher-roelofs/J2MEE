@@ -7,10 +7,17 @@
 #include <unistd.h>
 #include <vector>
 #include "util/jar.hpp"
+#include "util/game_config.hpp"
 #include "vm/vm.hpp"
 #include "vm/stub_registry.hpp"
 #include "midp/natives.hpp"
 #include "backend/display.hpp"
+#include <filesystem>
+namespace fs = std::filesystem;
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 // Declared in interpreter.cpp — set true to trace every opcode
 extern bool g_trace;
@@ -122,6 +129,22 @@ int main(int argc, char* argv[]) {
     }
     install_signal_handlers();
 
+#ifdef __EMSCRIPTEN__
+    // Browser entry: hardcode the POC invocation. The JAR and resolution come
+    // from CMake cache variables baked into the build (J2ME_WEB_MIDLET,
+    // J2ME_WEB_RES). Everything is preloaded into MEMFS via --preload-file.
+    // Ignore whatever argv the JS glue synthesized.
+    static const char* kArgv[] = {
+        "j2me",
+        "/game.jar",
+        J2ME_WEB_MIDLET,
+        J2ME_WEB_RES,
+        nullptr,
+    };
+    argc = 4;
+    argv = const_cast<char**>(kArgv);
+#endif
+
     // Split args into positional (jar, class, WxH) and option flags. Keeps
     // the existing `j2me <jar> <class> [WxH]` invocation working, while
     // `--foo` options can appear anywhere after the required two positionals.
@@ -167,8 +190,26 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Optional resolution override: "176x220"
+    // Per-game config: ~/.j2me/<jar-stem>/config.json. Values here are
+    // applied first; any CLI argument that follows overrides them. First
+    // run writes a defaults file so users have something to edit.
+    std::string jar_stem = fs::path(pos[0]).stem().string();
+    GameConfig cfg = GameConfig::load(jar_stem);
     extern bool g_screen_explicit;
+    if (auto wh = cfg.parsed_resolution()) {
+        g_screen_w = wh->first;
+        g_screen_h = wh->second;
+        g_screen_explicit = true;
+        if (!quiet)
+            std::cerr << "[config] resolution from config.json: "
+                      << g_screen_w << "x" << g_screen_h << "\n";
+    }
+    // Keypad prefs are deferred: Overlay::configure() picks them up when
+    // Display::open() fires on the first paint.
+    Display::instance().overlay().prefer_layout_by_name(cfg.keypad_layout);
+    Display::instance().overlay().prefer_visible(cfg.keypad_visible);
+
+    // Optional resolution override: "176x220" positional — wins over config.
     if (pos.size() >= 3) {
         int w = 0, h = 0;
         if (sscanf(pos[2], "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {

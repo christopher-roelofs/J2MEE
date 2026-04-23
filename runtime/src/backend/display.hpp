@@ -5,6 +5,10 @@
 #include <string>
 #include <vector>
 
+#include <unordered_set>
+
+#include "overlay.hpp"
+
 // Set from a SIGINT/SIGTERM handler to request graceful shutdown. Display::
 // flush() polls this each frame and returns false if set, which routes the
 // exit through the normal QuitRequest path — same as clicking the window's
@@ -71,6 +75,11 @@ public:
     // In headless mode the screen surface exists but no window is created.
     bool is_open() const { return m_screen != nullptr; }
 
+    // The on-screen keypad — exposed so CLI / config-file code can set
+    // deferred preferences (initial layout, initial visibility) before
+    // Display::open() lazily triggers Overlay::configure().
+    Overlay& overlay() { return m_overlay; }
+
     // ── Headless / automation ────────────────────────────────────────────
     // Enable before open(). Suppresses window/renderer/event-pump and
     // replaces live SDL input with a scripted key track.
@@ -101,6 +110,11 @@ private:
     SDL_Texture*  m_texture  = nullptr;
     SDL_Surface*  m_screen   = nullptr;
 
+    // Dedicated surface for the Below-placement overlay. In Overlay
+    // placement the overlay draws directly on m_screen and these are null.
+    SDL_Surface*  m_overlay_surf    = nullptr;
+    SDL_Texture*  m_overlay_texture = nullptr;
+
     int m_logical_w = 240;
     int m_logical_h = 320;
     int m_mouse_range_w = 0;
@@ -111,6 +125,29 @@ private:
     std::vector<PointerEvent> m_pending_pointers;
     bool m_pointer_down = false;
     double m_mouse_scale = 1.0;  // multiply SDL mouse coords by this before window-to-logical mapping
+
+    // On-screen keypad. Visible by default. For Placement::Below the
+    // overlay occupies a strip beneath the game (window is enlarged to
+    // fit); for Placement::Overlay it's drawn translucently on m_screen.
+    // Pointer events check the overlay first so taps on the keypad inject
+    // MIDP key events instead of reaching the game's pointer handler.
+    Overlay m_overlay;
+    // MIDP codes currently held by a finger-on-overlay. A single tap on
+    // a d-pad diagonal holds *two* codes (UP+RIGHT etc.) until the finger
+    // lifts, matching j2me-loader's DualKey behaviour. Cleared on every
+    // pointer-up. update_key_states() ORs each held code into the
+    // GameCanvas.getKeyStates bitmask.
+    std::unordered_set<int> m_overlay_held;
+
+    // Window/physical-pixel scale captured at open() so show/hide resizes
+    // can update the window without losing its initial proportions. For
+    // Wayland 2× scale machines this is the *physical* ratio, not the
+    // post-compositor ratio.
+    double m_display_scale = 1.0;
+    // Cached total-logical-height used during the last flush. Changes when
+    // the overlay's visible strip height changes (show/hide); triggers a
+    // window + renderer + mouse-range update in flush().
+    int m_cached_total_h = 0;
 
     // Headless state
     bool m_headless   = false;

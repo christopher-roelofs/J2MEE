@@ -1194,21 +1194,24 @@ void VM::exec_frame(Frame& f) {
             uint16_t cp_idx = bc_u2(code, f.pc); f.pc += 2;
             uint8_t  dims   = bc_u1(code, f.pc); f.pc += 1;
             ClassDef* klass = resolve_class(*cf_ptr, cp_idx);
-            // Only handle 2D int arrays (the common case: int[][])
-            // Pop dimension sizes from stack (last dim on top)
-            std::vector<int32_t> dim_sizes(dims);
-            for (int i = dims-1; i >= 0; --i)
-                dim_sizes[i] = f.pop_int();
-            // Allocate outer array of refs
-            ObjRef outer = m_heap.alloc_ref_array(dim_sizes[0], klass);
-            if (outer == NULL_REF) throw std::runtime_error("OutOfMemoryError");
-            if (dims >= 2) {
-                auto* outer_obj = m_heap.deref(outer);
-                for (int32_t i = 0; i < dim_sizes[0]; ++i) {
-                    ObjRef inner = m_heap.alloc_prim_array(
-                        ArrayType::Int, dim_sizes[1],
-                        m_loader.find_or_stub("[I"));
-                    outer_obj->array_slots()[i] = Slot::from_ref(inner);
+            // Only handle 2D int arrays (the common case: int[][]).
+            // dim_sizes must be destroyed before DISPATCH() — clang disallows
+            // indirect goto across a scope with non-trivial destructors.
+            ObjRef outer;
+            {
+                std::vector<int32_t> dim_sizes(dims);
+                for (int i = dims-1; i >= 0; --i)
+                    dim_sizes[i] = f.pop_int();
+                outer = m_heap.alloc_ref_array(dim_sizes[0], klass);
+                if (outer == NULL_REF) throw std::runtime_error("OutOfMemoryError");
+                if (dims >= 2) {
+                    auto* outer_obj = m_heap.deref(outer);
+                    for (int32_t i = 0; i < dim_sizes[0]; ++i) {
+                        ObjRef inner = m_heap.alloc_prim_array(
+                            ArrayType::Int, dim_sizes[1],
+                            m_loader.find_or_stub("[I"));
+                        outer_obj->array_slots()[i] = Slot::from_ref(inner);
+                    }
                 }
             }
             f.push_ref(outer);

@@ -1,0 +1,20 @@
+{
+  "name": "Numpad",
+  "description": "Phone-style 3x4 dialpad covering the whole strip.",
+  "strip_width": 176,
+  "strip_height": 89,
+  "buttons": [
+    { "code": 49, "image": "num-1",    "x":  28, "y":  2, "w": 24, "h": 20 },
+    { "code": 50, "image": "num-2",    "x":  56, "y":  2, "w": 24, "h": 20 },
+    { "code": 51, "image": "num-3",    "x":  84, "y":  2, "w": 24, "h": 20 },
+    { "code": 52, "image": "num-4",    "x":  28, "y": 24, "w": 24, "h": 20 },
+    { "code": 53, "image": "num-5",    "x":  56, "y": 24, "w": 24, "h": 20 },
+    { "code": 54, "image": "num-6",    "x":  84, "y": 24, "w": 24, "h": 20 },
+    { "code": 55, "image": "num-7",    "x":  28, "y": 46, "w": 24, "h": 20 },
+    { "code": 56, "image": "num-8",    "x":  56, "y": 46, "w": 24, "h": 20 },
+    { "code": 57, "image": "num-9",    "x":  84, "y": 46, "w": 24, "h": 20 },
+    { "code": 42, "image": "asterisk", "x":  28, "y": 68, "w": 24, "h": 20 },
+    { "code": 48, "image": "num-0",    "x":  56, "y": 68, "w": 24, "h": 20 },
+    { "code": 35, "image": "pound",    "x":  84, "y": 68, "w": 24, "h": 20 }
+  ]
+}

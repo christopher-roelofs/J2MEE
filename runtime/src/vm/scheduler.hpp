@@ -15,8 +15,16 @@
 #include <deque>
 #include <functional>
 #include <memory>
-#include <ucontext.h>
 #include <vector>
+
+#ifdef __EMSCRIPTEN__
+// Asyncify-backed fibers replace POSIX ucontext under wasm. The public
+// surface of Scheduler stays identical; only the context-switch primitives
+// differ (see scheduler.cpp).
+#include <emscripten/fiber.h>
+#else
+#include <ucontext.h>
+#endif
 
 #include "frame.hpp"
 #include "heap.hpp"  // for ObjRef, NULL_REF
@@ -45,8 +53,15 @@ struct JavaThread {
     uint64_t  wake_at_ms  = 0;        // for Sleeping; absolute timestamp
     ObjRef    wait_on     = NULL_REF; // for Waiting; the monitor object
 
-    // Context-switch state
+    // Context-switch state. Under emscripten, Asyncify fibers replace
+    // ucontext; each fiber needs its own Asyncify-side stack in addition
+    // to its C stack.
+#ifdef __EMSCRIPTEN__
+    emscripten_fiber_t ctx{};
+    std::vector<uint8_t> asyncify_stack;   // fiber's Asyncify stack
+#else
     ucontext_t ctx{};
+#endif
     uint8_t*   stack      = nullptr;
     size_t     stack_size = 0;
 
@@ -93,6 +108,13 @@ public:
     // Exposed for diagnostic use / the old pending_thread_count() callers.
     size_t ready_count() const;
 
+#ifdef __EMSCRIPTEN__
+    // Internal — exposed so the fiber-entry thunk can swap back to the
+    // scheduler fiber after a thread finishes. Do not dereference directly
+    // from outside the scheduler.
+    emscripten_fiber_t* scheduler_ctx_ptr();
+#endif
+
 private:
     static void thread_entry(uint32_t hi, uint32_t lo);
 
@@ -102,7 +124,13 @@ private:
 
     std::vector<std::unique_ptr<JavaThread>> m_threads;
     JavaThread* m_current = nullptr;
+#ifdef __EMSCRIPTEN__
+    emscripten_fiber_t m_scheduler_ctx{};
+    std::vector<uint8_t> m_scheduler_asyncify_stack;
+    bool m_scheduler_ctx_inited = false;
+#else
     ucontext_t  m_scheduler_ctx{};
+#endif
 
     // ucontext passes two uint32_t args to the entry function. We stash the
     // freshly-spawned JavaThread here between makecontext and the first

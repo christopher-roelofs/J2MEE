@@ -1,5 +1,34 @@
+# ─── Build outputs ───────────────────────────────────────────────────────────
 runtime/build/
+runtime/build-release/
+runtime/build-web/
+runtime/bios/
+runtime/tools/__pycache__/
+launcher/.gradle/
+launcher/build/
 *.o
 *.obj
+*.class
+*.pyc
+
+# ─── Game library ────────────────────────────────────────────────────────────
 games/
 explore/
+
+# ─── Accidentally-extracted JAR contents at the repo / runtime roots ─────────
+/META-INF/
+runtime/META-INF/
+/*.mid
+/*.bsp
+/*.str
+/*.bin
+/*.db
+/*.jar
+/*.png
+/*.map
+
+# ─── Editor / local state ────────────────────────────────────────────────────
+.claude/scheduled_tasks.lock
+.idea/
+.vscode/
+*.swp

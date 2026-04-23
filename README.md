@@ -2,9 +2,19 @@
 
 A small CLDC/MIDP-2.0 emulator written in C++ with SDL2 for graphics, audio,
 input, and persistent storage. Plays a handful of feature-phone Java games
-(Solitaire, Age of Empires II, 365 Puzzle Club, etc.) on Linux.
+(Solitaire, Age of Empires II, 365 Puzzle Club, Doom RPG, etc.) on Linux.
+
+This repo has three pieces:
+
+| Directory  | What it is |
+| ---------- | ---------- |
+| `runtime/` | Native C++/SDL2 J2ME VM — loads a JAR, interprets MIDP bytecode, renders the game. Also builds to WebAssembly via Emscripten. |
+| `launcher/`| Compose Multiplatform desktop UI — picks a JAR from a folder, spawns the runtime. Kotlin/JVM. |
+| `games/`   | Local JAR library (gitignored). |
 
 ## Build & run
+
+Native runtime:
 
 ```sh
 cd runtime/build
@@ -14,6 +24,24 @@ ASAN_OPTIONS=detect_leaks=0 ./j2me <jar> <MIDletClass> [WxH]
 
 Optional `WxH` overrides the screen resolution (default 240×320, otherwise
 read from `boxal.inf` if present in the jar).
+
+Launcher (opens a Material-styled window over the runtime):
+
+```sh
+cd launcher
+./gradlew run
+```
+
+Web / WebAssembly build (Emscripten; see `memory/project_j2me_wasm_build.md`
+for full detail):
+
+```sh
+cd runtime/build-web
+source ~/emsdk/emsdk_env.sh
+emcmake cmake .. -DJ2ME_WEB_GAME=/abs/path/to/game.jar -DJ2ME_WEB_MIDLET=pkg.MIDlet
+emmake make -j
+python3 -m http.server 8765   # open http://localhost:8765/j2me.html
+```
 
 ## What works
 
@@ -37,6 +65,10 @@ read from `boxal.inf` if present in the jar).
   `pointerDragged` in logical screen coordinates; `hasPointerEvents` and
   `hasPointerMotionEvents` return true. Compositor-scale aware so clicks
   map correctly under HiDPI Wayland.
+- **On-screen keypad**: dedicated strip below the game with a d-pad
+  (with diagonals), A/B/Start and a phone numpad layout. Hide/show
+  toggle + layout cycle. JSON-defined layouts with PNG button art under
+  `runtime/assets/keypad/`. See "On-screen keypad" below.
 - **Audio**: SDL2_mixer plays MIDI (`.mid`) and WAV via `Player`.
 - **RecordStore (RMS)**: persisted to `~/.j2me/<jar-stem>/rms/<name>.rms`;
   `enumerateRecords` (filter/comparator ignored) supported. Records written
@@ -48,10 +80,15 @@ read from `boxal.inf` if present in the jar).
 | Game | Status |
 | --- | --- |
 | 365 Solitaire (Connect2Media) | Playable end-to-end with audio + save |
-| Age of Empires II Mobile | Menu, gameplay, soft-key touch all work; some bitmap-font scroll text shows minor edge bleed (game expects pixel-exact 6px font) |
+| Age of Empires II Mobile | Menu, gameplay, soft-key touch all work; minor bitmap-font scroll bleed |
 | 365 Puzzle Club | Launches into language menu via VServ bypass; cosmetic highlight-bar narrower than item width |
-| 3D Bomberman Atomic | Reaches 3D init then crashes — game uses M3G (JSR-184), not implemented |
-| Lumines Mobile | Window opens but stays mostly black — needs more debugging (uses Nokia FullCanvas) |
+| Bejeweled (JAMDAT 2007) | Fully playable. Wipe `~/.j2me/bejeweled*/rms/` if it boots to a white screen |
+| Doom RPG (JAMDAT 2009) | Textured in-game world; playable |
+| Spore Origins | Playable. Minor clipping around background swirls |
+| Lemonade Tycoon | In-game. Audio off by default in-game (not a runtime issue) |
+| Bejeweled 3 (EA/JAMDAT) | Reaches the Enable-Sound dialog; soft-key mapping + M3G gem grid both unresolved |
+| 3D Bomberman Atomic | Needs JSR-184 (M3G) — not implemented, crashes on 3D init |
+| Lumines Mobile | Window opens but stays mostly black — needs more debugging (Nokia FullCanvas) |
 
 ## Special handling
 
@@ -106,6 +143,155 @@ pixels but mouse events arrive in compositor-logical coordinates. We detect
 the original window size captured at startup so resizing doesn't break
 input. Override with `J2ME_SCALE=<n>` (e.g. `J2ME_SCALE=1` to disable on
 non-scaled X11).
+
+## Per-game config
+
+Every game gets a JSON file at `~/.j2me/<jar-stem>/config.json` — same
+directory as its RMS saves. Missing on first run, auto-created with the
+defaults below:
+
+```json
+{
+  "resolution":     "auto",
+  "keypad_layout":  "minimal",
+  "keypad_visible": true
+}
+```
+
+Fields:
+
+| Field             | Values                         | Effect |
+| ----------------- | ------------------------------ | ------ |
+| `resolution`      | `"WxH"` (e.g. `"176x208"`) or `"auto"` | Overrides the screen resolution. `"auto"` lets the runtime pick from `boxal.inf` / manifest / 240×320 default. A CLI `WxH` positional still wins over the config value. |
+| `keypad_layout`   | Folder name under `runtime/assets/keypad/layouts/` (e.g. `"minimal"`, `"numpad"`) | Which layout to start on. User can still tap the ↻ button to cycle. |
+| `keypad_visible`  | `true` / `false`               | Whether the keypad starts expanded or collapsed to the thin handle strip. |
+
+Edit the JSON with any text editor — changes apply on the next launch.
+Unknown fields and malformed files are ignored (defaults win, with a
+one-line log).
+
+## On-screen keypad
+
+A virtual keypad renders below the game in a dedicated strip. Taps on
+buttons dispatch MIDP key events identical to a physical keyboard press
+(`keyPressed` / `keyReleased` + the `GameCanvas.getKeyStates()` bit is
+set while held).
+
+Two surfaces, one window: the game area and the keypad strip are
+composed as separate `SDL_RenderCopy` rects each frame — they have
+independent coord systems, so manual window resizes and the strip's
+own hide/show collapse never interfere with the game's touch mapping.
+
+### Controls (top-centre of the strip)
+
+| Glyph | Action |
+| ----- | ------ |
+| ▲     | Hide the keypad (collapses the strip to a thin band with just the toggle). |
+| ▼     | Show the keypad. Shown instead of ▲ while hidden. Tap anywhere in the thin band also works. |
+| ↻     | Cycle to the next layout. Wraps. |
+
+`Tab` (keyboard) toggles hide/show as well. `Esc` quits the runtime.
+
+### Built-in layouts
+
+Ship with two layouts under `runtime/assets/keypad/layouts/`:
+
+- **minimal** — d-pad (4 cardinals + 4 diagonals) on the left, A / B /
+  Start on the right.
+- **numpad** — phone-style 3×4 dialpad (1–9, *, 0, #) covering the
+  whole strip.
+
+### Adding a custom layout
+
+1. Create `runtime/assets/keypad/layouts/<name>/` with a `layout.json`.
+2. Drop any override PNGs into the same folder. Missing images fall
+   back to `runtime/assets/keypad/default/<slug>.png`; missing there
+   too falls back to live TTF render using the image slug as a label.
+3. Re-run. The runtime scans all layout folders lexicographically and
+   adds them to the cycle.
+
+### Layout JSON schema
+
+All fields are optional except `buttons`. Minimal valid layout:
+
+```json
+{ "buttons": [ { "code": -5, "image": "start", "x": 0, "y": 0, "w": 176, "h": 89 } ] }
+```
+
+Full shape:
+
+```jsonc
+{
+  "name":                "Minimal",     // debug label
+  "description":         "…",           // free-form, ignored by runtime
+  "strip_width":         176,           // design-time reference width  (default 176)
+  "strip_height":        89,            // design-time reference height (default 89)
+  "strip_height_px":     100,           // optional: absolute runtime strip height
+  "strip_aspect":        "3:2",         // optional: w:h ratio, runtime h = game_w / ratio
+  "collapsed_height_px": 24,            // optional: runtime hidden-state strip height
+  "buttons": [
+    // single-key button:
+    { "code":  -1, "image": "arrow-up", "x": 30, "y": 2, "w": 28, "h": 28 },
+    // multi-key button (j2me-loader-style diagonal — fires UP + RIGHT together):
+    { "codes": [-1, -4], "image": "arrow-up-right", "x": 58, "y": 2, "w": 28, "h": 28 }
+  ]
+}
+```
+
+- `x`, `y`, `w`, `h` are in the layout's own reference coord space
+  (`strip_width × strip_height`). Runtime scales to the actual strip
+  size, so the same layout works at any game resolution.
+- `code` and `codes` are alternatives — use `codes` when a single
+  button should press more than one MIDP key simultaneously
+  (d-pad diagonals, combo shortcuts).
+- Strip-height precedence: `strip_height_px` > `strip_aspect` >
+  built-in formula.
+
+Standard MIDP key codes:
+
+| Key | Code |
+| --- | ---- |
+| UP / DOWN / LEFT / RIGHT | -1 / -2 / -3 / -4 |
+| FIRE (OK / Select)       | -5 |
+| SOFT1 / SOFT2 (A / B)    | -6 / -7 |
+| 0–9                      | 48–57 (ASCII) |
+| `*` / `#`                | 42 / 35 |
+
+### Button image slugs
+
+Image lookup: `<layout_dir>/<slug>.png` first, then
+`runtime/assets/keypad/default/<slug>.png`. Default PNGs live at 128×128
+but any source size works — `SDL_BlitScaled` stretches to whichever rect
+the layout puts the button in.
+
+Default slug set (regenerable — see below):
+
+```
+arrow-up         arrow-down         arrow-left         arrow-right
+arrow-up-left    arrow-up-right     arrow-down-left    arrow-down-right
+soft-left        soft-right         start
+num-0 .. num-9   asterisk           pound
+toggle-hide      toggle-show        cycle               (controls)
+```
+
+### Regenerating the defaults
+
+The default PNGs are built by a Python script using DejaVu Sans Bold +
+Font Awesome Free Solid (same TTFs the runtime loads live):
+
+```sh
+python3 runtime/tools/export_keypad_sprites.py
+```
+
+Requires Pillow. Output goes to `runtime/assets/keypad/default/`.
+
+### Env-var overrides
+
+| Env var                  | Effect |
+| ------------------------ | ------ |
+| `J2ME_OVERLAY_PLACEMENT` | `below` (default), `overlay` (translucent on top), or `off` (hide entirely). |
+| `J2ME_OVERLAY_LAYOUT`    | `numpad` to start on the numpad layout instead of minimal. |
+| `J2ME_TRACE_MOUSE`       | Verbose mouse-event trace (window → logical coord mapping). |
 
 ## Known limitations
 
@@ -241,6 +427,7 @@ phone" well before getting to step 3.
 
 ```
 runtime/
+  CMakeLists.txt                ← native + emscripten build
   src/
     main.cpp                    ← CLI entry, VServ bypass setup
     util/jar.cpp                ← ZIP/jar reader
@@ -250,14 +437,39 @@ runtime/
       class_def.cpp             ← virtual dispatch
       heap.cpp                  ← bump alloc + mark/sweep
       interpreter.cpp           ← bytecode dispatch loop
+      scheduler.cpp             ← green-thread scheduler (ucontext / wasm fibers)
       vm.cpp                    ← run(), invoke(), <clinit>
     midp/
       natives.cpp               ← non-graphics MIDP natives (RMS, Player,
                                   Connector, Hashtable, …)
       graphics_natives.cpp      ← Graphics, Image, Canvas, Font, Display,
                                   Timer, Thread.start
+      audio_eas.cpp             ← Sonivox EAS wrapper (not yet wired to JSR-135)
+      lcdui_natives.cpp         ← Form, TextField, Alert, List, etc.
+      m3g_natives.cpp           ← JSR-184 native bridge (native build)
+      m3g_backend.cpp           ← SDL2+GLES1 context shim for M3G
+      m3g_natives_stub.cpp      ← no-op replacement for wasm (no GL)
     backend/
-      display.cpp               ← SDL2 window, mouse/key event polling,
-                                  HiDPI-aware coordinate mapping
+      display.cpp               ← SDL2 window, event polling, per-surface
+                                  compositing (game + keypad strip)
+      overlay.cpp               ← on-screen keypad: layouts, hit test,
+                                  sprite bake, JSON loader
+  assets/
+    keypad/
+      default/                  ← canonical 128×128 button PNGs
+      layouts/<name>/           ← one folder per layout; layout.json + PNGs
+  tools/
+    export_keypad_sprites.py    ← regenerate default/ PNGs with Pillow
+  third_party/
+    fontawesome/                ← Font Awesome Free Solid TTF (OFL-1.1)
+    json/                       ← nlohmann/json single-header
+    m3g/                        ← Khronos M3G reference (EPL-1.0)
+    sonivox/                    ← Sonivox EAS synthesizer (Apache-2.0)
+  build/                        ← native Debug (ASan + UBSan)
+  build-release/                ← native Release
+  build-web/                    ← emscripten output (.html/.js/.wasm/.data)
+launcher/
+  build.gradle.kts              ← Kotlin/Compose Multiplatform
+  src/main/kotlin/…             ← Material list UI, JAR metadata, subprocess launch
 games/                          ← .jars (gitignored)
 ```
