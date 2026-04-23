@@ -72,6 +72,13 @@ void create_into(ObjRef self, Factory factory) {
 
 } // namespace
 
+// Set J2ME_TRACE_M3G=1 to log every M3G native call — used when diagnosing
+// what a 3D game is (or isn't) actually asking for at its render path.
+#define M3G_TRACE(what) do { \
+    static bool s_enabled_##__LINE__ = (std::getenv("J2ME_TRACE_M3G") != nullptr); \
+    if (s_enabled_##__LINE__) std::fprintf(stderr, "[m3g] " what "\n"); \
+} while(0)
+
 void register_m3g_natives(VM& vm) {
 
     // ── Graphics3D ────────────────────────────────────────────────────────────
@@ -80,6 +87,7 @@ void register_m3g_natives(VM& vm) {
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "getInstance", "()Ljavax/microedition/m3g/Graphics3D;",
         [](VM& v, Frame& f, std::span<Slot>) {
+            M3G_TRACE("Graphics3D.getInstance");
             // Defer m3gCreateInterface + GL context creation until something
             // actually tries to render. Many games (e.g. Bejeweled 3) call
             // getInstance() during boot just to probe whether 3D is present,
@@ -96,6 +104,7 @@ void register_m3g_natives(VM& vm) {
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "bindTarget", "(Ljava/lang/Object;)V",
         [](VM&, Frame&, std::span<Slot>) {
+            M3G_TRACE("Graphics3D.bindTarget(Object)");
             // Target binding requires routing the SDL framebuffer / GLES
             // surface to M3G. Our backend's beginRenderFunc hooks GL_MakeCurrent
             // already; we'll thread a real userTarget id once we have render.
@@ -103,7 +112,10 @@ void register_m3g_natives(VM& vm) {
         });
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "bindTarget", "(Ljava/lang/Object;ZI)V",
-        [](VM&, Frame&, std::span<Slot>) { j2me_m3g_make_current(); });
+        [](VM&, Frame&, std::span<Slot>) {
+            M3G_TRACE("Graphics3D.bindTarget(Object,Z,I)");
+            j2me_m3g_make_current();
+        });
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "releaseTarget", "()V",
         [](VM&, Frame&, std::span<Slot>) {
