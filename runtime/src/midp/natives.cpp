@@ -1508,6 +1508,46 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_ref(self);
         });
 
+    // Boolean / long / float / double overloads. Asphalt 3 3D does
+    // `"s" + setFullScreen` which compiles to `append(Z)`; with no native
+    // registered the runtime defaulted to returning null and every chained
+    // toString() / further append then NPE'd at s.CanvasPlusInit@540.
+    vm.register_native("java/lang/StringBuffer", "append",
+        "(Z)Ljava/lang/StringBuffer;",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            g_string_buffers[self] += (args[1].as_int() ? "true" : "false");
+            f.push_ref(self);
+        });
+    vm.register_native("java/lang/StringBuffer", "append",
+        "(J)Ljava/lang/StringBuffer;",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            // Long args take 2 slots (lo then hi per our calling convention).
+            ObjRef self = args[0].as_ref();
+            int64_t v = (int64_t)(uint32_t)args[1].as_int()
+                      | ((int64_t)args[2].as_int() << 32);
+            g_string_buffers[self] += std::to_string(v);
+            f.push_ref(self);
+        });
+    vm.register_native("java/lang/StringBuffer", "append",
+        "(F)Ljava/lang/StringBuffer;",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            g_string_buffers[self] += std::to_string(args[1].as_float());
+            f.push_ref(self);
+        });
+    vm.register_native("java/lang/StringBuffer", "append",
+        "(D)Ljava/lang/StringBuffer;",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            double d;
+            uint64_t bits = (uint64_t)(uint32_t)args[1].as_int()
+                          | ((uint64_t)args[2].as_int() << 32);
+            std::memcpy(&d, &bits, 8);
+            g_string_buffers[self] += std::to_string(d);
+            f.push_ref(self);
+        });
+
     vm.register_native("java/lang/StringBuffer", "toString",
         "()Ljava/lang/String;",
         [](VM& v, Frame& f, std::span<Slot> args) {
