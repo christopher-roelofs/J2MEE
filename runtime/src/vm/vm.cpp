@@ -128,22 +128,24 @@ static inline uint64_t cp_cache_key(const ClassFile& cf, uint16_t idx) {
 }
 
 ClassDef* VM::resolve_class(const ClassFile& cf, uint16_t idx) {
-    uint64_t k = cp_cache_key(cf, idx);
-    auto it = m_class_cache.find(k);
-    if (it != m_class_cache.end()) return it->second;
+    // Per-ClassFile cache, see resolved_fields for the pattern.
+    ClassDef*& slot = cf.resolved_classes[idx];
+    if (slot) return slot;
 
     const auto& entry = cf.constant_pool.at(idx);
     const auto* cls   = std::get_if<CpClass>(&entry);
     if (!cls) throw std::runtime_error("Expected CpClass at cp[" + std::to_string(idx) + "]");
-    ClassDef* result = m_loader.find_or_stub(cf.utf8(cls->name_index));
-    m_class_cache[k] = result;
-    return result;
+    slot = m_loader.find_or_stub(cf.utf8(cls->name_index));
+    return slot;
 }
 
 VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
-    uint64_t k = cp_cache_key(cf, idx);
-    auto it = m_field_cache.find(k);
-    if (it != m_field_cache.end()) return it->second;
+    // Fast path — direct vector lookup by CP index. The resolved_fields
+    // vector is sized at class-file parse time to exactly match the CP
+    // length, so this is a bounds-checked load + null check. Hit rate is
+    // effectively 100% after the first touch of any given field site.
+    auto& slot = cf.resolved_fields[idx];
+    if (slot.first) return {slot.first, slot.second};
 
     const auto& entry = cf.constant_pool.at(idx);
 
@@ -164,9 +166,8 @@ VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
     ClassDef* cur = klass;
     while (cur) {
         if (auto* fd = cur->find_field(name, desc)) {
-            FieldRef r{cur, fd};
-            m_field_cache[k] = r;
-            return r;
+            slot = {cur, fd};
+            return {cur, fd};
         }
         cur = cur->super;
     }
@@ -179,15 +180,13 @@ VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
     stub.slot_index   = static_cast<uint32_t>(klass->static_fields.size());
     klass->static_fields.push_back(stub);
     klass->static_values.push_back(Slot{});
-    FieldRef r{klass, &klass->static_fields.back()};
-    m_field_cache[k] = r;
-    return r;
+    slot = {klass, &klass->static_fields.back()};
+    return {slot.first, slot.second};
 }
 
 VM::MethodRef VM::resolve_method(const ClassFile& cf, uint16_t idx) {
-    uint64_t k = cp_cache_key(cf, idx);
-    auto it = m_method_cache.find(k);
-    if (it != m_method_cache.end()) return it->second;
+    auto& slot = cf.resolved_methods[idx];
+    if (slot.first) return {slot.first, slot.second};
 
     const auto& entry = cf.constant_pool.at(idx);
 
@@ -208,9 +207,8 @@ VM::MethodRef VM::resolve_method(const ClassFile& cf, uint16_t idx) {
     const std::string& desc = cf.utf8(nat.descriptor_index);
 
     if (auto* md = klass->resolve_virtual(name, desc)) {
-        MethodRef r{klass, md};
-        m_method_cache[k] = r;
-        return r;
+        slot = {klass, md};
+        return {klass, md};
     }
 
     // Stub: add a native method that returns a zero/null value of the right
@@ -228,9 +226,8 @@ VM::MethodRef VM::resolve_method(const ClassFile& cf, uint16_t idx) {
                 default: break;  // Void, Double
             }
         });
-    MethodRef r{klass, klass->find_method(name, desc)};
-    m_method_cache[k] = r;
-    return r;
+    slot = {klass, klass->find_method(name, desc)};
+    return {slot.first, slot.second};
 }
 
 // ─── Invocation ───────────────────────────────────────────────────────────────

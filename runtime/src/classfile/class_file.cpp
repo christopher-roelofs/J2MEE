@@ -207,6 +207,12 @@ ClassFile parse_class_file(std::span<const uint8_t> data) {
 
     uint16_t cp_count = r.u2();
     cf.constant_pool = parse_constant_pool(r, cp_count);
+    // Lazy resolution caches; populated on first GETFIELD/INVOKESTATIC/etc.
+    // targeting each CP index. Null klass = not yet resolved.
+    const size_t n = cf.constant_pool.size();
+    cf.resolved_fields.assign(n,  {nullptr, nullptr});
+    cf.resolved_methods.assign(n, {nullptr, nullptr});
+    cf.resolved_classes.assign(n, nullptr);
 
     cf.access_flags = r.u2();
     cf.this_class   = cf.class_name(r.u2());

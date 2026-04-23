@@ -3,6 +3,24 @@
 #include "class_def.hpp"
 #include <vector>
 #include <stdexcept>
+#include <string>
+
+// Cold-path helpers — throwing std::runtime_error keeps them out of the
+// header so push()/pop() bodies stay small enough for the compiler to
+// inline across translation units. Defined in frame.cpp (or inline in
+// this header if declared static below).
+namespace frame_detail {
+[[noreturn]] inline void overflow(uint32_t sp) {
+    throw std::runtime_error("operand stack overflow (sp=" + std::to_string(sp) + ")");
+}
+[[noreturn]] inline void underflow_pop() {
+    throw std::runtime_error("operand stack underflow (pop)");
+}
+[[noreturn]] inline void underflow_peek(uint32_t depth, uint32_t sp) {
+    throw std::runtime_error("operand stack underflow (peek depth=" +
+                             std::to_string(depth) + " sp=" + std::to_string(sp) + ")");
+}
+}  // namespace frame_detail
 
 // ─── Frame ───────────────────────────────────────────────────────────────────
 // One activation record: a method call in progress.
@@ -32,18 +50,17 @@ struct Frame {
     // ── Operand stack ─────────────────────────────────────────────────────────
 
     void push(Slot s) {
-        if (sp >= static_cast<uint32_t>(stack.size()))
-            throw std::runtime_error("operand stack overflow (sp=" + std::to_string(sp) + ")");
+        if (__builtin_expect(sp >= static_cast<uint32_t>(stack.size()), 0))
+            frame_detail::overflow(sp);
         stack[sp++] = s;
     }
     Slot pop() {
-        if (sp == 0) throw std::runtime_error("operand stack underflow (pop)");
+        if (__builtin_expect(sp == 0, 0)) frame_detail::underflow_pop();
         return stack[--sp];
     }
     Slot& peek(uint32_t depth = 0) {
-        if (depth >= sp)
-            throw std::runtime_error("operand stack underflow (peek depth=" +
-                                     std::to_string(depth) + " sp=" + std::to_string(sp) + ")");
+        if (__builtin_expect(depth >= sp, 0))
+            frame_detail::underflow_peek(depth, sp);
         return stack[sp - 1 - depth];
     }
 
