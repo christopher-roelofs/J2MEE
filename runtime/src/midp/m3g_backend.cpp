@@ -44,8 +44,15 @@ bool ensure_gl_context() {
         std::fprintf(stderr, "[m3g] no SDL window yet — defer GL init\n");
         return false;
     }
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 1);
+    // M3G's vendored core compiles to fixed-function OpenGL (glMatrixMode,
+    // glLoadMatrix, glBegin/glEnd, glTexCoord…). On desktop Linux the SDL
+    // default context is OpenGL 3.x core, which deleted fixed function;
+    // GLES1 via SDL_GL_CONTEXT_PROFILE_ES fails with BadAlloc on Mesa
+    // because ES is only exposed over EGL. Request the **compatibility**
+    // profile at 2.1 — that's the last desktop GL revision that keeps
+    // fixed-function alive and is universally supported by Mesa + NVIDIA.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
     g_gl_context = SDL_GL_CreateContext(g_gl_window);
     if (!g_gl_context) {

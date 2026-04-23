@@ -119,11 +119,17 @@ void Display::open(int w, int h, const std::string& title) {
         win_h = (int)(total_h * scale);
     }
 #endif
+    // SDL_WINDOW_OPENGL: M3G needs a GLES1 context to render 3D. Without the
+    // flag, SDL_GL_CreateContext against this window fails with BadAlloc on
+    // X11. The SDL renderer still works alongside M3G's context — they both
+    // target the same window and SDL_GL_MakeCurrent selects which is active
+    // at any moment.
     m_window = SDL_CreateWindow(
         title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         win_w, win_h,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+        SDL_WINDOW_OPENGL);
     if (!m_window)
         throw std::runtime_error(std::string("SDL_CreateWindow: ") + SDL_GetError());
 
