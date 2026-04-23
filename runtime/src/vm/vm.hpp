@@ -74,13 +74,25 @@ public:
     // Resolve a class reference from the current class's CP.
     ClassDef* resolve_class(const ClassFile& cf, uint16_t cp_idx);
 
-    // Resolve a field reference; also returns the owning class.
+    // Resolve a field reference; also returns the owning class. The fast
+    // path (cache hit) is header-inlined so each GETFIELD/PUTFIELD site
+    // becomes a couple of loads + null check; the slow path is outlined.
     struct FieldRef { ClassDef* klass; FieldDef* field; };
-    FieldRef resolve_field(const ClassFile& cf, uint16_t cp_idx);
+    FieldRef resolve_field_slow(const ClassFile& cf, uint16_t cp_idx);
+    FieldRef resolve_field(const ClassFile& cf, uint16_t cp_idx) {
+        auto& slot = cf.resolved_fields[cp_idx];
+        if (slot.first) return {slot.first, slot.second};
+        return resolve_field_slow(cf, cp_idx);
+    }
 
     // Resolve a method reference (for invokestatic / invokespecial).
     struct MethodRef { ClassDef* klass; MethodDef* method; };
-    MethodRef resolve_method(const ClassFile& cf, uint16_t cp_idx);
+    MethodRef resolve_method_slow(const ClassFile& cf, uint16_t cp_idx);
+    MethodRef resolve_method(const ClassFile& cf, uint16_t cp_idx) {
+        auto& slot = cf.resolved_methods[cp_idx];
+        if (slot.first) return {slot.first, slot.second};
+        return resolve_method_slow(cf, cp_idx);
+    }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
 

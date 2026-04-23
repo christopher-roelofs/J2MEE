@@ -139,13 +139,11 @@ ClassDef* VM::resolve_class(const ClassFile& cf, uint16_t idx) {
     return slot;
 }
 
-VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
-    // Fast path — direct vector lookup by CP index. The resolved_fields
-    // vector is sized at class-file parse time to exactly match the CP
-    // length, so this is a bounds-checked load + null check. Hit rate is
-    // effectively 100% after the first touch of any given field site.
+VM::FieldRef VM::resolve_field_slow(const ClassFile& cf, uint16_t idx) {
+    // Fast path (cache hit) is in vm.hpp so it inlines at each call site.
+    // This is the cold path: walk the class hierarchy, install in the
+    // per-CP cache, return.
     auto& slot = cf.resolved_fields[idx];
-    if (slot.first) return {slot.first, slot.second};
 
     const auto& entry = cf.constant_pool.at(idx);
 
@@ -184,9 +182,9 @@ VM::FieldRef VM::resolve_field(const ClassFile& cf, uint16_t idx) {
     return {slot.first, slot.second};
 }
 
-VM::MethodRef VM::resolve_method(const ClassFile& cf, uint16_t idx) {
+VM::MethodRef VM::resolve_method_slow(const ClassFile& cf, uint16_t idx) {
+    // See resolve_field_slow — fast path lives in the header.
     auto& slot = cf.resolved_methods[idx];
-    if (slot.first) return {slot.first, slot.second};
 
     const auto& entry = cf.constant_pool.at(idx);
 
