@@ -22,6 +22,12 @@
 // surface of Scheduler stays identical; only the context-switch primitives
 // differ (see scheduler.cpp).
 #include <emscripten/fiber.h>
+#elif defined(__ANDROID__)
+// Android NDK removed <ucontext.h>. Each Java thread is a real pthread
+// gated by a semaphore so only one runs at a time — cooperatively
+// indistinguishable from the ucontext model for the rest of the runtime.
+#include <pthread.h>
+#include <semaphore.h>
 #else
 #include <ucontext.h>
 #endif
@@ -59,6 +65,10 @@ struct JavaThread {
 #ifdef __EMSCRIPTEN__
     emscripten_fiber_t ctx{};
     std::vector<uint8_t> asyncify_stack;   // fiber's Asyncify stack
+#elif defined(__ANDROID__)
+    pthread_t thread{};
+    sem_t     ctx{};        // semaphore this thread waits on to resume
+    bool      started = false;
 #else
     ucontext_t ctx{};
 #endif
@@ -128,6 +138,12 @@ private:
     emscripten_fiber_t m_scheduler_ctx{};
     std::vector<uint8_t> m_scheduler_asyncify_stack;
     bool m_scheduler_ctx_inited = false;
+#elif defined(__ANDROID__)
+    sem_t  m_scheduler_ctx{};
+    bool   m_scheduler_ctx_inited = false;
+public:
+    sem_t& scheduler_sem() { return m_scheduler_ctx; }
+private:
 #else
     ucontext_t  m_scheduler_ctx{};
 #endif

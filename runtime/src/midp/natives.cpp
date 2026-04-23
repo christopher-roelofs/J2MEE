@@ -13,9 +13,9 @@
 #include <thread>
 #include <unordered_map>
 
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_mixer.h>
-#include <SDL2/SDL_ttf.h>
+#include <SDL.h>
+#include <SDL_mixer.h>
+#include <SDL_ttf.h>
 #include "backend/display.hpp"
 
 namespace fs = std::filesystem;
@@ -3857,8 +3857,22 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
     auto ensure_mixer = []() {
         if (g_mixer_inited) return;
-        if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0)
+        int init_flags = Mix_Init(MIX_INIT_MID);
+        // 48 kHz matches Android's native rate on Pixel 7; buffer bumped to
+        // 4096 to exceed AAudio's 1772-frame burst window. Too small and the
+        // stream auto-pauses between callbacks before samples are ready.
+        if (Mix_OpenAudio(48000, MIX_DEFAULT_FORMAT, 2, 4096) < 0)
             fprintf(stderr, "[audio] Mix_OpenAudio failed: %s\n", Mix_GetError());
+        else {
+            int freq = 0, chans = 0; Uint16 fmt = 0;
+            Mix_QuerySpec(&freq, &fmt, &chans);
+            fprintf(stderr, "[audio] device open: %dHz fmt=0x%x ch=%d init=0x%x\n",
+                    freq, fmt, chans, init_flags);
+            int n = Mix_GetNumMusicDecoders();
+            fprintf(stderr, "[audio] music decoders (%d):", n);
+            for (int i = 0; i < n; ++i) fprintf(stderr, " %s", Mix_GetMusicDecoder(i));
+            fprintf(stderr, "\n");
+        }
         Mix_AllocateChannels(16);
         g_mixer_inited = true;
     };
@@ -3903,8 +3917,16 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
             if (is_midi) {
                 pd.music = Mix_LoadMUS_RW(pd.rw, 0);
-                if (!pd.music)
-                    fprintf(stderr, "[audio] Mix_LoadMUS_RW failed: %s\n", Mix_GetError());
+                if (!pd.music) {
+                    fprintf(stderr, "[audio] Mix_LoadMUS_RW failed: %s (size=%zu, head=", Mix_GetError(), pd.buf.size());
+                    size_t n = std::min<size_t>(16, pd.buf.size());
+                    for (size_t i = 0; i < n; ++i) fprintf(stderr, "%02X ", pd.buf[i]);
+                    fprintf(stderr, ")\n");
+                    fprintf(stderr, "[audio] Mix_HasMusicDecoder(TIMIDITY)=%d, Mix_GetNumMusicDecoders=%d\n",
+                            Mix_HasMusicDecoder("TIMIDITY"), Mix_GetNumMusicDecoders());
+                    for (int i = 0; i < Mix_GetNumMusicDecoders(); ++i)
+                        fprintf(stderr, "[audio]   decoder[%d]=%s\n", i, Mix_GetMusicDecoder(i));
+                }
             } else {
                 pd.chunk = Mix_LoadWAV_RW(pd.rw, 0);
                 if (!pd.chunk)
@@ -4023,9 +4045,15 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             PlayerData& pd = it->second;
             int loops = (pd.loop_count == -1) ? -1 : pd.loop_count - 1;
             if (pd.music) {
-                Mix_PlayMusic(pd.music, loops);
+                int rc = Mix_PlayMusic(pd.music, loops);
+                fprintf(stderr, "[audio] Mix_PlayMusic rc=%d err=%s vol=%d\n",
+                        rc, rc < 0 ? Mix_GetError() : "", Mix_VolumeMusic(-1));
             } else if (pd.chunk) {
                 pd.channel = Mix_PlayChannel(-1, pd.chunk, loops);
+                fprintf(stderr, "[audio] Mix_PlayChannel ch=%d vol=%d\n",
+                        pd.channel, Mix_Volume(pd.channel, -1));
+            } else {
+                fprintf(stderr, "[audio] Player.start but no music/chunk loaded\n");
             }
         });
 

@@ -19,6 +19,11 @@ namespace fs = std::filesystem;
 #include <emscripten.h>
 #endif
 
+#ifdef __ANDROID__
+extern "C" int j2me_android_bootstrap(const char* version_tag,
+                                      std::vector<std::string>& out_argv);
+#endif
+
 // Declared in interpreter.cpp — set true to trace every opcode
 extern bool g_trace;
 
@@ -143,6 +148,25 @@ int main(int argc, char* argv[]) {
     };
     argc = 4;
     argv = const_cast<char**>(kArgv);
+#endif
+
+#ifdef __ANDROID__
+    // SDLActivity hands us a synthetic argv — discard it and synthesize
+    // our own from assets/args.cfg after extracting bundled files into
+    // internal storage. `version_tag` gates re-extraction; bump it when
+    // bundled assets change (e.g. new keypad layout shipped).
+    static std::vector<std::string> kAndroidArgs;
+    static std::vector<const char*> kAndroidArgv;
+    int n = j2me_android_bootstrap("v1", kAndroidArgs);
+    if (n <= 0) {
+        std::cerr << "[android] bootstrap failed\n";
+        return 1;
+    }
+    kAndroidArgv.clear();
+    for (auto& s : kAndroidArgs) kAndroidArgv.push_back(s.c_str());
+    kAndroidArgv.push_back(nullptr);
+    argc = n;
+    argv = const_cast<char**>(kAndroidArgv.data());
 #endif
 
     // Split args into positional (jar, class, WxH) and option flags. Keeps

@@ -17,7 +17,7 @@
 // before the game's pointer handler: any Press is consumed (the midp code
 // is enqueued) and never reaches the game.
 
-#include <SDL2/SDL.h>
+#include <SDL.h>
 #include <string>
 #include <vector>
 

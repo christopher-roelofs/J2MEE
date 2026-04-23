@@ -1,7 +1,7 @@
 #include "overlay.hpp"
 
-#include <SDL2/SDL_image.h>
-#include <SDL2/SDL_ttf.h>
+#include <SDL_image.h>
+#include <SDL_ttf.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <vector>
 
 #include "json.hpp"
 
@@ -146,8 +147,10 @@ std::string button_slug(int midp_code) {
 }
 
 // Root directory that the runtime looks in for default button PNGs.
-// Searched in this order; first hit wins.
-const char* const kKeypadAssetRoots[] = {
+// Searched in this order; first hit wins. On Android we prepend the
+// runtime-resolved extracted-asset path (J2ME_ASSET_DIR from the
+// bootstrap in android_platform.cpp); see kKeypadAssetRoots_storage.
+const char* const kKeypadAssetRootsStatic[] = {
     "runtime/assets/keypad/default",     // invoked from repo root
     "../assets/keypad/default",          // invoked from runtime/build/
     "assets/keypad/default",             // installed layout (cwd-relative)
@@ -156,12 +159,40 @@ const char* const kKeypadAssetRoots[] = {
 
 // Root directories the runtime scans for layout.json files. First match
 // wins; duplicate-named layouts in later dirs are silently skipped.
-const char* const kLayoutRoots[] = {
+const char* const kLayoutRootsStatic[] = {
     "runtime/assets/keypad/layouts",     // invoked from repo root
     "../assets/keypad/layouts",          // invoked from runtime/build/
     "assets/keypad/layouts",             // installed layout (cwd-relative)
     "/fonts/keypad/layouts",             // emscripten MEMFS (future use)
 };
+
+// Build the live search lists, prepending the Android extracted-asset
+// path when J2ME_ASSET_DIR is set. Called lazily so the env var set by
+// j2me_android_bootstrap is already live.
+static std::vector<std::string> build_roots(const char* const* base,
+                                            size_t base_n,
+                                            const char* subdir) {
+    std::vector<std::string> out;
+    if (const char* ad = std::getenv("J2ME_ASSET_DIR"))
+        out.push_back(std::string(ad) + "/keypad/" + subdir);
+    for (size_t i = 0; i < base_n; ++i) out.emplace_back(base[i]);
+    return out;
+}
+
+static const std::vector<std::string>& keypad_asset_roots() {
+    static const std::vector<std::string> v = build_roots(
+        kKeypadAssetRootsStatic,
+        sizeof(kKeypadAssetRootsStatic)/sizeof(kKeypadAssetRootsStatic[0]),
+        "default");
+    return v;
+}
+static const std::vector<std::string>& layout_roots() {
+    static const std::vector<std::string> v = build_roots(
+        kLayoutRootsStatic,
+        sizeof(kLayoutRootsStatic)/sizeof(kLayoutRootsStatic[0]),
+        "layouts");
+    return v;
+}
 
 bool dir_exists(const std::string& p) {
     struct stat st;
@@ -189,8 +220,8 @@ SDL_Surface* load_png_scaled(const std::string& layout_dir,
         src = IMG_Load(path);
     }
     if (!src) {
-        for (const char* root : kKeypadAssetRoots) {
-            std::snprintf(path, sizeof(path), "%s/%s.png", root, slug.c_str());
+        for (const std::string& root : keypad_asset_roots()) {
+            std::snprintf(path, sizeof(path), "%s/%s.png", root.c_str(), slug.c_str());
             src = IMG_Load(path);
             if (src) break;
         }
@@ -281,7 +312,7 @@ std::vector<LayoutDef> scan_layouts() {
     // merged — users who want to ship extra layouts drop them into the
     // primary one.
     std::string chosen_root;
-    for (const char* r : kLayoutRoots) {
+    for (const std::string& r : layout_roots()) {
         if (dir_exists(r)) { chosen_root = r; break; }
     }
     std::vector<LayoutDef> out;

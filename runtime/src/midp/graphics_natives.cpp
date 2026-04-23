@@ -3,9 +3,9 @@
 #include "vm/vm.hpp"
 #include "vm/heap.hpp"
 
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_image.h>
-#include <SDL2/SDL_ttf.h>
+#include <SDL.h>
+#include <SDL_image.h>
+#include <SDL_ttf.h>
 
 #include <cstring>
 #include <cmath>
@@ -59,6 +59,25 @@ static constexpr const char* FONT_BOLD_PATH   = "/fonts/DejaVuSans-Bold.ttf";
 static constexpr const char* FONT_MONO_PATH   = "/fonts/DejaVuSansMono.ttf";
 static constexpr const char* FONT_MONO_BOLD_PATH = "/fonts/DejaVuSansMono-Bold.ttf";
 static constexpr const char* FONT_CJK_PATH   = "/fonts/DejaVuSans.ttf";
+#elif defined(__ANDROID__)
+// Resolved at first use from J2ME_FONT_DIR (set by android_platform.cpp
+// after extracting bundled fonts to internal storage). std::string so the
+// backing storage outlives every TTF_OpenFont call, const char* wrappers
+// so the call sites stay unchanged.
+static const std::string& android_font(const char* name) {
+    static std::unordered_map<std::string, std::string> cache;
+    auto it = cache.find(name);
+    if (it != cache.end()) return it->second;
+    const char* dir = std::getenv("J2ME_FONT_DIR");
+    std::string path = (dir ? std::string(dir) + "/" : std::string())
+                     + name;
+    return cache.emplace(name, std::move(path)).first->second;
+}
+#define FONT_PATH           (android_font("DejaVuSans.ttf").c_str())
+#define FONT_BOLD_PATH      (android_font("DejaVuSans-Bold.ttf").c_str())
+#define FONT_MONO_PATH      (android_font("DejaVuSansMono.ttf").c_str())
+#define FONT_MONO_BOLD_PATH (android_font("DejaVuSansMono-Bold.ttf").c_str())
+#define FONT_CJK_PATH       (android_font("DejaVuSans.ttf").c_str())
 #else
 static constexpr const char* FONT_PATH       = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
 static constexpr const char* FONT_BOLD_PATH   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
@@ -133,6 +152,8 @@ TTF_Font* get_ttf_font(int px_size, bool bold, bool mono) {
 // it preloaded into MEMFS at /fonts/fa-solid-900.ttf (see CMakeLists).
 #ifdef __EMSCRIPTEN__
 static constexpr const char* FONT_ICON_PATH = "/fonts/fa-solid-900.ttf";
+#elif defined(__ANDROID__)
+#define FONT_ICON_PATH (android_font("fa-solid-900.ttf").c_str())
 #else
 static constexpr const char* FONT_ICON_PATH =
     "third_party/fontawesome/fa-solid-900.ttf";

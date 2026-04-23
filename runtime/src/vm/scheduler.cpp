@@ -1,7 +1,7 @@
 #include "scheduler.hpp"
 #include "vm.hpp"
 
-#include <SDL2/SDL.h>
+#include <SDL.h>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -13,6 +13,11 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #include <emscripten/fiber.h>
+#endif
+
+#ifdef __ANDROID__
+#include <pthread.h>
+#include <semaphore.h>
 #endif
 
 extern volatile std::sig_atomic_t g_quit_requested;
@@ -48,6 +53,16 @@ void ctx_swap_to(emscripten_fiber_t& from, emscripten_fiber_t& to) {
     emscripten_fiber_swap(&from, &to);
 }
 
+#elif defined(__ANDROID__)
+
+// Post the destination's semaphore to let it proceed, then block on our
+// own until someone posts us. Pairs of threads are always sym­metric:
+// exactly one runs at a time.
+void ctx_swap_to(sem_t& from, sem_t& to) {
+    sem_post(&to);
+    while (sem_wait(&from) == -1 && errno == EINTR) {}
+}
+
 #else
 
 void ctx_swap_to(ucontext_t& from, ucontext_t& to) {
@@ -61,7 +76,14 @@ void ctx_swap_to(ucontext_t& from, ucontext_t& to) {
 // ─── JavaThread ──────────────────────────────────────────────────────────────
 
 JavaThread::~JavaThread() {
+#ifdef __ANDROID__
+    // Detached pthread — its stack is managed by the C library, not by us.
+    // The semaphore is intentionally not destroyed: if the thread is still
+    // blocked on it at scheduler tear-down, sem_destroy would be UB. Let
+    // the kernel reap everything at process exit.
+#else
     if (stack) munmap(stack, stack_size);
+#endif
 }
 
 // ─── Scheduler ───────────────────────────────────────────────────────────────
@@ -89,7 +111,7 @@ JavaThread* g_thread_entry_bootstrap = nullptr;
 // (one per process), so a plain global is fine.
 static Scheduler* g_scheduler = nullptr;
 
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
 void Scheduler::thread_entry(uint32_t /*hi*/, uint32_t /*lo*/) {
     // Runs on the new thread's C stack. The Scheduler instance is accessed
     // through VM's global storage — we trust it survives until all threads
@@ -111,6 +133,37 @@ void Scheduler::thread_entry(uint32_t /*hi*/, uint32_t /*lo*/) {
     self->state = JavaThread::State::Dead;
     // uc_link will swap back to m_scheduler_ctx automatically.
 }
+#elif defined(__ANDROID__)
+// Android: each JavaThread runs as a real pthread, gated by its resume
+// semaphore so only one thread ever executes Java code at a time. This
+// mirrors the cooperative model enforced elsewhere by ucontext/Asyncify.
+void Scheduler::thread_entry(uint32_t, uint32_t) {
+    // Unused on Android — pthread entry goes through android_thread_main.
+}
+
+namespace {
+void* android_thread_main(void* arg) {
+    auto* self = static_cast<JavaThread*>(arg);
+    // Block until the scheduler posts our semaphore for the first time.
+    while (sem_wait(&self->ctx) == -1 && errno == EINTR) {}
+    try {
+        if (self->entry) self->entry();
+    } catch (const QuitRequest&) {
+        g_quit_requested = 1;
+    } catch (const JvmException& e) {
+        fprintf(stderr, "[thread] uncaught JvmException: %s%s%s\n",
+                e.message.c_str(),
+                e.location.empty() ? "" : " at ",
+                e.location.c_str());
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[thread] C++ exception: %s\n", e.what());
+    }
+    self->state = JavaThread::State::Dead;
+    // Hand control back to the scheduler thread.
+    sem_post(&g_scheduler->scheduler_sem());
+    return nullptr;
+}
+} // namespace
 #else
 // Emscripten fiber entry runs on the fiber's stack; fibers have no automatic
 // "return to parent" link, so the thunk must explicitly swap back to the
@@ -155,15 +208,37 @@ JavaThread* Scheduler::spawn(ObjRef java_ref, std::function<void()> entry) {
     thr->java_ref = java_ref;
     thr->entry    = std::move(entry);
 
+#ifdef __ANDROID__
+    // pthread manages its own stack; we record kStackSize so
+    // pthread_attr_setstacksize picks it up below.
+    thr->stack      = nullptr;
+    thr->stack_size = kStackSize;
+#else
     thr->stack = static_cast<uint8_t*>(mmap(
         nullptr, kStackSize, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0));
     if (thr->stack == MAP_FAILED)
         throw std::runtime_error(std::string("scheduler: mmap stack: ") + std::strerror(errno));
     thr->stack_size = kStackSize;
+#endif
 
 #ifdef __EMSCRIPTEN__
     ctx_make(*thr);
+#elif defined(__ANDROID__)
+    // Detached pthread so we never need to pthread_join — the C library
+    // frees the stack when the thread returns. The semaphore starts at 0
+    // so the thread blocks until ctx_swap_to posts it.
+    if (sem_init(&thr->ctx, /*pshared=*/0, /*value=*/0) != 0)
+        throw std::runtime_error(std::string("scheduler: sem_init: ") + std::strerror(errno));
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, thr->stack_size);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&thr->thread, &attr, android_thread_main, thr.get());
+    pthread_attr_destroy(&attr);
+    if (rc != 0)
+        throw std::runtime_error(std::string("scheduler: pthread_create: ") + std::strerror(rc));
+    thr->started = true;
 #else
     if (getcontext(&thr->ctx) != 0)
         throw std::runtime_error("scheduler: getcontext failed");
@@ -213,6 +288,12 @@ void Scheduler::run_to_completion() {
             &m_scheduler_ctx,
             m_scheduler_asyncify_stack.data(),
             m_scheduler_asyncify_stack.size());
+        m_scheduler_ctx_inited = true;
+    }
+#elif defined(__ANDROID__)
+    g_scheduler = this;
+    if (!m_scheduler_ctx_inited) {
+        sem_init(&m_scheduler_ctx, 0, 0);
         m_scheduler_ctx_inited = true;
     }
 #endif

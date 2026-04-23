@@ -1,0 +1,14 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+app/.cxx/
+app/jni/SDL/
+app/jni/SDL_image/
+app/jni/SDL_ttf/
+app/jni/SDL_mixer/
+# Game JARs are third-party content users bring themselves — never commit.
+# prepare_assets.sh regenerates manifest.txt on every run, so any JAR
+# dropped into games/ is picked up automatically.
+app/src/main/assets/games/*.jar
