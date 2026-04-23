@@ -121,6 +121,35 @@ an `IOException`.
 To re-enable the override flag mechanism: this is keyed on the presence of
 `VservManager.class` in the jar — no per-game configuration needed.
 
+### JAMDAT custom PNG format (Bejeweled 2007, Tetris Pop, …)
+
+Mid-2000s JAMDAT / EA Mobile titles pack their sprite sheets as PNGs that
+libpng rejects outright with `invalid chunk type: [00][0D]IH`. It looks
+like a PNG — the 8-byte signature is standard — but the immediate layout
+diverges:
+
+| Bytes | Standard PNG | JAMDAT |
+| ----- | ------------ | ------ |
+| 0x08–0x0B | IHDR length (`00 00 00 0D`) | Fixed marker `00 C0 00 80` |
+| 0x0C–… | IHDR type + data | **2-byte** length + 4-byte type + data + **2-byte** truncated CRC (top 2 bytes of the real CRC32 only) |
+| subsequent chunks | standard length/type/data/CRC | standard PNG, but with a **variable trailer** — either 4 bytes (real CRC) or 6 bytes (CRC + 2 bytes padding, seen between IDAT → IEND) |
+| tail | 12-byte IEND chunk | No proper IEND; file ends with "JAMDAT marker + IEND type", no CRC |
+
+`load_png_from_bytes` in `runtime/src/midp/graphics_natives.cpp` detects
+the format by the 12-byte header signature and runs `repair_jamdat_png`
+before handing bytes to libpng. The repair:
+
+1. Rebuilds IHDR from its 13 data bytes with a real CRC32 (via zlib).
+2. Scans the rest for known chunk types (PLTE, tRNS, IDAT, IEND, gAMA, …);
+   for each, picks trailer size 4 or 6 by whichever makes the stored CRC
+   verify — that tells us where the data ends.
+3. Appends a fresh standard IEND.
+
+Standard PNGs take a zero-cost early-out (signature check misses at byte
+0x08). Heads-up: if you encounter a JAMDAT title that still fails, the
+marker may differ — dump the bytes with `J2ME_DUMP_PNGS=<dir>` and compare
+the first 12 against `{0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A, 0x00,0xC0,0x00,0x80}`.
+
 ### Stale RMS save files
 
 If a game appears to hang on a splash forever, it may be tripping over a
