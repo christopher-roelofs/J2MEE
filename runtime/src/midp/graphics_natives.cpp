@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
+#include <zlib.h>  // crc32 for JAMDAT PNG repair
 
 // ─── External state ──────────────────────────────────────────────────────────
 // Graphics objects draw into SDL surfaces.  The "main" graphics always draws
@@ -612,8 +613,104 @@ static void blit_image(SDL_Surface* dst, SDL_Surface* src,
 
 // ─── Image loading ────────────────────────────────────────────────────────────
 
+// JAMDAT-era games (Bejeweled 2007, Tetris Pop, etc.) pack PNGs in a custom
+// format that libpng rejects as "invalid chunk type". The format:
+//   - Standard 8-byte PNG magic
+//   - 4-byte JAMDAT header {0x00, 0xC0, 0x00, 0x80} (purpose unclear, possibly
+//     an encoder version marker — appears unchanged across titles)
+//   - IHDR in compact form: 2-byte length + 4-byte type + 13 data bytes +
+//     2-byte truncated CRC (only the high 2 bytes of the real CRC)
+//   - Subsequent chunks (PLTE, tRNS, IDAT, …) in STANDARD PNG format, but
+//     with a variable trailer — either 4 bytes (standard CRC) or 6 bytes
+//     (CRC + 2 bytes alignment padding, seen between IDAT→IEND)
+//   - No trailing IEND chunk; file ends with "JAMDAT header + IEND type"
+//
+// Conversion to standard PNG: rebuild IHDR, copy downstream chunks verbatim
+// (probing trailer size via CRC match), append a fresh IEND. The result is
+// byte-identical to what a standards-compliant encoder would emit.
+static bool looks_like_jamdat_png(const uint8_t* data, size_t len) {
+    static const uint8_t kMagic[12] = {
+        0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A, 0x00,0xC0,0x00,0x80 };
+    return len >= 32 && std::memcmp(data, kMagic, 12) == 0;
+}
+static std::vector<uint8_t> repair_jamdat_png(const uint8_t* in, size_t n) {
+    auto push_u32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back((x >> 24) & 0xFF); v.push_back((x >> 16) & 0xFF);
+        v.push_back((x >>  8) & 0xFF); v.push_back( x        & 0xFF);
+    };
+    auto push_chunk = [&](std::vector<uint8_t>& v, const char* type,
+                          const uint8_t* data, size_t dlen) {
+        push_u32(v, (uint32_t)dlen);
+        const uint8_t* t = (const uint8_t*)type;
+        v.insert(v.end(), t, t + 4);
+        v.insert(v.end(), data, data + dlen);
+        uLong c = crc32(0, t, 4);
+        c = crc32(c, data, (uInt)dlen);
+        push_u32(v, (uint32_t)c);
+    };
+
+    std::vector<uint8_t> out;
+    out.reserve(n + 8);
+    out.insert(out.end(), in, in + 8);            // PNG magic
+    if (n < 0x1F) return {};
+    push_chunk(out, "IHDR", in + 0x12, 13);       // rebuild IHDR from its 13 data bytes
+
+    // Find and copy subsequent chunks by scanning type signatures.
+    static const char* kChunkTypes[] = {
+        "PLTE", "tRNS", "IDAT", "gAMA", "cHRM", "bKGD",
+        "pHYs", "sRGB", "iCCP", "tEXt", "zTXt",
+    };
+    struct Hit { size_t pos; const char* type; };
+    std::vector<Hit> hits;
+    for (const char* t : kChunkTypes) {
+        for (size_t i = 0x21; i + 4 <= n; ++i) {
+            if (std::memcmp(in + i, t, 4) == 0) hits.push_back({i, t});
+        }
+    }
+    std::sort(hits.begin(), hits.end(),
+              [](const Hit& a, const Hit& b) { return a.pos < b.pos; });
+
+    for (size_t k = 0; k < hits.size(); ++k) {
+        size_t data_start = hits[k].pos + 4;
+        size_t next_pos   = (k + 1 < hits.size()) ? hits[k+1].pos : n;
+        // Try trailer sizes 4 (standard CRC) and 6 (CRC + 2 padding). Pick
+        // whichever yields a CRC that matches the stored value.
+        size_t chosen_len = 0; bool ok = false;
+        for (int trailer : {4, 6}) {
+            long long length = (long long)next_pos - trailer - 4 - (long long)data_start;
+            if (length < 0 || (size_t)data_start + length + 4 > n) continue;
+            uint32_t stored = ((uint32_t)in[data_start + length]     << 24) |
+                              ((uint32_t)in[data_start + length + 1] << 16) |
+                              ((uint32_t)in[data_start + length + 2] <<  8) |
+                              ((uint32_t)in[data_start + length + 3]);
+            uLong c = crc32(0, (const uint8_t*)hits[k].type, 4);
+            c = crc32(c, in + data_start, (uInt)length);
+            if (stored == (uint32_t)c) { chosen_len = (size_t)length; ok = true; break; }
+        }
+        if (!ok) {
+            // CRC doesn't verify either way — fall back to next_pos - 8.
+            long long length = (long long)next_pos - 8 - (long long)data_start;
+            if (length < 0) length = 0;
+            chosen_len = (size_t)length;
+        }
+        push_chunk(out, hits[k].type, in + data_start, chosen_len);
+    }
+    push_chunk(out, "IEND", nullptr, 0);
+    return out;
+}
+
 // Load PNG bytes → SDL_Surface (ARGB8888)
 static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
+    // JAMDAT's custom PNG format (Bejeweled / Tetris Pop / etc.) fails libpng's
+    // chunk validator. Repair it to standard PNG before decoding. Detection is
+    // exact — harmless false positives are impossible because the signature is
+    // an invalid standard-PNG chunk length anyway.
+    std::vector<uint8_t> repaired;
+    if (looks_like_jamdat_png(data, len)) {
+        repaired = repair_jamdat_png(data, len);
+        if (!repaired.empty()) { data = repaired.data(); len = repaired.size(); }
+    }
+
     SDL_RWops* rw = SDL_RWFromConstMem(data, static_cast<int>(len));
     if (!rw) return nullptr;
     SDL_Surface* raw = IMG_Load_RW(rw, 1);  // 1 = auto-close

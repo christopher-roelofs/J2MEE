@@ -332,6 +332,53 @@ int main(int argc, char* argv[]) {
             vm.register_noop("VservManager", "showAtEnd", "()V",
                 "ad-network hook; we never display ads",
                 [](VM&, Frame&, std::span<Slot>) {});
+            vm.register_noop("VservManager", "show", "()V",
+                "ad-network hook; we never display ads",
+                [](VM&, Frame&, std::span<Slot>) {});
+            // 365 Puzzle Club's VservManager kicks off a Runnable background
+            // thread from Canvas.showNotify() that dereferences the internal
+            // Hashtable/Thread fields our <init> bypass never populated (it
+            // replaces the constructor body whole). NPE at VservManager.a@13
+            // is that thread pulling `notify-once` out of a null config map.
+            // Turning run() into a no-op kills the ad-fetch Runnable body;
+            // the `a(…)` overloads below cover every helper the background
+            // code path might still reach through other entry points (paint,
+            // keyPressed, Timer callbacks etc.).
+            // register_native (not register_noop) because VservManager ships
+            // bytecode for all of these — FillGap binding would be ignored.
+            // register_native flips the NATIVE access flag on the existing
+            // method so dispatch lands on our empty lambda.
+            //
+            // VservManager has a dozen+ obfuscated helpers named a/b/c/etc.
+            // The ad-fetch thread (365 Puzzle) walks through several of them,
+            // so rather than enumerate every signature we iterate the loaded
+            // ClassDef and no-op every method whose name is a single letter
+            // other than constructors and the public entrypoints we want to
+            // keep reachable (showAtStart/show/showAtEnd handled separately).
+            if (ClassDef* vsm = vm.loader().find("VservManager")) {
+                for (MethodDef& md : vsm->methods) {
+                    if (md.name == "<init>" || md.name == "<clinit>") continue;
+                    if (md.name == "showAtStart" || md.name == "showAtEnd" ||
+                        md.name == "show" || md.name == "paint" ||
+                        md.name == "hideNotify" || md.name == "showNotify") continue;
+                    if (md.name.size() != 1 && md.name != "run") continue;
+                    // Push a zero/null of the right type so non-void helpers
+                    // (e.g. VservManager.a(String)String) keep the caller's
+                    // stack balanced.
+                    auto ret = md.ret_type;
+                    vm.register_native("VservManager", md.name, md.descriptor,
+                        [ret](VM&, Frame& f, std::span<Slot>) {
+                            switch (ret) {
+                                case MethodDef::RetType::Int:    f.push_int(0);       break;
+                                case MethodDef::RetType::Long:   f.push_long(0);      break;
+                                case MethodDef::RetType::Float:  f.push_float(0.0f);  break;
+                                case MethodDef::RetType::Double: f.push_double(0.0);  break;
+                                case MethodDef::RetType::Ref:    f.push_ref(NULL_REF);break;
+                                default: break;  // Void
+                            }
+                        });
+                }
+            }
         }
 
         if (!quiet) std::cout << "Starting MIDlet: " << pos[1] << "\n";
