@@ -586,6 +586,25 @@ void register_natives(VM& vm, const JarFile& jar) {
             g_streams.erase(args[0].as_ref());
         });
 
+    // available() returns bytes remaining. Galaxy on Fire's asset loader
+    // uses this to allocate a `new byte[in.available()]` and then read into
+    // it; returning 0 (the default stub) made the game read zero bytes,
+    // decide the file was empty, retry from the top, and cycle forever on
+    // items/stations/ships.txt + the logo PNGs. Covering both InputStream
+    // and DataInputStream with the same body because the stream ref is the
+    // same entry in g_streams regardless of wrapper.
+    auto stream_available = [](VM&, Frame& f, std::span<Slot> args) {
+        auto it = g_streams.find(args[0].as_ref());
+        int remaining = 0;
+        if (it != g_streams.end()) {
+            auto& s = it->second;
+            remaining = std::max<int>(0, (int)s.data.size() - s.pos);
+        }
+        f.push_int(remaining);
+    };
+    vm.register_native("java/io/InputStream",     "available", "()I", stream_available);
+    vm.register_native("java/io/DataInputStream", "available", "()I", stream_available);
+
     vm.register_native("java/io/DataInputStream", "<init>",
         "(Ljava/io/InputStream;)V",
         [](VM&, Frame&, std::span<Slot> args) {
