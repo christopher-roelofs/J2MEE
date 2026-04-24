@@ -21,8 +21,9 @@ void register_graphics_natives(VM& vm, const JarFile& jar);
 
 // Register M3G (JSR-184) native bridge. Routes javax/microedition/m3g/*
 // methods through to the vendored Khronos M3G core (third_party/m3g).
+// The jar reference is used by Loader.load(String) to fetch .m3g resources.
 // Call after register_natives() / register_graphics_natives().
-void register_m3g_natives(VM& vm);
+void register_m3g_natives(VM& vm, const JarFile& jar);
 
 // Register LCDUI form/textfield/textbox/StringItem/Item native impls.
 // State-only (no visual rendering of Form items yet — that needs full

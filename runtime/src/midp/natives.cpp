@@ -482,7 +482,16 @@ void register_natives(VM& vm, const JarFile& jar) {
             std::string name = v.string_value(args[0].as_ref());
             std::replace(name.begin(), name.end(), '.', '/');
             ClassDef* klass = v.loader().find(name);
-            if (!klass || klass->source == nullptr) {
+            // Stubs (no source file parsed) are legitimate for framework
+            // classes whose impl is entirely native — java/lang/Class,
+            // java/lang/Thread, every javax.microedition.* that we handle via
+            // register_native. Throwing ClassNotFoundException on those broke
+            // Galaxy on Fire, which calls Class.forName("java.lang.Class") as
+            // a cheap "do we have a real JVM" probe during boot. Accept any
+            // ClassDef the runtime has registered — the caller only gets a
+            // reflective handle and real method lookup still goes through
+            // the normal invokevirtual path.
+            if (!klass) {
                 ClassDef* exk = v.loader().find_or_stub("java/lang/ClassNotFoundException");
                 ObjRef ex = v.heap().alloc_object(exk, 0);
                 throw JvmException{ex, "ClassNotFoundException: " + name, {}};

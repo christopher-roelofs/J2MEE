@@ -10,6 +10,6 @@
 
 #include "natives.hpp"
 
-void register_m3g_natives(VM& /*vm*/) {
+void register_m3g_natives(VM& /*vm*/, const JarFile& /*jar*/) {
     // no-op: M3G is unavailable in this build
 }

@@ -79,7 +79,81 @@ void create_into(ObjRef self, Factory factory) {
     if (s_enabled_##__LINE__) std::fprintf(stderr, "[m3g] " what "\n"); \
 } while(0)
 
-void register_m3g_natives(VM& vm) {
+// Map an M3G class enum (from m3gGetClass) to its JSR-184 Java class name.
+// Loader.load returns a heterogeneous Object3D[]; each element's dynamic
+// Java type has to match the underlying M3G object so game code can
+// downcast it (e.g. `(Mesh)loaded[3]`).
+static const char* m3g_java_class_for(M3GClass c) {
+    switch (c) {
+        case M3G_CLASS_ANIMATION_CONTROLLER: return "javax/microedition/m3g/AnimationController";
+        case M3G_CLASS_ANIMATION_TRACK:      return "javax/microedition/m3g/AnimationTrack";
+        case M3G_CLASS_APPEARANCE:           return "javax/microedition/m3g/Appearance";
+        case M3G_CLASS_BACKGROUND:           return "javax/microedition/m3g/Background";
+        case M3G_CLASS_CAMERA:               return "javax/microedition/m3g/Camera";
+        case M3G_CLASS_COMPOSITING_MODE:     return "javax/microedition/m3g/CompositingMode";
+        case M3G_CLASS_FOG:                  return "javax/microedition/m3g/Fog";
+        case M3G_CLASS_GROUP:                return "javax/microedition/m3g/Group";
+        case M3G_CLASS_IMAGE:                return "javax/microedition/m3g/Image2D";
+        case M3G_CLASS_INDEX_BUFFER:         return "javax/microedition/m3g/TriangleStripArray";
+        case M3G_CLASS_KEYFRAME_SEQUENCE:    return "javax/microedition/m3g/KeyframeSequence";
+        case M3G_CLASS_LIGHT:                return "javax/microedition/m3g/Light";
+        case M3G_CLASS_MATERIAL:             return "javax/microedition/m3g/Material";
+        case M3G_CLASS_MESH:                 return "javax/microedition/m3g/Mesh";
+        case M3G_CLASS_MORPHING_MESH:        return "javax/microedition/m3g/MorphingMesh";
+        case M3G_CLASS_POLYGON_MODE:         return "javax/microedition/m3g/PolygonMode";
+        case M3G_CLASS_SKINNED_MESH:         return "javax/microedition/m3g/SkinnedMesh";
+        case M3G_CLASS_SPRITE:               return "javax/microedition/m3g/Sprite3D";
+        case M3G_CLASS_TEXTURE:              return "javax/microedition/m3g/Texture2D";
+        case M3G_CLASS_VERTEX_ARRAY:         return "javax/microedition/m3g/VertexArray";
+        case M3G_CLASS_VERTEX_BUFFER:        return "javax/microedition/m3g/VertexBuffer";
+        case M3G_CLASS_WORLD:                return "javax/microedition/m3g/World";
+        default:                             return "javax/microedition/m3g/Object3D";
+    }
+}
+
+// Feed `data` (a .m3g byte stream) through a fresh M3GLoader, import the
+// loaded objects into the main interface, and build a Java Object3D[]
+// whose element types mirror each underlying M3G class. Returns NULL_REF
+// on any failure (game treats null-element array as empty).
+static ObjRef m3g_loader_load(VM& v, const uint8_t* data, size_t len) {
+    M3GInterface itf = j2me_m3g_interface();
+    ClassDef* arr_klass = v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;");
+    if (!itf) return v.heap().alloc_ref_array(0, arr_klass);
+
+    M3GLoader loader = m3gCreateLoader(itf);
+    if (!loader) return v.heap().alloc_ref_array(0, arr_klass);
+
+    // Feed bytes in one chunk. m3gDecodeData returns bytes consumed; loop
+    // until all consumed or zero-progress (malformed / truncated stream).
+    M3Gsizei offset = 0;
+    while (offset < (M3Gsizei)len) {
+        M3Gsizei n = m3gDecodeData(loader, (M3Gsizei)len - offset, data + offset);
+        if (n <= 0) break;
+        offset += n;
+    }
+
+    M3Gint count = m3gGetLoadedObjects(loader, nullptr);
+    if (count <= 0) return v.heap().alloc_ref_array(0, arr_klass);
+
+    std::vector<M3Gulong> refs((size_t)count);
+    m3gGetLoadedObjects(loader, refs.data());
+    m3gImportObjects(loader, count, refs.data());
+
+    ObjRef arr = v.heap().alloc_ref_array(count, arr_klass);
+    HeapObject* arr_obj = v.heap().deref(arr);
+    if (!arr_obj) return v.heap().alloc_ref_array(0, arr_klass);
+    for (M3Gint i = 0; i < count; ++i) {
+        auto obj = (M3GObject)(uintptr_t)refs[i];
+        M3GClass cls = m3gGetClass(obj);
+        ClassDef* jcls = v.loader().find_or_stub(m3g_java_class_for(cls));
+        ObjRef jref = v.heap().alloc_object(jcls, 0);
+        store_handle(jref, (uintptr_t)obj);
+        arr_obj->array_slots()[i] = Slot::from_ref(jref);
+    }
+    return arr;
+}
+
+void register_m3g_natives(VM& vm, const JarFile& jar) {
 
     // ── Graphics3D ────────────────────────────────────────────────────────────
     // Singleton — getInstance() always returns the same Java object backed
@@ -846,12 +920,24 @@ void register_m3g_natives(VM& vm) {
     // that allocates a Mesh handle without backing geometry. Games typically
     // build the rest of the scene anyway and don't immediately render the
     // mesh visibly.
-    vm.register_stub("javax/microedition/m3g/Mesh",
-        "<init>",
+    // Single-submesh Mesh constructor. Same m3gCreateMesh call as the 4-arg
+    // version but with 1-element IndexBuffer/Appearance arrays. Galaxy on
+    // Fire builds its 3D objects procedurally through this form rather than
+    // loading .m3g files, so leaving it as a stub left every Mesh in the
+    // scene tree geometry-less and every subsequent .getVertexBuffer() or
+    // World.render() path NPE'd downstream.
+    vm.register_native("javax/microedition/m3g/Mesh", "<init>",
         "(Ljavax/microedition/m3g/VertexBuffer;Ljavax/microedition/m3g/IndexBuffer;Ljavax/microedition/m3g/Appearance;)V",
-        "Mesh constructor — geometry not bound (would need m3gCreateMesh "
-        "with patch arrays); Mesh exists but renders empty",
-        [](VM&, Frame&, std::span<Slot>) {});
+        [](VM&, Frame&, std::span<Slot> args) {
+            M3GInterface itf = j2me_m3g_interface();
+            if (!itf) return;
+            M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[1].as_ref());
+            if (!vb) return;
+            M3Gulong ib = (M3Gulong)handle_for<M3GIndexBuffer>(args[2].as_ref());
+            M3Gulong ap = (M3Gulong)handle_for<M3GAppearance>(args[3].as_ref());
+            M3GMesh m = m3gCreateMesh(itf, vb, &ib, &ap, 1);
+            if (m) store_handle(args[0].as_ref(), (uintptr_t)m);
+        });
     vm.register_native("javax/microedition/m3g/Mesh",
         "getAppearance", "(I)Ljavax/microedition/m3g/Appearance;",
         [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
@@ -860,22 +946,41 @@ void register_m3g_natives(VM& vm) {
         [](VM&, Frame&, std::span<Slot>) {});
 
     // ── Loader ──────────────────────────────────────────────────────────────
-    // m3gCreateLoader + the streaming loader needs reading the input stream
-    // through M3G's beginRender hook. Stub returns empty array — game treats
-    // it as "no objects loaded" and falls through.
-    vm.register_stub("javax/microedition/m3g/Loader",
+    // Feed .m3g model bytes through the vendored Khronos loader (m3gCreateLoader
+    // → m3gDecodeData → m3gGetLoadedObjects → m3gImportObjects) and wrap each
+    // imported M3G object in a Java ObjRef of the right concrete subclass.
+    // Galaxy on Fire ships 26 .m3g files it loads via Loader.load(String).
+    vm.register_native("javax/microedition/m3g/Loader",
         "load", "(Ljava/lang/String;)[Ljavax/microedition/m3g/Object3D;",
-        "Loader.load(String) — not wired to JAR resource reader; empty array",
-        [](VM& v, Frame& f, std::span<Slot>) {
-            f.push_ref(v.heap().alloc_ref_array(0,
-                v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;")));
+        [&jar](VM& v, Frame& f, std::span<Slot> args) {
+            M3G_TRACE("Loader.load(String)");
+            std::string name = v.string_value(args[0].as_ref());
+            std::string path = jar.resolve(name);
+            if (path.empty()) {
+                fprintf(stderr, "[m3g] Loader.load: not in JAR: %s\n", name.c_str());
+                f.push_ref(v.heap().alloc_ref_array(0,
+                    v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;")));
+                return;
+            }
+            const auto& bytes = jar.get(path);
+            f.push_ref(m3g_loader_load(v, bytes.data(), bytes.size()));
         });
-    vm.register_stub("javax/microedition/m3g/Loader",
+    vm.register_native("javax/microedition/m3g/Loader",
         "load", "([BI)[Ljavax/microedition/m3g/Object3D;",
-        "Loader.load(byte[],int) — same; empty array",
-        [](VM& v, Frame& f, std::span<Slot>) {
-            f.push_ref(v.heap().alloc_ref_array(0,
-                v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;")));
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            M3G_TRACE("Loader.load(byte[],int)");
+            ObjRef arr_ref = args[0].as_ref();
+            int offset = args[1].as_int();
+            HeapObject* arr = v.heap().deref(arr_ref);
+            if (!arr || offset < 0) {
+                f.push_ref(v.heap().alloc_ref_array(0,
+                    v.loader().find_or_stub("[Ljavax/microedition/m3g/Object3D;")));
+                return;
+            }
+            const uint8_t* data = arr->array_bytes() + offset;
+            size_t len = arr->array_length() > offset
+                       ? (size_t)arr->array_length() - (size_t)offset : 0;
+            f.push_ref(m3g_loader_load(v, data, len));
         });
 
     // ── Object3D.animate / duplicate ────────────────────────────────────────
