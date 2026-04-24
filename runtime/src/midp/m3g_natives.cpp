@@ -35,8 +35,11 @@ extern bool         j2me_m3g_make_current();
 namespace {
 
 // One handle map covers every M3G class — we pun the M3G handles to a
-// uintptr_t for storage.
+// uintptr_t for storage. Reverse map lets getters that return Image2D /
+// VertexBuffer / … rebuild the right Java ObjRef from a C handle
+// (m3gGetTextureImage etc.) without allocating new wrappers each call.
 std::unordered_map<ObjRef, uintptr_t> g_m3g_handles;
+std::unordered_map<uintptr_t, ObjRef> g_m3g_rev;
 
 template <typename Handle>
 Handle handle_for(ObjRef ref) {
@@ -46,6 +49,64 @@ Handle handle_for(ObjRef ref) {
 
 void store_handle(ObjRef ref, uintptr_t h) {
     g_m3g_handles[ref] = h;
+    if (h) g_m3g_rev[h] = ref;
+}
+
+ObjRef ref_for_handle(uintptr_t h) {
+    if (!h) return NULL_REF;
+    auto it = g_m3g_rev.find(h);
+    return it == g_m3g_rev.end() ? NULL_REF : it->second;
+}
+
+// Same as ref_for_handle, but lazily builds a Java wrapper of the right
+// concrete type when the handle hasn't been seen before. Used by getters
+// like Texture2D.getImage — the loader creates the inner Image2D inside
+// m3gCreateTexture without the game ever constructing it in Java, so our
+// reverse map is empty until the game asks for it back.
+// Map an M3G class enum (from m3gGetClass) to its JSR-184 Java class name.
+// Loader.load returns a heterogeneous Object3D[]; each element's dynamic
+// Java type has to match the underlying M3G object so game code can
+// downcast it (e.g. `(Mesh)loaded[3]`). Also used by ref_for_handle_or_wrap
+// to allocate the right concrete wrapper for handles first seen via
+// getter returns (Texture2D.getImage etc.).
+const char* m3g_java_class_for(M3GClass c) {
+    switch (c) {
+        case M3G_CLASS_ANIMATION_CONTROLLER: return "javax/microedition/m3g/AnimationController";
+        case M3G_CLASS_ANIMATION_TRACK:      return "javax/microedition/m3g/AnimationTrack";
+        case M3G_CLASS_APPEARANCE:           return "javax/microedition/m3g/Appearance";
+        case M3G_CLASS_BACKGROUND:           return "javax/microedition/m3g/Background";
+        case M3G_CLASS_CAMERA:               return "javax/microedition/m3g/Camera";
+        case M3G_CLASS_COMPOSITING_MODE:     return "javax/microedition/m3g/CompositingMode";
+        case M3G_CLASS_FOG:                  return "javax/microedition/m3g/Fog";
+        case M3G_CLASS_GROUP:                return "javax/microedition/m3g/Group";
+        case M3G_CLASS_IMAGE:                return "javax/microedition/m3g/Image2D";
+        case M3G_CLASS_INDEX_BUFFER:         return "javax/microedition/m3g/TriangleStripArray";
+        case M3G_CLASS_KEYFRAME_SEQUENCE:    return "javax/microedition/m3g/KeyframeSequence";
+        case M3G_CLASS_LIGHT:                return "javax/microedition/m3g/Light";
+        case M3G_CLASS_MATERIAL:             return "javax/microedition/m3g/Material";
+        case M3G_CLASS_MESH:                 return "javax/microedition/m3g/Mesh";
+        case M3G_CLASS_MORPHING_MESH:        return "javax/microedition/m3g/MorphingMesh";
+        case M3G_CLASS_POLYGON_MODE:         return "javax/microedition/m3g/PolygonMode";
+        case M3G_CLASS_SKINNED_MESH:         return "javax/microedition/m3g/SkinnedMesh";
+        case M3G_CLASS_SPRITE:               return "javax/microedition/m3g/Sprite3D";
+        case M3G_CLASS_TEXTURE:              return "javax/microedition/m3g/Texture2D";
+        case M3G_CLASS_VERTEX_ARRAY:         return "javax/microedition/m3g/VertexArray";
+        case M3G_CLASS_VERTEX_BUFFER:        return "javax/microedition/m3g/VertexBuffer";
+        case M3G_CLASS_WORLD:                return "javax/microedition/m3g/World";
+        default:                             return "javax/microedition/m3g/Object3D";
+    }
+}
+
+ObjRef ref_for_handle_or_wrap(VM& v, uintptr_t h) {
+    if (!h) return NULL_REF;
+    auto it = g_m3g_rev.find(h);
+    if (it != g_m3g_rev.end()) return it->second;
+    M3GClass cls = m3gGetClass((M3GObject)h);
+    ClassDef* jcls = v.loader().find_or_stub(m3g_java_class_for(cls));
+    ObjRef jref = v.heap().alloc_object(jcls, 0);
+    g_m3g_handles[jref] = h;
+    g_m3g_rev[h] = jref;
+    return jref;
 }
 
 // Process-wide singleton render context (one Graphics3D in MIDP)
@@ -78,38 +139,6 @@ void create_into(ObjRef self, Factory factory) {
     static bool s_enabled_##__LINE__ = (std::getenv("J2ME_TRACE_M3G") != nullptr); \
     if (s_enabled_##__LINE__) std::fprintf(stderr, "[m3g] " what "\n"); \
 } while(0)
-
-// Map an M3G class enum (from m3gGetClass) to its JSR-184 Java class name.
-// Loader.load returns a heterogeneous Object3D[]; each element's dynamic
-// Java type has to match the underlying M3G object so game code can
-// downcast it (e.g. `(Mesh)loaded[3]`).
-static const char* m3g_java_class_for(M3GClass c) {
-    switch (c) {
-        case M3G_CLASS_ANIMATION_CONTROLLER: return "javax/microedition/m3g/AnimationController";
-        case M3G_CLASS_ANIMATION_TRACK:      return "javax/microedition/m3g/AnimationTrack";
-        case M3G_CLASS_APPEARANCE:           return "javax/microedition/m3g/Appearance";
-        case M3G_CLASS_BACKGROUND:           return "javax/microedition/m3g/Background";
-        case M3G_CLASS_CAMERA:               return "javax/microedition/m3g/Camera";
-        case M3G_CLASS_COMPOSITING_MODE:     return "javax/microedition/m3g/CompositingMode";
-        case M3G_CLASS_FOG:                  return "javax/microedition/m3g/Fog";
-        case M3G_CLASS_GROUP:                return "javax/microedition/m3g/Group";
-        case M3G_CLASS_IMAGE:                return "javax/microedition/m3g/Image2D";
-        case M3G_CLASS_INDEX_BUFFER:         return "javax/microedition/m3g/TriangleStripArray";
-        case M3G_CLASS_KEYFRAME_SEQUENCE:    return "javax/microedition/m3g/KeyframeSequence";
-        case M3G_CLASS_LIGHT:                return "javax/microedition/m3g/Light";
-        case M3G_CLASS_MATERIAL:             return "javax/microedition/m3g/Material";
-        case M3G_CLASS_MESH:                 return "javax/microedition/m3g/Mesh";
-        case M3G_CLASS_MORPHING_MESH:        return "javax/microedition/m3g/MorphingMesh";
-        case M3G_CLASS_POLYGON_MODE:         return "javax/microedition/m3g/PolygonMode";
-        case M3G_CLASS_SKINNED_MESH:         return "javax/microedition/m3g/SkinnedMesh";
-        case M3G_CLASS_SPRITE:               return "javax/microedition/m3g/Sprite3D";
-        case M3G_CLASS_TEXTURE:              return "javax/microedition/m3g/Texture2D";
-        case M3G_CLASS_VERTEX_ARRAY:         return "javax/microedition/m3g/VertexArray";
-        case M3G_CLASS_VERTEX_BUFFER:        return "javax/microedition/m3g/VertexBuffer";
-        case M3G_CLASS_WORLD:                return "javax/microedition/m3g/World";
-        default:                             return "javax/microedition/m3g/Object3D";
-    }
-}
 
 // Feed `data` (a .m3g byte stream) through a fresh M3GLoader, import the
 // loaded objects into the main interface, and build a Java Object3D[]
@@ -340,8 +369,16 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
             M3GInterface itf = j2me_m3g_interface();
             if (!itf) return;
             M3GImage img = handle_for<M3GImage>(args[1].as_ref());
-            if (!img) return;
+            if (!img) {
+                if (std::getenv("J2ME_TRACE_M3G"))
+                    std::fprintf(stderr, "[m3g] Texture2D.<init> img_ref=%u has no M3G handle\n",
+                                 args[1].as_ref());
+                return;
+            }
             M3GTexture tex = m3gCreateTexture(itf, img);
+            if (std::getenv("J2ME_TRACE_M3G"))
+                std::fprintf(stderr, "[m3g] Texture2D.<init> self=%u img=%p -> tex=%p\n",
+                             args[0].as_ref(), (void*)img, (void*)tex);
             if (tex) store_handle(args[0].as_ref(), (uintptr_t)tex);
         });
     vm.register_native("javax/microedition/m3g/Texture2D",
@@ -714,10 +751,15 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
         });
 
     // ── Mesh.getVertexBuffer ────────────────────────────────────────────────
+    // Galaxy on Fire builds a Mesh then retrieves its VertexBuffer to call
+    // setPositions for per-frame geometry updates. Leaving this returning
+    // null caused `q.a@59` NPE in an inner render/setup loop — the bar
+    // "jittering" the user saw was the game retrying this path and dying.
     vm.register_native("javax/microedition/m3g/Mesh",
         "getVertexBuffer", "()Ljavax/microedition/m3g/VertexBuffer;",
-        [](VM&, Frame& f, std::span<Slot>) {
-            f.push_ref(NULL_REF);  // Mesh.<init> doesn't bind geometry yet
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            M3GMesh m = handle_for<M3GMesh>(args[0].as_ref());
+            f.push_ref(m ? ref_for_handle_or_wrap(v, (uintptr_t)m3gGetVertexBuffer(m)) : NULL_REF);
         });
 
     // ── Appearance.getCompositingMode ───────────────────────────────────────
@@ -1165,22 +1207,39 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
         "find", "(I)Ljavax/microedition/m3g/Object3D;",
         "World.find — handle→ObjRef reverse not modelled; null",
         [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
-    vm.register_stub("javax/microedition/m3g/World",
+    vm.register_native("javax/microedition/m3g/World",
         "getActiveCamera", "()Ljavax/microedition/m3g/Camera;",
-        "World.getActiveCamera — handle→ObjRef reverse not modelled; null",
-        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            M3GWorld w = handle_for<M3GWorld>(args[0].as_ref());
+            f.push_ref(w ? ref_for_handle_or_wrap(v, (uintptr_t)m3gGetActiveCamera(w)) : NULL_REF);
+        });
 
     // ── Texture2D.getImage ─────────────────────────────────────────────────
-    vm.register_stub("javax/microedition/m3g/Texture2D",
+    // Galaxy on Fire calls this during asset init — without a real handle
+    // round-trip the game got null, printStackTrace'd, then NPE'd on the
+    // next dereference of the "loaded" texture. When the texture was built
+    // by m3gCreateTexture inside Loader.load, the inner Image2D never had a
+    // Java wrapper; ref_for_handle_or_wrap lazily allocates one the first
+    // time the game asks.
+    vm.register_native("javax/microedition/m3g/Texture2D",
         "getImage", "()Ljavax/microedition/m3g/Image2D;",
-        "Texture2D.getImage — handle→ObjRef reverse not modelled; null",
-        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            M3GTexture t = handle_for<M3GTexture>(args[0].as_ref());
+            M3GImage img = t ? m3gGetTextureImage(t) : nullptr;
+            ObjRef result = img ? ref_for_handle_or_wrap(v, (uintptr_t)img) : NULL_REF;
+            if (std::getenv("J2ME_TRACE_M3G"))
+                std::fprintf(stderr, "[m3g] Texture2D.getImage tex_ref=%u tex=%p img=%p result_ref=%u\n",
+                             args[0].as_ref(), (void*)t, (void*)img, result);
+            f.push_ref(result);
+        });
 
     // ── Node.getParent ─────────────────────────────────────────────────────
-    vm.register_stub("javax/microedition/m3g/Node",
+    vm.register_native("javax/microedition/m3g/Node",
         "getParent", "()Ljavax/microedition/m3g/Node;",
-        "Node.getParent — handle→ObjRef reverse not modelled; null",
-        [](VM&, Frame& f, std::span<Slot>) { f.push_ref(NULL_REF); });
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            M3GNode n = handle_for<M3GNode>(args[0].as_ref());
+            f.push_ref(n ? ref_for_handle_or_wrap(v, (uintptr_t)m3gGetParent(n)) : NULL_REF);
+        });
 
     // ── Image2D.getWidth/getHeight ─────────────────────────────────────────
     vm.register_native("javax/microedition/m3g/Image2D",
