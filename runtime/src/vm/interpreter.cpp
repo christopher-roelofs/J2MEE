@@ -222,6 +222,12 @@ enum Opcode : uint8_t {
     // Reserved opcode range 0xCB..0xFD per JVMS; we only consume two.
     GETFIELD_QUICK  = 0xcb,
     PUTFIELD_QUICK  = 0xcc,
+    // Same operand format as the original (cp_idx); the QUICK forms skip
+    // the resolved_methods[] null-check and (for STATIC) the per-call
+    // initialize_class() path. Bytecode rewrite happens after the first
+    // successful execution of the slow form.
+    INVOKESTATIC_QUICK  = 0xcd,
+    INVOKESPECIAL_QUICK = 0xce,
 };
 
 // ─── Bytecode read helpers ────────────────────────────────────────────────────
@@ -445,6 +451,16 @@ void VM::exec_frame(Frame& f) {
                " sp=" + std::to_string(f.sp);
     };
 
+    // Throw a Java-catchable OutOfMemoryError. Bytecode catch handlers can
+    // intercept this; using std::runtime_error escapes the interpreter and
+    // aborts the VM, so games that legitimately catch OOM (asset loaders,
+    // image decoders) couldn't recover.
+    auto throw_oom = [&](const char* msg) {
+        ClassDef* exk = m_loader.find_or_stub("java/lang/OutOfMemoryError");
+        ObjRef ex = m_heap.alloc_object(exk, 0);
+        throw JvmException{ex, msg, {}};
+    };
+
     // ── Direct-threaded dispatch ──────────────────────────────────────────────
     // Opcode → label address table. Label addresses via GCC &&label extension.
     // Built lazily on first entry; thereafter fetch is a single indexed load +
@@ -616,6 +632,8 @@ void VM::exec_frame(Frame& f) {
         dispatch_table[PUTFIELD]  = &&L_PUTFIELD;
         dispatch_table[GETFIELD_QUICK] = &&L_GETFIELD_QUICK;
         dispatch_table[PUTFIELD_QUICK] = &&L_PUTFIELD_QUICK;
+        dispatch_table[INVOKESTATIC_QUICK]  = &&L_INVOKESTATIC_QUICK;
+        dispatch_table[INVOKESPECIAL_QUICK] = &&L_INVOKESPECIAL_QUICK;
         dispatch_table[INVOKESTATIC]    = &&L_INVOKESTATIC;
         dispatch_table[INVOKEVIRTUAL]   = &&L_INVOKEVIRTUAL;
         dispatch_table[INVOKEINTERFACE] = &&L_INVOKEVIRTUAL;
@@ -1172,10 +1190,33 @@ void VM::exec_frame(Frame& f) {
         }
 
         // ── Invocations ───────────────────────────────────────────────────────
+        // INVOKESTATIC has both a slow path (resolve + initialize_class) and
+        // a hot QUICK path. The first execution does the full resolve, then
+        // rewrites the call site to INVOKESTATIC_QUICK so subsequent passes
+        // skip the resolved_methods[] null-check and initialize_class()
+        // entirely (the class is guaranteed initialized after this point).
         L_INVOKESTATIC: {
-            auto [klass, md] = resolve_method(*cf_ptr, bc_u2(code, f.pc));
+            uint32_t op_pc = f.pc - 1;
+            uint16_t cp_idx = bc_u2(code, f.pc);
+            auto [klass, md] = resolve_method(*cf_ptr, cp_idx);
             f.pc += 2;
             initialize_class(klass);
+            // Only quicken AFTER initialize_class returns successfully —
+            // otherwise a class-init failure would leave a quickened call
+            // site that skips init forever.
+            code_w[op_pc] = INVOKESTATIC_QUICK;
+            uint32_t nslots = md->arg_slot_count;
+            do_invoke(*this, f, md, klass, nslots);
+            DISPATCH();
+        }
+        L_INVOKESTATIC_QUICK: {
+            // resolved_methods[cp_idx] is guaranteed populated — this opcode
+            // is only ever reached after the slow form ran successfully.
+            uint16_t cp_idx = bc_u2(code, f.pc);
+            auto& slot = cf_ptr->resolved_methods[cp_idx];
+            ClassDef* klass = slot.first;
+            MethodDef* md   = slot.second;
+            f.pc += 2;
             uint32_t nslots = md->arg_slot_count;
             do_invoke(*this, f, md, klass, nslots);
             DISPATCH();
@@ -1212,7 +1253,19 @@ void VM::exec_frame(Frame& f) {
             DISPATCH();
         }
         L_INVOKESPECIAL: {
+            uint32_t op_pc = f.pc - 1;
             auto [klass, md] = resolve_method(*cf_ptr, bc_u2(code, f.pc));
+            f.pc += 2;
+            uint32_t nslots = md->arg_slot_count + 1;
+            code_w[op_pc] = INVOKESPECIAL_QUICK;
+            do_invoke(*this, f, md, klass, nslots);
+            DISPATCH();
+        }
+        L_INVOKESPECIAL_QUICK: {
+            uint16_t cp_idx = bc_u2(code, f.pc);
+            auto& slot = cf_ptr->resolved_methods[cp_idx];
+            ClassDef* klass = slot.first;
+            MethodDef* md   = slot.second;
             f.pc += 2;
             uint32_t nslots = md->arg_slot_count + 1;
             do_invoke(*this, f, md, klass, nslots);
@@ -1249,7 +1302,7 @@ void VM::exec_frame(Frame& f) {
             else
                 arr = m_heap.alloc_prim_array(at, length,
                           m_loader.find_or_stub(arr_name));
-            if (arr == NULL_REF) throw std::runtime_error("OutOfMemoryError");
+            if (arr == NULL_REF) throw_oom("OutOfMemoryError: array allocation");
             f.push_ref(arr);
             DISPATCH();
         }
@@ -1259,7 +1312,7 @@ void VM::exec_frame(Frame& f) {
             int32_t length = f.pop_int();
             ObjRef arr = m_heap.alloc_ref_array(length,
                              m_loader.find_or_stub("[L" + elem->name + ";"));
-            if (arr == NULL_REF) throw std::runtime_error("OutOfMemoryError");
+            if (arr == NULL_REF) throw_oom("OutOfMemoryError: array allocation");
             f.push_ref(arr);
             DISPATCH();
         }

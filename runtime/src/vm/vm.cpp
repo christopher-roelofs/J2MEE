@@ -50,11 +50,25 @@ void VM::initialize_class(ClassDef* klass) {
 
 // ─── Object creation ──────────────────────────────────────────────────────────
 
+// Allocate a java.lang.OutOfMemoryError instance and wrap in a JvmException
+// so bytecode catch handlers can intercept (a plain std::runtime_error
+// blows past the interpreter's exception handling and aborts the VM).
+// Static class lookup uses find_or_stub so this works even without
+// java/lang/OutOfMemoryError loaded.
+[[noreturn]] static void throw_oom_static(VM& v, const char* msg) {
+    ClassDef* exk = v.loader().find_or_stub("java/lang/OutOfMemoryError");
+    // Allocate the exception itself directly via the heap to avoid a
+    // recursive new_object call. If that *also* OOMs, we have nothing
+    // left to do but bail with the C++ exception.
+    ObjRef ex = v.heap().alloc_object(exk, 0);
+    throw JvmException{ex, msg, {}};
+}
+
 ObjRef VM::new_object(ClassDef* klass) {
     initialize_class(klass);
     ObjRef ref = m_heap.alloc_object(klass, klass->instance_slot_count);
     if (ref == NULL_REF)
-        throw std::runtime_error("OutOfMemoryError: heap exhausted");
+        throw_oom_static(*this, "OutOfMemoryError: heap exhausted");
     return ref;
 }
 
@@ -69,7 +83,7 @@ ObjRef VM::new_string(const std::string& utf8) {
         static_cast<int32_t>(utf8.size()),
         m_loader.find_or_stub("[C"));
     if (char_arr == NULL_REF)
-        throw std::runtime_error("OutOfMemoryError");
+        throw_oom_static(*this, "OutOfMemoryError: char[] for new_string");
 
     HeapObject* arr = m_heap.deref(char_arr);
     uint16_t* chars = arr->array_shorts();
@@ -80,7 +94,7 @@ ObjRef VM::new_string(const std::string& utf8) {
     // (simplified layout — real java.lang.String has more, but games access
     // it only through String methods which we implement natively)
     ObjRef str = m_heap.alloc_object(m_string_class, 2);
-    if (str == NULL_REF) throw std::runtime_error("OutOfMemoryError");
+    if (str == NULL_REF) throw_oom_static(*this, "OutOfMemoryError: new_string");
 
     HeapObject* sobj = m_heap.deref(str);
     sobj->field(0) = Slot::from_ref(char_arr);
