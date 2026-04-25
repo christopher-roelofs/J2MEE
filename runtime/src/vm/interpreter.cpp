@@ -461,6 +461,22 @@ void VM::exec_frame(Frame& f) {
         throw JvmException{ex, msg, {}};
     };
 
+    // Verify an array index is in [0, length) for an already-non-null array.
+    // Negative or out-of-range indices used to silently corrupt memory or
+    // read past the end of the heap object's data; now throws the spec-
+    // mandated ArrayIndexOutOfBoundsException, which Java try/catch handles.
+    auto check_bounds = [&](HeapObject* obj, int32_t idx) {
+        int32_t len = obj->array_length();
+        if (__builtin_expect((uint32_t)idx >= (uint32_t)len, 0)) {
+            ClassDef* exk = m_loader.find_or_stub(
+                "java/lang/ArrayIndexOutOfBoundsException");
+            ObjRef ex = m_heap.alloc_object(exk, 0);
+            throw JvmException{ex,
+                "ArrayIndexOutOfBoundsException: index=" + std::to_string(idx) +
+                ", length=" + std::to_string(len), {}};
+        }
+    };
+
     // ── Direct-threaded dispatch ──────────────────────────────────────────────
     // Opcode → label address table. Label addresses via GCC &&label extension.
     // Built lazily on first entry; thereafter fetch is a single indexed load +
@@ -737,6 +753,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             f.push(obj->array_slots()[idx]);
             DISPATCH();
         }
@@ -745,6 +762,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             f.push_long(obj->array_longs()[idx]);
             DISPATCH();
         }
@@ -753,6 +771,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             f.push_ref(obj->array_slots()[idx].as_ref());
             DISPATCH();
         }
@@ -761,6 +780,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             f.push_int(static_cast<int8_t>(obj->array_bytes()[idx]));
             DISPATCH();
         }
@@ -769,6 +789,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             f.push_int(obj->array_shorts()[idx]);
             DISPATCH();
         }
@@ -777,6 +798,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             f.push_int(static_cast<int16_t>(obj->array_shorts()[idx]));
             DISPATCH();
         }
@@ -811,6 +833,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             obj->array_slots()[idx] = val;
             DISPATCH();
         }
@@ -820,6 +843,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             obj->array_longs()[idx] = val;
             DISPATCH();
         }
@@ -829,6 +853,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             obj->array_slots()[idx] = Slot::from_ref(val);
             DISPATCH();
         }
@@ -838,6 +863,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             obj->array_bytes()[idx] = static_cast<uint8_t>(val);
             DISPATCH();
         }
@@ -847,6 +873,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             obj->array_shorts()[idx] = static_cast<uint16_t>(val);
             DISPATCH();
         }
@@ -856,6 +883,7 @@ void VM::exec_frame(Frame& f) {
             ObjRef  arr = f.pop_ref();
             auto* obj = m_heap.deref(arr);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            check_bounds(obj, idx);
             obj->array_shorts()[idx] = static_cast<uint16_t>(val);
             DISPATCH();
         }
