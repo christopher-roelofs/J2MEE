@@ -1721,6 +1721,17 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             int offset = args[1].as_int(), length = args[2].as_int();
             HeapObject* obj = v.heap().deref(arr);
             if (!obj) { f.push_ref(NULL_REF); return; }
+            // Validate the (offset, length) window against the array — a
+            // hostile or corrupt JAR can pass arbitrary values that would
+            // otherwise let load_png_from_bytes read past the heap object
+            // into adjacent memory before libpng ever sees the bytes.
+            // 64-bit add to dodge int overflow on (offset + length).
+            int32_t alen = obj->array_length();
+            if (offset < 0 || length < 0 ||
+                (int64_t)offset + (int64_t)length > (int64_t)alen) {
+                f.push_ref(NULL_REF);
+                return;
+            }
 
             const uint8_t* data = obj->array_bytes() + offset;
             if (const char* dir = std::getenv("J2ME_DUMP_PNGS")) {

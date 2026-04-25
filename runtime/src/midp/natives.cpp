@@ -567,6 +567,12 @@ void register_natives(VM& vm, const JarFile& jar) {
         StreamEntry& s = it->second;
         HeapObject* arr = v.heap().deref(buf);
         if (!arr) { f.push_int(-1); return; }
+        // Spec (InputStream.read): throw IndexOutOfBoundsException if
+        // off<0, len<0, or len > b.length - off. Clamp len to fit so a
+        // hostile JAR can't push past the array end with off+len > size.
+        int32_t alen = arr->array_length();
+        if (off < 0 || len < 0 || off > alen) { f.push_int(-1); return; }
+        if (len > alen - off) len = alen - off;
         int32_t avail = static_cast<int32_t>(s.data.size()) - s.pos;
         int32_t n = std::min(len, avail);
         if (n <= 0) { f.push_int(-1); return; }
@@ -751,6 +757,11 @@ void register_natives(VM& vm, const JarFile& jar) {
             HeapObject* arr = v.heap().deref(buf);
             if (!arr) return;
             StreamEntry& s = it->second;
+            // Validate (off, len) window before any memcpy; spec says
+            // readFully throws IndexOutOfBoundsException for bad ranges.
+            int32_t alen = arr->array_length();
+            if (off < 0 || len < 0 || off > alen || len > alen - off)
+                throw JvmException{NULL_REF, "IndexOutOfBoundsException"};
             if (s.pos + len > (int32_t)s.data.size())
                 throw JvmException{NULL_REF, "EOFException"};
             std::memcpy(arr->array_bytes() + off, s.data.data() + s.pos, len);
