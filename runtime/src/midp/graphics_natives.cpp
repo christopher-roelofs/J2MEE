@@ -504,6 +504,41 @@ static void draw_line_on(SDL_Surface* surf, uint32_t color,
     }
 }
 
+// Surface pool keyed by (w,h). blit_image's transform path used to
+// SDL_CreateRGBSurface + SDL_FreeSurface a `tmp` every call (and a `region`
+// for non-ARGB sources). On AoE menu / Doom RPG that was ~5% CPU in
+// malloc + _int_free + malloc_consolidate combined. Pool reuses surfaces
+// per (w,h) bucket; bounded to keep memory in check on Doom RPG (hundreds
+// of distinct wall-tex sizes).
+namespace {
+struct SurfacePool {
+    static constexpr size_t kMaxPerBucket = 8;
+    std::unordered_map<uint64_t, std::vector<SDL_Surface*>> free_lists;
+
+    static uint64_t key(int w, int h) {
+        return (uint64_t(uint32_t(w)) << 32) | uint32_t(h);
+    }
+    SDL_Surface* acquire(int w, int h) {
+        auto it = free_lists.find(key(w, h));
+        if (it != free_lists.end() && !it->second.empty()) {
+            SDL_Surface* s = it->second.back();
+            it->second.pop_back();
+            return s;
+        }
+        return SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+    }
+    void release(SDL_Surface* s) {
+        if (!s) return;
+        auto& bucket = free_lists[key(s->w, s->h)];
+        if (bucket.size() >= kMaxPerBucket) { SDL_FreeSurface(s); return; }
+        // Reset blend mode so the next caller gets a clean slate.
+        SDL_SetSurfaceBlendMode(s, SDL_BLENDMODE_NONE);
+        bucket.push_back(s);
+    }
+};
+SurfacePool& g_surface_pool() { static SurfacePool p; return p; }
+}
+
 // Blit an image surface onto a target surface
 static void blit_image(SDL_Surface* dst, SDL_Surface* src,
                         int dx, int dy,
@@ -545,7 +580,7 @@ static void blit_image(SDL_Surface* dst, SDL_Surface* src,
             sp        = (const uint8_t*)src->pixels + sy * src->pitch + sx * 4;
             src_pitch = src->pitch;
         } else {
-            region = SDL_CreateRGBSurfaceWithFormat(0, sw, sh, 32, SDL_PIXELFORMAT_ARGB8888);
+            region = g_surface_pool().acquire(sw, sh);
             if (!region) return;
             SDL_SetSurfaceBlendMode(src, SDL_BLENDMODE_NONE);
             SDL_Rect srect{sx, sy, sw, sh};
@@ -556,10 +591,10 @@ static void blit_image(SDL_Surface* dst, SDL_Surface* src,
             src_pitch = region->pitch;
         }
 
-        // Dest-sized surface that receives the rotated pixels.
-        SDL_Surface* tmp = SDL_CreateRGBSurfaceWithFormat(0, dw, dh, 32, SDL_PIXELFORMAT_ARGB8888);
+        // Dest-sized surface that receives the rotated pixels (pooled).
+        SDL_Surface* tmp = g_surface_pool().acquire(dw, dh);
         if (!tmp) {
-            if (region) { SDL_UnlockSurface(region); SDL_FreeSurface(region); }
+            if (region) { SDL_UnlockSurface(region); g_surface_pool().release(region); }
             else        { SDL_UnlockSurface(src); }
             return;
         }
@@ -602,12 +637,12 @@ static void blit_image(SDL_Surface* dst, SDL_Surface* src,
         }
         #undef TRANSFORM_LOOP
         SDL_UnlockSurface(tmp);
-        if (region) { SDL_UnlockSurface(region); SDL_FreeSurface(region); }
+        if (region) { SDL_UnlockSurface(region); g_surface_pool().release(region); }
         else        { SDL_UnlockSurface(src); }
         SDL_SetSurfaceBlendMode(tmp, SDL_BLENDMODE_BLEND);
         SDL_Rect drect{dx, dy, dw, dh};
         SDL_BlitSurface(tmp, nullptr, dst, &drect);
-        SDL_FreeSurface(tmp);
+        g_surface_pool().release(tmp);
     }
 }
 
@@ -1363,6 +1398,10 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
                     fprintf(stderr, "[glyph] sx=%d sy=%d dx=%d dy=%d\n", sx, sy, dx, dy);
                     s_g++;
                 }
+            }
+            if (getenv("J2ME_TRACE_DRAWREGION")) {
+                fprintf(stderr, "[dr] img=%u sx=%d sy=%d sw=%d sh=%d t=%d dx=%d dy=%d a=%d\n",
+                        img, sx, sy, sw, sh, t, dx, dy, anchor);
             }
             // Compute drawn dimensions after transform
             int dw = sw, dh = sh;
@@ -2162,19 +2201,8 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
         "no fields to init; we run full-screen by default",
         [](VM&, Frame&, std::span<Slot>) {});
 
-    // Nokia Sound stub
-    vm.register_stub("com/nokia/mid/sound/Sound",
-        "<init>", "([BI)V",
-        "Nokia OTT tone format not decoded; sound silently created",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("com/nokia/mid/sound/Sound",
-        "play", "(I)V",
-        "Nokia Sound decoding not implemented; silent",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("com/nokia/mid/sound/Sound",
-        "stop", "()V",
-        "Nokia Sound not playing anyway",
-        [](VM&, Frame&, std::span<Slot>) {});
+    // com.nokia.mid.sound.Sound is wired in register_natives() below where
+    // SDL_mixer is in scope.
 
     vm.register_native("javax/microedition/lcdui/Canvas",
         "isDoubleBuffered", "()Z",

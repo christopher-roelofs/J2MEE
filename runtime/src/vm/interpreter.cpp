@@ -213,6 +213,15 @@ enum Opcode : uint8_t {
     MULTIANEWARRAY  = 0xc5,
     IFNULL          = 0xc6,
     IFNONNULL       = 0xc7,
+
+    // Internal "quickened" opcodes — written back over the original
+    // GETFIELD/PUTFIELD bytes after first resolve, so subsequent passes
+    // skip the resolved_fields[] vector lookup. Encoded operand:
+    //   high bit (0x8000) = wide (long/double)
+    //   low 15 bits       = slot_index
+    // Reserved opcode range 0xCB..0xFD per JVMS; we only consume two.
+    GETFIELD_QUICK  = 0xcb,
+    PUTFIELD_QUICK  = 0xcc,
 };
 
 // ─── Bytecode read helpers ────────────────────────────────────────────────────
@@ -423,6 +432,11 @@ void VM::exec_frame(Frame& f) {
     ClassDef* cp_klass = (f.method && f.method->owner) ? f.method->owner : f.klass;
     const ClassFile* cf_ptr  = cp_klass ? cp_klass->source : nullptr;
     const uint8_t*   code    = f.method->code->code.data();
+    // Same buffer, mutable view — used by the quickening rewrites below
+    // (GETFIELD/PUTFIELD swap the opcode byte to GETFIELD_QUICK on first
+    // execution and re-encode the operand). Single-threaded interpreter
+    // so the rewrite is race-free.
+    uint8_t*         code_w  = const_cast<uint8_t*>(code);
     const auto&      ex_tbl  = f.method->code->exception_table;
 
     auto frame_loc = [&]() -> std::string {
@@ -600,6 +614,8 @@ void VM::exec_frame(Frame& f) {
         dispatch_table[PUTSTATIC] = &&L_PUTSTATIC;
         dispatch_table[GETFIELD]  = &&L_GETFIELD;
         dispatch_table[PUTFIELD]  = &&L_PUTFIELD;
+        dispatch_table[GETFIELD_QUICK] = &&L_GETFIELD_QUICK;
+        dispatch_table[PUTFIELD_QUICK] = &&L_PUTFIELD_QUICK;
         dispatch_table[INVOKESTATIC]    = &&L_INVOKESTATIC;
         dispatch_table[INVOKEVIRTUAL]   = &&L_INVOKEVIRTUAL;
         dispatch_table[INVOKEINTERFACE] = &&L_INVOKEVIRTUAL;
@@ -1072,21 +1088,48 @@ void VM::exec_frame(Frame& f) {
         }
 
         // ── Instance fields ───────────────────────────────────────────────────
+        // First execution resolves the field via the per-classfile cache,
+        // then rewrites the call site in-place to a GETFIELD_QUICK /
+        // PUTFIELD_QUICK opcode whose 2-byte operand encodes
+        //   bit 15:    is_wide (long/double)
+        //   bits 0..14: slot_index
+        // so subsequent passes skip the resolve_fields[] lookup entirely.
+        // slot_index < 0x8000 holds for every realistic class (FieldDef
+        // slots are sequential per class and well below 32k).
         L_GETFIELD: {
+            uint32_t op_pc = f.pc - 1;
             auto [klass, fd] = resolve_field(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
             ObjRef ref = f.pop_ref();
             auto* obj = m_heap.deref(ref);
             if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
             f.push(obj->field(fd->slot_index));
-            if (fd->is_long() || fd->is_double())
-                f.push(obj->field(fd->slot_index + 1));
+            bool wide = fd->is_long() || fd->is_double();
+            if (wide) f.push(obj->field(fd->slot_index + 1));
+            uint16_t enc = (uint16_t)fd->slot_index | (wide ? 0x8000u : 0u);
+            code_w[op_pc    ] = GETFIELD_QUICK;
+            code_w[op_pc + 1] = (uint8_t)(enc >> 8);
+            code_w[op_pc + 2] = (uint8_t)(enc & 0xFF);
+            DISPATCH();
+        }
+        L_GETFIELD_QUICK: {
+            uint16_t enc = bc_u2(code, f.pc);
+            f.pc += 2;
+            uint16_t slot = enc & 0x7FFF;
+            bool wide = (enc & 0x8000) != 0;
+            ObjRef ref = f.pop_ref();
+            auto* obj = m_heap.deref(ref);
+            if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+            f.push(obj->field(slot));
+            if (wide) f.push(obj->field(slot + 1));
             DISPATCH();
         }
         L_PUTFIELD: {
+            uint32_t op_pc = f.pc - 1;
             auto [klass, fd] = resolve_field(*cf_ptr, bc_u2(code, f.pc));
             f.pc += 2;
-            if (fd->is_long() || fd->is_double()) {
+            bool wide = fd->is_long() || fd->is_double();
+            if (wide) {
                 Slot hi = f.pop(), lo = f.pop();
                 ObjRef ref = f.pop_ref();
                 auto* obj = m_heap.deref(ref);
@@ -1099,6 +1142,31 @@ void VM::exec_frame(Frame& f) {
                 auto* obj = m_heap.deref(ref);
                 if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
                 obj->field(fd->slot_index) = val;
+            }
+            uint16_t enc = (uint16_t)fd->slot_index | (wide ? 0x8000u : 0u);
+            code_w[op_pc    ] = PUTFIELD_QUICK;
+            code_w[op_pc + 1] = (uint8_t)(enc >> 8);
+            code_w[op_pc + 2] = (uint8_t)(enc & 0xFF);
+            DISPATCH();
+        }
+        L_PUTFIELD_QUICK: {
+            uint16_t enc = bc_u2(code, f.pc);
+            f.pc += 2;
+            uint16_t slot = enc & 0x7FFF;
+            bool wide = (enc & 0x8000) != 0;
+            if (wide) {
+                Slot hi = f.pop(), lo = f.pop();
+                ObjRef ref = f.pop_ref();
+                auto* obj = m_heap.deref(ref);
+                if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+                obj->field(slot    ) = lo;
+                obj->field(slot + 1) = hi;
+            } else {
+                Slot val = f.pop();
+                ObjRef ref = f.pop_ref();
+                auto* obj = m_heap.deref(ref);
+                if (!obj) throw JvmException{NULL_REF, "NullPointerException"};
+                obj->field(slot) = val;
             }
             DISPATCH();
         }

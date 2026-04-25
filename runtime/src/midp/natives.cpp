@@ -119,6 +119,14 @@ static std::string utf8_substring(const std::string& s, int32_t from, int32_t to
 // on the heap as empty shells (0-slot stubs).  Their actual data lives here,
 // keyed by ObjRef.
 
+struct AlertData {
+    std::string title;
+    std::string text;
+    int32_t     timeout = -2;   // -2 = FOREVER per spec
+    int32_t     type    = 0;
+};
+static std::unordered_map<ObjRef, AlertData> g_alerts;
+
 static std::unordered_map<ObjRef, StreamEntry>   g_streams;
 StreamEntry* find_stream(ObjRef ref) {
     auto it = g_streams.find(ref);
@@ -2668,57 +2676,86 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     }
 
     // ── java.util.Date / Calendar ────────────────────────────────────────────
-    vm.register_stub("java/util/Date", "<init>", "()V",
-        "Date fields not stored; only getTime() at point-of-call works",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("java/util/Date", "<init>", "(J)V",
-        "long ctor arg discarded; Date does not roundtrip",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_fallback("java/util/Date", "getTime", "()J",
-        [](VM&, Frame& f, std::span<Slot>) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            f.push_long(int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000);
+    // Per-instance millis state so set→get roundtrips work (challenge-of-the
+    // -day timers, expiration checks, leaderboard timestamps).
+    static auto wall_now_ms = []() -> int64_t {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+    };
+    static std::unordered_map<ObjRef, int64_t> g_date_ms;
+    static std::unordered_map<ObjRef, int64_t> g_cal_ms;
+
+    vm.register_native("java/util/Date", "<init>", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            g_date_ms[args[0].as_ref()] = wall_now_ms();
+        });
+    vm.register_native("java/util/Date", "<init>", "(J)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            Slot2 s; s.lo = args[1].raw; s.hi = args[2].raw;
+            g_date_ms[args[0].as_ref()] = s.as_long();
+        });
+    vm.register_native("java/util/Date", "getTime", "()J",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_date_ms.find(args[0].as_ref());
+            f.push_long(it != g_date_ms.end() ? it->second : wall_now_ms());
+        });
+    vm.register_native("java/util/Date", "setTime", "(J)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            Slot2 s; s.lo = args[1].raw; s.hi = args[2].raw;
+            g_date_ms[args[0].as_ref()] = s.as_long();
         });
 
-    vm.register_fallback("java/util/Calendar", "getInstance",
+    vm.register_native("java/util/Calendar", "getInstance",
         "()Ljava/util/Calendar;",
         [](VM& v, Frame& f, std::span<Slot>) {
-            f.push_ref(v.new_object(v.loader().find_or_stub("java/util/Calendar")));
+            ObjRef c = v.new_object(v.loader().find_or_stub("java/util/Calendar"));
+            g_cal_ms[c] = wall_now_ms();
+            f.push_ref(c);
         });
-    vm.register_stub("java/util/Calendar", "setTime", "(Ljava/util/Date;)V",
-        "Calendar does not store Date; subsequent get() returns wall clock",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_fallback("java/util/Calendar", "getTime", "()Ljava/util/Date;",
-        [](VM& v, Frame& f, std::span<Slot>) {
+    vm.register_native("java/util/Calendar", "setTime",
+        "(Ljava/util/Date;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto it = g_date_ms.find(args[1].as_ref());
+            g_cal_ms[args[0].as_ref()] = it != g_date_ms.end() ? it->second : wall_now_ms();
+        });
+    vm.register_native("java/util/Calendar", "getTime",
+        "()Ljava/util/Date;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
             ClassDef* dk = v.loader().find_or_stub("java/util/Date");
-            f.push_ref(v.heap().alloc_object(dk, 0));
+            ObjRef d = v.heap().alloc_object(dk, 0);
+            auto it = g_cal_ms.find(args[0].as_ref());
+            g_date_ms[d] = it != g_cal_ms.end() ? it->second : wall_now_ms();
+            f.push_ref(d);
         });
-    vm.register_stub("java/util/Calendar", "setTimeInMillis", "(J)V",
-        "Calendar does not store millis; subsequent get() returns wall clock",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_fallback("java/util/Calendar", "getTimeInMillis", "()J",
-        [](VM&, Frame& f, std::span<Slot>) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            f.push_long(int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000);
+    vm.register_native("java/util/Calendar", "setTimeInMillis", "(J)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            Slot2 s; s.lo = args[1].raw; s.hi = args[2].raw;
+            g_cal_ms[args[0].as_ref()] = s.as_long();
         });
-    vm.register_fallback("java/util/Calendar", "get", "(I)I",
+    vm.register_native("java/util/Calendar", "getTimeInMillis", "()J",
         [](VM&, Frame& f, std::span<Slot> args) {
-            // Calendar field IDs: YEAR=1, MONTH=2, DAY_OF_MONTH=5,
+            auto it = g_cal_ms.find(args[0].as_ref());
+            f.push_long(it != g_cal_ms.end() ? it->second : wall_now_ms());
+        });
+    vm.register_native("java/util/Calendar", "get", "(I)I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            // Field IDs: YEAR=1, MONTH=2, DAY_OF_MONTH=5, DAY_OF_WEEK=7,
             // HOUR_OF_DAY=11, MINUTE=12, SECOND=13
-            time_t now = time(nullptr);
-            struct tm* t = localtime(&now);
+            auto it = g_cal_ms.find(args[0].as_ref());
+            int64_t ms = it != g_cal_ms.end() ? it->second : wall_now_ms();
+            time_t s = (time_t)(ms / 1000);
+            struct tm* t = localtime(&s);
             int field = args[1].as_int();
             int val = 0;
             switch (field) {
-                case 1:  val = t->tm_year + 1900; break;  // YEAR
-                case 2:  val = t->tm_mon;         break;  // MONTH (0-based)
-                case 5:  val = t->tm_mday;        break;  // DAY_OF_MONTH
-                case 7:  val = t->tm_wday + 1;    break;  // DAY_OF_WEEK
-                case 11: val = t->tm_hour;        break;  // HOUR_OF_DAY
-                case 12: val = t->tm_min;         break;  // MINUTE
-                case 13: val = t->tm_sec;         break;  // SECOND
+                case 1:  val = t->tm_year + 1900; break;
+                case 2:  val = t->tm_mon;         break;
+                case 5:  val = t->tm_mday;        break;
+                case 7:  val = t->tm_wday + 1;    break;
+                case 11: val = t->tm_hour;        break;
+                case 12: val = t->tm_min;         break;
+                case 13: val = t->tm_sec;         break;
             }
             f.push_int(val);
         });
@@ -2867,11 +2904,21 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         });
 
     // Alert variant: games with an optional Alert dialog. We don't render
-    // Alerts; just route to the underlying Displayable.
+    // Alerts visually; instead print the text so users see "Game saved",
+    // "Are you sure?" etc, then route to the underlying Displayable.
     vm.register_native("javax/microedition/lcdui/Display",
         "setCurrent",
         "(Ljavax/microedition/lcdui/Alert;Ljavax/microedition/lcdui/Displayable;)V",
         [](VM& v, Frame& f, std::span<Slot> args) {
+            (void)f;
+            ObjRef alert_ref = args[1].as_ref();
+            auto it = g_alerts.find(alert_ref);
+            if (it != g_alerts.end()) {
+                fprintf(stderr, "[alert] %s%s%s\n",
+                    it->second.title.c_str(),
+                    it->second.title.empty() || it->second.text.empty() ? "" : ": ",
+                    it->second.text.c_str());
+            }
             // args: this, alert, nextDisplayable  → forward the 2nd.
             MethodDef* base = v.loader().find("javax/microedition/lcdui/Display")
                                ->find_method("setCurrent",
@@ -3337,28 +3384,60 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             [](VM&, Frame&, std::span<Slot>) {});
     }
 
-    // Alert — stub dialogs as no-ops (games use these for info/error popups)
-    vm.register_stub("javax/microedition/lcdui/Alert",
+    // ── Alert ─────────────────────────────────────────────────────────────────
+    // Per-instance title/string/timeout/type stored in file-scope g_alerts so
+    // Display.setCurrent(Alert,…) above can read them too. We don't render a
+    // modal dialog visually; instead the alert text is printed to stderr when
+    // shown, and setCurrent forwards to `next` so the game keeps going.
+    vm.register_native("javax/microedition/lcdui/Alert",
         "<init>", "(Ljava/lang/String;)V",
-        "Alert UI not implemented; title discarded",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/Alert",
-        "<init>",
-        "(Ljava/lang/String;Ljava/lang/String;Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V",
-        "Alert UI not implemented; all args discarded",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/Alert",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            AlertData a;
+            a.title = args[1].as_ref() == NULL_REF ? std::string()
+                    : v.string_value(args[1].as_ref());
+            g_alerts[args[0].as_ref()] = std::move(a);
+        });
+    vm.register_native("javax/microedition/lcdui/Alert", "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;"
+        "Ljavax/microedition/lcdui/Image;Ljavax/microedition/lcdui/AlertType;)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            AlertData a;
+            if (args[1].as_ref() != NULL_REF) a.title = v.string_value(args[1].as_ref());
+            if (args[2].as_ref() != NULL_REF) a.text  = v.string_value(args[2].as_ref());
+            // args[3] = Image (icon, ignored)
+            // args[4] = AlertType
+            g_alerts[args[0].as_ref()] = std::move(a);
+        });
+    vm.register_native("javax/microedition/lcdui/Alert",
         "setType", "(Ljavax/microedition/lcdui/AlertType;)V",
-        "Alert UI not implemented; type discarded",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/Alert",
+    vm.register_native("javax/microedition/lcdui/Alert",
         "setTimeout", "(I)V",
-        "Alert UI not implemented; timeout discarded",
-        [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/Alert",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto it = g_alerts.find(args[0].as_ref());
+            if (it != g_alerts.end()) it->second.timeout = args[1].as_int();
+        });
+    vm.register_native("javax/microedition/lcdui/Alert",
         "setString", "(Ljava/lang/String;)V",
-        "Alert UI not implemented; text discarded",
-        [](VM&, Frame&, std::span<Slot>) {});
+        [](VM& v, Frame&, std::span<Slot> args) {
+            auto it = g_alerts.find(args[0].as_ref());
+            if (it == g_alerts.end()) return;
+            it->second.text = args[1].as_ref() == NULL_REF
+                ? std::string() : v.string_value(args[1].as_ref());
+        });
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "getString", "()Ljava/lang/String;",
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            auto it = g_alerts.find(args[0].as_ref());
+            f.push_ref(it != g_alerts.end()
+                ? v.new_string(it->second.text.c_str()) : NULL_REF);
+        });
+    vm.register_native("javax/microedition/lcdui/Alert",
+        "getTimeout", "()I",
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_alerts.find(args[0].as_ref());
+            f.push_int(it != g_alerts.end() ? it->second.timeout : 2000);
+        });
     vm.register_native("javax/microedition/lcdui/Alert",
         "getDefaultTimeout", "()I",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(2000); });
@@ -3929,6 +4008,8 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         int channel = -1;             // assigned mixer channel for chunks
         SDL_RWops* rw = nullptr;      // keep alive for SDL_mixer
         std::vector<uint8_t> buf;     // owns the byte data
+        uint64_t start_us = 0;        // wall clock at last Mix_PlayMusic
+        int64_t  duration_us = -1;    // best-effort duration (-1 = unknown)
     };
     static std::unordered_map<ObjRef, PlayerData> g_players;
     static bool g_mixer_inited = false;
@@ -3965,7 +4046,8 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             // Read all bytes from the stream
             auto it = g_streams.find(stream_ref);
             if (it == g_streams.end()) {
-                // Return a valid but empty player so the game doesn't think sound init failed
+                fprintf(stderr, "[audio] createPlayer(stream,'%s') -> empty (stream not found)\n",
+                        content_type.c_str());
                 // Return a valid but empty player so the game doesn't think sound init failed
                 ObjRef dummy = v.new_object(
                     v.loader().find_or_stub("javax/microedition/media/Player"));
@@ -3976,6 +4058,12 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             StreamEntry& se = it->second;
             std::vector<uint8_t> data(se.data.begin() + se.pos, se.data.end());
             se.pos = (int32_t)se.data.size();
+            fprintf(stderr, "[audio] createPlayer(stream,'%s') size=%zu hdr=%02x%02x%02x%02x\n",
+                    content_type.c_str(), data.size(),
+                    data.size() > 0 ? data[0] : 0,
+                    data.size() > 1 ? data[1] : 0,
+                    data.size() > 2 ? data[2] : 0,
+                    data.size() > 3 ? data[3] : 0);
 
             ensure_mixer();
 
@@ -4019,7 +4107,12 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     vm.register_native("javax/microedition/media/Manager",
         "createPlayer",
         "(Ljava/lang/String;)Ljavax/microedition/media/Player;",
-        [](VM& v, Frame& f, std::span<Slot>) {
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            std::string locator = args[0].as_ref() == NULL_REF
+                ? std::string("(null)")
+                : v.string_value(args[0].as_ref());
+            fprintf(stderr, "[audio] createPlayer(locator='%s') -> empty stub\n",
+                    locator.c_str());
             f.push_ref(v.new_object(
                 v.loader().find_or_stub("javax/microedition/media/Player")));
         });
@@ -4030,6 +4123,8 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             int note = args[0].as_int();
             int dur  = args[1].as_int();
             int vol  = args[2].as_int();
+            fprintf(stderr, "[audio] playTone note=%d dur=%dms vol=%d\n",
+                    note, dur, vol);
             if (dur <= 0 || vol <= 0) return;
             if (note < 0) note = 0; if (note > 127) note = 127;
             double freq = 440.0 * std::pow(2.0, (note - 69) / 12.0);
@@ -4106,13 +4201,14 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
 
     vm.register_native("javax/microedition/media/Player",
         "realize", "()V",
-        [](VM&, Frame&, std::span<Slot>) {
-            // No-op: deviceAvailable is not part of realize() per JSR-135.
+        [](VM&, Frame&, std::span<Slot> args) {
+            fprintf(stderr, "[audio] Player.realize ref=%u\n", args[0].as_ref());
         });
 
     vm.register_native("javax/microedition/media/Player",
         "prefetch", "()V",
         [](VM&, Frame&, std::span<Slot> args) {
+            fprintf(stderr, "[audio] Player.prefetch ref=%u\n", args[0].as_ref());
         });
 
     vm.register_native("javax/microedition/media/Player",
@@ -4124,6 +4220,10 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             int loops = (pd.loop_count == -1) ? -1 : pd.loop_count - 1;
             if (pd.music) {
                 int rc = Mix_PlayMusic(pd.music, loops);
+                if (rc == 0) {
+                    pd.start_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                }
                 fprintf(stderr, "[audio] Mix_PlayMusic rc=%d err=%s vol=%d\n",
                         rc, rc < 0 ? Mix_GetError() : "", Mix_VolumeMusic(-1));
             } else if (pd.chunk) {
@@ -4141,6 +4241,9 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             auto it = g_players.find(args[0].as_ref());
             if (it == g_players.end()) return;
             PlayerData& pd = it->second;
+            fprintf(stderr, "[audio] Player.stop ref=%u %s\n",
+                    args[0].as_ref(),
+                    pd.music ? "music" : (pd.chunk ? "chunk" : "empty"));
             if (pd.music) Mix_HaltMusic();
             else if (pd.channel >= 0) Mix_HaltChannel(pd.channel);
         });
@@ -4151,23 +4254,30 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             auto it = g_players.find(args[0].as_ref());
             if (it == g_players.end()) return;
             PlayerData& pd = it->second;
+            fprintf(stderr, "[audio] Player.close ref=%u %s\n",
+                    args[0].as_ref(),
+                    pd.music ? "music" : (pd.chunk ? "chunk" : "empty"));
             if (pd.music)  { Mix_HaltMusic(); Mix_FreeMusic(pd.music); }
             if (pd.chunk)  { if (pd.channel >= 0) Mix_HaltChannel(pd.channel); Mix_FreeChunk(pd.chunk); }
             if (pd.rw)     SDL_RWclose(pd.rw);
             g_players.erase(it);
         });
 
-    vm.register_noop("javax/microedition/media/Player",
+    vm.register_native("javax/microedition/media/Player",
         "deallocate", "()V",
-        "SDL_mixer resources reclaimed when ObjRef is collected",
-        [](VM&, Frame&, std::span<Slot>) {});
+        [](VM&, Frame&, std::span<Slot> args) {
+            fprintf(stderr, "[audio] Player.deallocate ref=%u\n", args[0].as_ref());
+        });
 
     vm.register_native("javax/microedition/media/Player",
         "setLoopCount", "(I)V",
         [](VM&, Frame&, std::span<Slot> args) {
+            int n = args[1].as_int();
+            fprintf(stderr, "[audio] Player.setLoopCount ref=%u n=%d\n",
+                    args[0].as_ref(), n);
             auto it = g_players.find(args[0].as_ref());
             if (it != g_players.end())
-                it->second.loop_count = args[1].as_int();
+                it->second.loop_count = n;
         });
 
     vm.register_native("javax/microedition/media/Player",
@@ -4176,20 +4286,48 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_int(300); // PREFETCHED
         });
 
-    // Real seeking would require backend support (Mix_SetMusicPosition is
-    // format-specific, EAS has no seek). Echoing the requested time keeps
-    // games that check the return value happy; playback won't actually jump.
-    vm.register_stub("javax/microedition/media/Player",
+    // setMediaTime(microseconds): seek the player. We honour 0 (rewind to
+    // start) for both music and chunk paths via Mix_RewindMusic + reload —
+    // games typically call setMediaTime(0); start() to loop a track. Non-zero
+    // seeks fall through to a position seek where SDL_mixer supports it
+    // (MOD/OGG); MIDI/MP3 ignore the offset and stay rewound.
+    vm.register_native("javax/microedition/media/Player",
         "setMediaTime", "(J)J",
-        "echoes requested time; does not actually seek",
         [](VM&, Frame& f, std::span<Slot> args) {
             Slot2 s2; s2.lo = args[1].raw; s2.hi = args[2].raw;
-            f.push_long(s2.as_long());
+            int64_t us = s2.as_long();
+            auto it = g_players.find(args[0].as_ref());
+            if (it != g_players.end()) {
+                PlayerData& pd = it->second;
+                if (pd.music) {
+                    Mix_RewindMusic();
+                    if (us > 0) Mix_SetMusicPosition((double)us / 1e6);
+                } else if (pd.chunk && pd.channel >= 0) {
+                    // Mix_Chunk has no seek — halt the channel; the next
+                    // start() replays from the beginning.
+                    Mix_HaltChannel(pd.channel);
+                    pd.channel = -1;
+                }
+            }
+            f.push_long(us);
         });
-    vm.register_stub("javax/microedition/media/Player",
+    // getMediaTime: SDL_mixer doesn't expose music playback position. Track
+    // it loosely via the time we kicked Mix_PlayMusic / set via setMediaTime.
+    // Good enough for games that poll-and-compare to detect end-of-track.
+    vm.register_native("javax/microedition/media/Player",
         "getMediaTime", "()J",
-        "no position tracking; -1 = TIME_UNKNOWN per spec",
-        [](VM&, Frame& f, std::span<Slot>) { f.push_long(-1); });
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_players.find(args[0].as_ref());
+            if (it == g_players.end()) { f.push_long(-1); return; }
+            PlayerData& pd = it->second;
+            if (pd.music && Mix_PlayingMusic()) {
+                uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                f.push_long((int64_t)(now - pd.start_us));
+            } else {
+                f.push_long(-1);  // TIME_UNKNOWN
+            }
+        });
 
     // getControl("VolumeControl") → returns a VolumeControl object
     vm.register_native("javax/microedition/media/Player",
@@ -4208,6 +4346,7 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
         "setLevel", "(I)I",
         [](VM&, Frame& f, std::span<Slot> args) {
             int level = args[1].as_int(); // 0-100
+            fprintf(stderr, "[audio] VolumeControl.setLevel %d\n", level);
             // Set global volume (0-128 for SDL_mixer)
             int vol = level * MIX_MAX_VOLUME / 100;
             Mix_VolumeMusic(vol);
@@ -4233,10 +4372,75 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             f.push_int(Mix_VolumeMusic(-1) == 0 ? 1 : 0);
         });
 
-    vm.register_stub("javax/microedition/media/Player",
+    vm.register_native("javax/microedition/media/Player",
         "getDuration", "()J",
-        "no per-player duration tracking; -1 = TIME_UNKNOWN per spec",
-        [](VM&, Frame& f, std::span<Slot>) { f.push_long(-1); });
+        [](VM&, Frame& f, std::span<Slot> args) {
+            auto it = g_players.find(args[0].as_ref());
+            if (it == g_players.end()) { f.push_long(-1); return; }
+            PlayerData& pd = it->second;
+            if (pd.duration_us < 0 && pd.music) {
+                // SDL_mixer 2.6+: Mix_MusicDuration returns seconds, -1 if
+                // not supported by the format. Cache so we only ask once.
+                double secs = Mix_MusicDuration(pd.music);
+                pd.duration_us = secs > 0 ? (int64_t)(secs * 1e6) : -1;
+            }
+            f.push_long(pd.duration_us);
+        });
+
+    // ── com.nokia.mid.sound.Sound ─────────────────────────────────────────────
+    // Pre-MMAPI Nokia sound API (JSR-37, ships on Series 30/40 phones). Format
+    // codes: FORMAT_TONE=1 (Smart Messaging tone), FORMAT_WAV=5, plus a few
+    // vendor-specific ints. Most modern jars feeding Sound at runtime use
+    // type=1 (built-in tone byte stream) but some pass plain WAV/MIDI. We
+    // detect by signature so type code is just a fallback hint.
+    struct NokiaSound {
+        Mix_Music* music = nullptr;
+        Mix_Chunk* chunk = nullptr;
+        int channel = -1;
+        SDL_RWops* rw = nullptr;
+        std::vector<uint8_t> buf;
+    };
+    static std::unordered_map<ObjRef, NokiaSound> g_nokia_sounds;
+
+    vm.register_native("com/nokia/mid/sound/Sound", "<init>", "([BI)V",
+        [ensure_mixer](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            ObjRef arr_ref = args[1].as_ref();
+            // int type = args[2].as_int();  // hint only
+            HeapObject* arr = v.heap().deref(arr_ref);
+            if (!arr) { g_nokia_sounds[self] = {}; return; }
+            ensure_mixer();
+            NokiaSound s;
+            s.buf.assign((uint8_t*)arr->array_bytes(),
+                         (uint8_t*)arr->array_bytes() + arr->array_length());
+            s.rw = SDL_RWFromConstMem(s.buf.data(), (int)s.buf.size());
+            // Detect by header: MThd → MIDI, RIFF → WAV.
+            bool is_midi = s.buf.size() >= 4 && s.buf[0] == 'M' &&
+                           s.buf[1] == 'T' && s.buf[2] == 'h' && s.buf[3] == 'd';
+            bool is_wav  = s.buf.size() >= 4 && s.buf[0] == 'R' &&
+                           s.buf[1] == 'I' && s.buf[2] == 'F' && s.buf[3] == 'F';
+            if (is_midi) s.music = Mix_LoadMUS_RW(s.rw, 0);
+            else if (is_wav) s.chunk = Mix_LoadWAV_RW(s.rw, 0);
+            // OTT tone format (type=1) isn't decoded — silent fallback.
+            g_nokia_sounds[self] = std::move(s);
+        });
+    vm.register_native("com/nokia/mid/sound/Sound", "play", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto it = g_nokia_sounds.find(args[0].as_ref());
+            if (it == g_nokia_sounds.end()) return;
+            int loops_arg = args[1].as_int();   // 0 = infinite, 1 = once
+            int loops = (loops_arg == 0) ? -1 : loops_arg - 1;
+            if (it->second.music) Mix_PlayMusic(it->second.music, loops);
+            else if (it->second.chunk)
+                it->second.channel = Mix_PlayChannel(-1, it->second.chunk, loops);
+        });
+    vm.register_native("com/nokia/mid/sound/Sound", "stop", "()V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto it = g_nokia_sounds.find(args[0].as_ref());
+            if (it == g_nokia_sounds.end()) return;
+            if (it->second.music) Mix_HaltMusic();
+            else if (it->second.channel >= 0) Mix_HaltChannel(it->second.channel);
+        });
 
     // VideoControl — MIDP 2.1 MMAPI. We don't decode video, so stub all the
     // common methods so games probing for VideoControl get usable defaults
@@ -4289,82 +4493,69 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
     // phoneME's javax.microedition.lcdui.*LFImpl classes route through these
     // private native leaves for platform-side rendering. A "native resource
     // ID" (NRID) is an int handle the framework uses to refer to a created
-    // widget. For now we return monotonic IDs and do no real work — enough
-    // to progress past the exceptions. Real impls come later, leaf by leaf.
+    // widget. We return monotonic IDs and do no real work — paint goes
+    // through our Graphics natives instead. These were originally registered
+    // as stubs (which log every call); promoted to native no-ops once the
+    // behaviour was confirmed correct against the BIOS jar.
     static int32_t g_nrid = 1;
     auto next_nrid = []() -> int32_t { return g_nrid++; };
 
     // DisplayableLFImpl: class init, destroy, title/ticker setters
-    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+    vm.register_native("javax/microedition/lcdui/DisplayableLFImpl",
         "initialize0", "()V",
-        "BIOS LFImpl class init — no platform setup needed",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+    vm.register_native("javax/microedition/lcdui/DisplayableLFImpl",
         "finalize", "()V",
-        "no platform resources to reclaim",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+    vm.register_native("javax/microedition/lcdui/DisplayableLFImpl",
         "deleteNativeResource0", "(I)V",
-        "no backing resource to free",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+    vm.register_native("javax/microedition/lcdui/DisplayableLFImpl",
         "setTitle0", "(ILjava/lang/String;)V",
-        "title stored in Java-side Displayable; no window chrome",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/DisplayableLFImpl",
+    vm.register_native("javax/microedition/lcdui/DisplayableLFImpl",
         "setTicker0", "(ILjava/lang/String;)V",
-        "tickers not rendered",
         [](VM&, Frame&, std::span<Slot>) {});
 
     // CanvasLFImpl: one createNativeResource0 call per Canvas
-    vm.register_stub("javax/microedition/lcdui/CanvasLFImpl",
+    vm.register_native("javax/microedition/lcdui/CanvasLFImpl",
         "createNativeResource0",
         "(Ljava/lang/String;Ljava/lang/String;)I",
-        "Canvas paints through our Graphics natives; NRID is opaque",
         [next_nrid](VM&, Frame& f, std::span<Slot>) { f.push_int(next_nrid()); });
 
     // FormLFImpl: scroll/viewport/item-focus plumbing
-    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+    vm.register_native("javax/microedition/lcdui/FormLFImpl",
         "createNativeResource0",
         "(Ljava/lang/String;Ljava/lang/String;)I",
-        "Form layout handled by BIOS Java code",
         [next_nrid](VM&, Frame& f, std::span<Slot>) { f.push_int(next_nrid()); });
-    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+    vm.register_native("javax/microedition/lcdui/FormLFImpl",
         "showNativeResource0", "(IIII)V",
-        "no framed form window",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+    vm.register_native("javax/microedition/lcdui/FormLFImpl",
         "setCurrentItem0", "(III)V",
-        "focus tracking in Java side",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+    vm.register_native("javax/microedition/lcdui/FormLFImpl",
         "getScrollPosition0", "()I",
-        "no scroll viewport",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
-    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+    vm.register_native("javax/microedition/lcdui/FormLFImpl",
         "setScrollPosition0", "(I)V",
-        "no scroll viewport",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/FormLFImpl",
+    vm.register_native("javax/microedition/lcdui/FormLFImpl",
         "getViewportHeight0", "()I",
-        "report full screen height as viewport",
         [](VM&, Frame& f, std::span<Slot>) {
             extern int g_screen_h; f.push_int(g_screen_h);
         });
 
     // AlertLFImpl: popup dialog
-    vm.register_stub("javax/microedition/lcdui/AlertLFImpl",
+    vm.register_native("javax/microedition/lcdui/AlertLFImpl",
         "createNativeResource0",
         "(Ljava/lang/String;Ljava/lang/String;I)I",
-        "Alert UI not drawn; NRID opaque",
         [next_nrid](VM&, Frame& f, std::span<Slot>) { f.push_int(next_nrid()); });
-    vm.register_stub("javax/microedition/lcdui/AlertLFImpl",
+    vm.register_native("javax/microedition/lcdui/AlertLFImpl",
         "showNativeResource0", "(I)V",
-        "no Alert dialog presented",
         [](VM&, Frame&, std::span<Slot>) {});
-    vm.register_stub("javax/microedition/lcdui/AlertLFImpl",
+    vm.register_native("javax/microedition/lcdui/AlertLFImpl",
         "setNativeContents0",
         "(ILjavax/microedition/lcdui/ImageData;[ILjava/lang/String;)Z",
-        "Alert contents discarded; return false (not fully set)",
         [](VM&, Frame& f, std::span<Slot>) { f.push_int(0); });
 }
