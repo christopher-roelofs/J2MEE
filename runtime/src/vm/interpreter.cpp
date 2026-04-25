@@ -1357,13 +1357,19 @@ void VM::exec_frame(Frame& f) {
                 for (int i = dims-1; i >= 0; --i)
                     dim_sizes[i] = f.pop_int();
                 outer = m_heap.alloc_ref_array(dim_sizes[0], klass);
-                if (outer == NULL_REF) throw std::runtime_error("OutOfMemoryError");
+                if (outer == NULL_REF) throw_oom("OutOfMemoryError: multidim array");
                 if (dims >= 2) {
-                    auto* outer_obj = m_heap.deref(outer);
+                    // Re-deref `outer` AFTER each inner alloc — alloc_prim_array
+                    // appends to the heap's handle table which can reallocate
+                    // its backing vector and invalidate any HeapObject* held
+                    // across the call. Holding outer_obj for the whole loop
+                    // was a use-after-free waiting for a heap-table grow.
                     for (int32_t i = 0; i < dim_sizes[0]; ++i) {
                         ObjRef inner = m_heap.alloc_prim_array(
                             ArrayType::Int, dim_sizes[1],
                             m_loader.find_or_stub("[I"));
+                        if (inner == NULL_REF) throw_oom("OutOfMemoryError: multidim inner");
+                        auto* outer_obj = m_heap.deref(outer);
                         outer_obj->array_slots()[i] = Slot::from_ref(inner);
                     }
                 }
