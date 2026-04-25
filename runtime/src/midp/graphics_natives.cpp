@@ -3282,4 +3282,294 @@ void register_graphics_natives(VM& vm, const JarFile& jar) {
             bool overlap = ax < ix+iw && ax+aw > ix && ay < iy+ih && ay+ah > iy;
             f.push_int(overlap ? 1 : 0);
         });
+
+    // ── Nokia DirectGraphicsImp ───────────────────────────────────────────────
+    // DirectGraphics is a Nokia/S40 vendor API (JSR-37) for fast pixel-buffer
+    // blits — used by Doom RPG, older platformers, and pre-MIDP-2 sprites.
+    // Map a DirectGraphicsImp ObjRef → its wrapped Graphics ObjRef so blits
+    // route to the same SDL_Surface our LCDUI Graphics natives draw to.
+    static std::unordered_map<ObjRef, ObjRef> g_dg_wrap;
+
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "<init>", "(Ljavax/microedition/lcdui/Graphics;)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            g_dg_wrap[args[0].as_ref()] = args[1].as_ref();
+        });
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "setARGBColor", "(I)V",
+        [](VM&, Frame&, std::span<Slot> args) {
+            auto it = g_dg_wrap.find(args[0].as_ref());
+            if (it != g_dg_wrap.end())
+                g_colors[it->second] = (uint32_t)args[1].as_int();
+        });
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "setARGBColor", "(III)V",
+        [](VM&, Frame&, std::span<Slot>) {});
+
+    // Format codes used by DirectGraphics.drawPixels(...) per JSR-37. We
+    // accept both the decimal-shape constants (565, 4444, 888 …) used by
+    // J2ME-Loader and freej2me, and the alternate Nokia-header constants
+    // (256, 4096, 16777216, -1) some titles encode against.
+    enum DGFormat {
+        DG_BYTE_1_GRAY     = 1,
+        DG_BYTE_2_GRAY     = 2,
+        DG_BYTE_4_GRAY     = 4,
+        DG_BYTE_8_GRAY     = 8,
+        DG_BYTE_332_RGB    = 332,
+        DG_USHORT_444_RGB  = 444,
+        DG_USHORT_4444_ARGB= 4444,
+        DG_USHORT_555_RGB  = 555,
+        DG_USHORT_1555_ARGB= 1555,
+        DG_USHORT_565_RGB  = 565,
+        DG_INT_888_RGB     = 888,
+        DG_INT_8888_ARGB   = 8888,
+        DG_ALT_565         = 256,
+        DG_ALT_4444        = 4096,
+        DG_ALT_1555        = 8192,
+        DG_ALT_888         = 16777216,
+        DG_ALT_8888        = -1,
+    };
+
+    auto dg_blit = [](SDL_Surface* dst, int dx, int dy, int w, int h,
+                      auto get_argb) {
+        if (!dst || w <= 0 || h <= 0) return;
+        SDL_Rect clip; SDL_GetClipRect(dst, &clip);
+        int cx0 = clip.x, cy0 = clip.y;
+        int cx1 = clip.x + clip.w, cy1 = clip.y + clip.h;
+        SDL_LockSurface(dst);
+        uint32_t* dpix = (uint32_t*)dst->pixels;
+        int dpitch = dst->pitch / 4;
+        for (int r = 0; r < h; ++r) {
+            int py = dy + r;
+            if (py < cy0 || py >= cy1) continue;
+            for (int c = 0; c < w; ++c) {
+                int px = dx + c;
+                if (px < cx0 || px >= cx1) continue;
+                uint32_t argb = get_argb(r, c);
+                uint8_t a = (argb >> 24) & 0xFF;
+                if (a == 0) continue;
+                if (a == 0xFF) {
+                    dpix[py * dpitch + px] = argb | 0xFF000000u;
+                } else {
+                    uint32_t d = dpix[py * dpitch + px];
+                    uint8_t dr = (d >> 16) & 0xFF, dgc = (d >> 8) & 0xFF, db = d & 0xFF;
+                    uint8_t sr = (argb >> 16) & 0xFF, sg = (argb >> 8) & 0xFF, sb = argb & 0xFF;
+                    uint8_t rr = (sr*a + dr*(255-a))/255;
+                    uint8_t gg = (sg*a + dgc*(255-a))/255;
+                    uint8_t bb = (sb*a + db*(255-a))/255;
+                    dpix[py * dpitch + px] = 0xFF000000u | (rr<<16) | (gg<<8) | bb;
+                }
+            }
+        }
+        SDL_UnlockSurface(dst);
+    };
+
+    // drawPixels(int[] pixels, boolean transparency, int offset, int scanlength,
+    //            int x, int y, int width, int height, int manipulation, int format)
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "drawPixels", "([IZIIIIIIII)V",
+        [dg_blit](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            auto wrap = g_dg_wrap.find(self);
+            if (wrap == g_dg_wrap.end()) return;
+            SDL_Surface* dst = gfx_surface(wrap->second);
+            if (!dst) return;
+            HeapObject* arr = v.heap().deref(args[1].as_ref());
+            if (!arr) return;
+            bool transparency = args[2].as_int() != 0;
+            int offset   = args[3].as_int();
+            int scan     = args[4].as_int();
+            int x        = args[5].as_int();
+            int y        = args[6].as_int();
+            int w        = args[7].as_int();
+            int h        = args[8].as_int();
+            int format   = args[10].as_int();
+            auto tr = gfx_tx(wrap->second);
+            const Slot* px = arr->array_slots();
+            int len = arr->array_length();
+            dg_blit(dst, x + tr.x, y + tr.y, w, h,
+                [&](int r, int c) -> uint32_t {
+                    int idx = offset + r * scan + c;
+                    if (idx < 0 || idx >= len) return 0;
+                    uint32_t v32 = (uint32_t)px[idx].as_int();
+                    if (format == DG_INT_888_RGB || format == DG_ALT_888)
+                        return 0xFF000000u | (v32 & 0x00FFFFFFu);
+                    return transparency ? v32 : (0xFF000000u | (v32 & 0x00FFFFFFu));
+                });
+        });
+
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "drawPixels", "([SZIIIIIIII)V",
+        [dg_blit](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            auto wrap = g_dg_wrap.find(self);
+            if (wrap == g_dg_wrap.end()) return;
+            SDL_Surface* dst = gfx_surface(wrap->second);
+            if (!dst) return;
+            HeapObject* arr = v.heap().deref(args[1].as_ref());
+            if (!arr) return;
+            bool transparency = args[2].as_int() != 0;
+            int offset = args[3].as_int();
+            int scan   = args[4].as_int();
+            int x      = args[5].as_int();
+            int y      = args[6].as_int();
+            int w      = args[7].as_int();
+            int h      = args[8].as_int();
+            int format = args[10].as_int();
+            auto tr = gfx_tx(wrap->second);
+            const uint16_t* sp = (const uint16_t*)arr->array_bytes();
+            int len = arr->array_length();
+            dg_blit(dst, x + tr.x, y + tr.y, w, h,
+                [&](int r, int c) -> uint32_t {
+                    int idx = offset + r * scan + c;
+                    if (idx < 0 || idx >= len) return 0;
+                    uint16_t v16 = sp[idx];
+                    uint8_t a = 0xFF, rr = 0, gg = 0, bb = 0;
+                    switch (format) {
+                        case DG_USHORT_4444_ARGB:
+                        case DG_ALT_4444:
+                            a  = (v16 >> 12) & 0xF; a = (a << 4) | a;
+                            rr = (v16 >>  8) & 0xF; rr= (rr<< 4) | rr;
+                            gg = (v16 >>  4) & 0xF; gg= (gg<< 4) | gg;
+                            bb =  v16        & 0xF; bb= (bb<< 4) | bb;
+                            break;
+                        case DG_USHORT_1555_ARGB:
+                        case DG_ALT_1555:
+                            a  = (v16 & 0x8000) ? 0xFF : 0x00;
+                            rr = ((v16 >> 10) & 0x1F) << 3;
+                            gg = ((v16 >>  5) & 0x1F) << 3;
+                            bb = ( v16        & 0x1F) << 3;
+                            break;
+                        case DG_USHORT_555_RGB:
+                            rr = ((v16 >> 10) & 0x1F) << 3;
+                            gg = ((v16 >>  5) & 0x1F) << 3;
+                            bb = ( v16        & 0x1F) << 3;
+                            break;
+                        case DG_USHORT_444_RGB:
+                            rr = ((v16 >>  8) & 0xF) << 4;
+                            gg = ((v16 >>  4) & 0xF) << 4;
+                            bb = ( v16        & 0xF) << 4;
+                            break;
+                        case DG_USHORT_565_RGB:
+                        case DG_ALT_565:
+                        default:
+                            rr = ((v16 >> 11) & 0x1F) << 3;
+                            gg = ((v16 >>  5) & 0x3F) << 2;
+                            bb = ( v16        & 0x1F) << 3;
+                            break;
+                    }
+                    if (!transparency) a = 0xFF;
+                    return ((uint32_t)a << 24) | ((uint32_t)rr << 16) |
+                           ((uint32_t)gg <<  8) |  (uint32_t)bb;
+                });
+        });
+
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "drawPixels", "([B[BIIIIIIII)V",
+        [dg_blit](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            auto wrap = g_dg_wrap.find(self);
+            if (wrap == g_dg_wrap.end()) return;
+            SDL_Surface* dst = gfx_surface(wrap->second);
+            if (!dst) return;
+            HeapObject* arr  = v.heap().deref(args[1].as_ref());
+            HeapObject* mask = args[2].as_ref() == NULL_REF ? nullptr
+                              : v.heap().deref(args[2].as_ref());
+            if (!arr) return;
+            int offset = args[3].as_int();
+            int scan   = args[4].as_int();
+            int x      = args[5].as_int();
+            int y      = args[6].as_int();
+            int w      = args[7].as_int();
+            int h      = args[8].as_int();
+            int format = args[10].as_int();
+            auto tr = gfx_tx(wrap->second);
+            const uint8_t* sp = arr->array_bytes();
+            const uint8_t* mp = mask ? mask->array_bytes() : nullptr;
+            int len = arr->array_length();
+            dg_blit(dst, x + tr.x, y + tr.y, w, h,
+                [&](int r, int c) -> uint32_t {
+                    int idx = offset + r * scan + c;
+                    if (idx < 0 || idx >= len) return 0;
+                    uint8_t b = sp[idx];
+                    uint8_t a = mp ? (mp[idx] ? 0xFF : 0x00) : 0xFF;
+                    uint8_t rr = 0, gg = 0, bb = 0;
+                    switch (format) {
+                        case DG_BYTE_332_RGB:
+                            rr = ( b        & 0xE0);
+                            gg = ((b << 3) & 0xE0);
+                            bb = ((b << 6) & 0xC0);
+                            break;
+                        case DG_BYTE_8_GRAY:
+                            rr = gg = bb = b; break;
+                        case DG_BYTE_4_GRAY:
+                            rr = gg = bb = (uint8_t)((b & 0xF) * 0x11); break;
+                        case DG_BYTE_2_GRAY:
+                            rr = gg = bb = (uint8_t)((b & 0x3) * 0x55); break;
+                        case DG_BYTE_1_GRAY:
+                            rr = gg = bb = (b & 1) ? 0xFF : 0x00; break;
+                        default:
+                            rr = gg = bb = b; break;
+                    }
+                    return ((uint32_t)a << 24) | ((uint32_t)rr << 16) |
+                           ((uint32_t)gg <<  8) |  (uint32_t)bb;
+                });
+        });
+
+    // getPixels(short[] pixels, int offset, int scanlength,
+    //           int x, int y, int width, int height, int format)
+    vm.register_native("com/nokia/mid/ui/DirectGraphicsImp",
+        "getPixels", "([SIIIIIIII)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            ObjRef self = args[0].as_ref();
+            auto wrap = g_dg_wrap.find(self);
+            if (wrap == g_dg_wrap.end()) return;
+            SDL_Surface* src = gfx_surface(wrap->second);
+            if (!src) return;
+            HeapObject* arr = v.heap().deref(args[1].as_ref());
+            if (!arr) return;
+            int offset = args[2].as_int();
+            int scan   = args[3].as_int();
+            int x      = args[4].as_int();
+            int y      = args[5].as_int();
+            int w      = args[6].as_int();
+            int h      = args[7].as_int();
+            int format = args[8].as_int();
+            uint16_t* dp = (uint16_t*)arr->array_bytes();
+            int len = arr->array_length();
+            SDL_LockSurface(src);
+            const uint32_t* spix = (const uint32_t*)src->pixels;
+            int spitch = src->pitch / 4;
+            for (int r = 0; r < h; ++r) {
+                int sy = y + r;
+                if (sy < 0 || sy >= src->h) continue;
+                for (int c = 0; c < w; ++c) {
+                    int sx = x + c;
+                    if (sx < 0 || sx >= src->w) continue;
+                    int idx = offset + r * scan + c;
+                    if (idx < 0 || idx >= len) continue;
+                    uint32_t v32 = spix[sy * spitch + sx];
+                    uint8_t rr = (v32 >> 16) & 0xFF;
+                    uint8_t gg = (v32 >>  8) & 0xFF;
+                    uint8_t bb =  v32        & 0xFF;
+                    uint16_t out;
+                    switch (format) {
+                        case DG_USHORT_4444_ARGB:
+                        case DG_ALT_4444: {
+                            uint8_t aa = (v32 >> 24) & 0xFF;
+                            out = (uint16_t)(((aa>>4)<<12) | ((rr>>4)<<8) |
+                                              ((gg>>4)<<4) |  (bb>>4));
+                            break;
+                        }
+                        case DG_USHORT_565_RGB:
+                        case DG_ALT_565:
+                        default:
+                            out = (uint16_t)(((rr>>3)<<11) | ((gg>>2)<<5) | (bb>>3));
+                            break;
+                    }
+                    dp[idx] = out;
+                }
+            }
+            SDL_UnlockSurface(src);
+        });
 }
