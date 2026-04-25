@@ -750,6 +750,18 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
     if (!rw) return nullptr;
     SDL_Surface* raw = IMG_Load_RW(rw, 1);  // 1 = auto-close
     if (!raw) return nullptr;
+
+    // RAII guard so any throw inside the lock window (e.g. transparent_mask
+    // .resize() bad_alloc on a degenerate image, or future edits adding
+    // early returns) doesn't leak a locked surface.
+    struct SurfaceLock {
+        SDL_Surface* s;
+        explicit SurfaceLock(SDL_Surface* surf) : s(surf) { SDL_LockSurface(s); }
+        ~SurfaceLock() { SDL_UnlockSurface(s); }
+        SurfaceLock(const SurfaceLock&) = delete;
+        SurfaceLock& operator=(const SurfaceLock&) = delete;
+    };
+
     // Preserve color key transparency through format conversion
     uint32_t ckey = 0;
     bool has_colorkey = (SDL_GetColorKey(raw, &ckey) == 0);
@@ -764,7 +776,7 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
     std::vector<bool> transparent_mask;
     bool indexed_ckey = has_colorkey && raw->format->BytesPerPixel == 1;
     if (indexed_ckey) {
-        SDL_LockSurface(raw);
+        SurfaceLock guard(raw);
         const uint8_t* src = static_cast<const uint8_t*>(raw->pixels);
         int pitch = raw->pitch;
         transparent_mask.resize((size_t)raw->w * raw->h, false);
@@ -773,7 +785,6 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
             for (int x = 0; x < raw->w; ++x)
                 if (src[y * pitch + x] == ck_idx)
                     transparent_mask[(size_t)y * raw->w + x] = true;
-        SDL_UnlockSurface(raw);
     }
     // Non-indexed color-key fallback: record the RGB value; we'll match on
     // it after conversion the old way.
@@ -785,29 +796,30 @@ static SDL_Surface* load_png_from_bytes(const uint8_t* data, size_t len) {
     SDL_FreeSurface(raw);
     if (!converted) return nullptr;
 
-    SDL_LockSurface(converted);
-    uint32_t* px = static_cast<uint32_t*>(converted->pixels);
-    int count = converted->w * converted->h;
-    if (indexed_ckey) {
-        for (int i = 0; i < count; i++) {
-            if (transparent_mask[(size_t)i])
-                px[i] = 0x00000000u;
-            else
+    {
+        SurfaceLock guard(converted);
+        uint32_t* px = static_cast<uint32_t*>(converted->pixels);
+        int count = converted->w * converted->h;
+        if (indexed_ckey) {
+            for (int i = 0; i < count; i++) {
+                if (transparent_mask[(size_t)i])
+                    px[i] = 0x00000000u;
+                else
+                    px[i] |= 0xFF000000u;
+            }
+        } else if (has_colorkey) {
+            uint32_t ck_rgb = ((uint32_t)ck_r << 16) | ((uint32_t)ck_g << 8) | ck_b;
+            for (int i = 0; i < count; i++) {
+                if ((px[i] & 0x00FFFFFFu) == ck_rgb)
+                    px[i] = 0x00000000u;
+                else
+                    px[i] |= 0xFF000000u;
+            }
+        } else if (!has_alpha) {
+            for (int i = 0; i < count; i++)
                 px[i] |= 0xFF000000u;
         }
-    } else if (has_colorkey) {
-        uint32_t ck_rgb = ((uint32_t)ck_r << 16) | ((uint32_t)ck_g << 8) | ck_b;
-        for (int i = 0; i < count; i++) {
-            if ((px[i] & 0x00FFFFFFu) == ck_rgb)
-                px[i] = 0x00000000u;
-            else
-                px[i] |= 0xFF000000u;
-        }
-    } else if (!has_alpha) {
-        for (int i = 0; i < count; i++)
-            px[i] |= 0xFF000000u;
     }
-    SDL_UnlockSurface(converted);
     SDL_SetSurfaceBlendMode(converted, SDL_BLENDMODE_BLEND);
     return converted;
 }
