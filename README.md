@@ -324,15 +324,53 @@ Requires Pillow. Output goes to `runtime/assets/keypad/default/`.
 
 ## Known limitations
 
-- **JSR-184 (M3G)**: not implemented. Games using mobile 3D graphics
-  (3D Bomberman, etc.) will crash when they touch `Graphics3D` or related
-  classes.
+- **JSR-184 (M3G)**: implemented end-to-end via the vendored Khronos core
+  (`runtime/third_party/m3g/`). Asphalt 3D / Galaxy on Fire / Bomberman 3D
+  load and render. The GL-output → SDL-surface compositing pass is still
+  open (results show as ghosting on titles that mix 2D HUD with 3D scenes).
 - **Networking**: no real sockets/HTTP. `Connector.open` returns the fake
-  HTTP-200 connection described above.
-- **JSR-120 (SMS)**: not implemented.
+  HTTP-200 connection described above. `HttpConnection.setRequestMethod`,
+  `setRequestProperty`, `close` and `StreamConnectionNotifier.acceptAndOpen`
+  remain no-op stubs.
+- **JSR-120 (SMS)**: 4 stubs (`MessageConnection.close/setMessageListener`,
+  `Message.setAddress`, `TextMessage.setPayloadText`).
+- **VideoControl** (JSR-135 video): no decoder; 7 stubs, games proceed but
+  see no video.
+- **`OutputStream.write([B)V` / `write([BII)V`**: no-ops on the base class.
+  Anything writing logs/saves through raw `OutputStream` loses data.
 - **Custom bitmap fonts**: games that compute scroll/layout offsets assuming
   a specific pixel-width bitmap font (AoE tutorial scroll, 365 Puzzle Club
   selection bar) render with minor edge bleed since we use a TTF fallback.
+
+## Outstanding code-review findings
+
+A pass over the runtime turned up these latent issues. The high-impact ones
+(array-bounds checks, `MULTIANEWARRAY` stale-pointer, byte-array windows in
+`Image.createImage` / `InputStream.read` / `readFully`, RAII surface lock)
+have been fixed; the rest are documented here so they don't get forgotten.
+
+- **`graphics_natives.cpp:749` — `(int)len` cast in `SDL_RWFromConstMem`.**
+  Truncates if `len > INT_MAX`. Vanishingly rare for J2ME PNGs (single asset
+  > 2 GB) but defensive: clamp or reject before cast.
+- **Global `ObjRef`-keyed maps (`g_string_buffers`, `g_vectors`, `g_alerts`,
+  `g_players`, `g_dg_wrap`, `g_images`, `g_gfx_surf`, `g_m3g_handles` …) —
+  no GC integration.** Today the heap never sweeps so it's fine; the moment
+  a real GC lands these become dangling-key zombies and any native lookup
+  by `ObjRef` post-collect is a use-after-free. Fix: either weak-ref +
+  finalizer hooks per map, or a sweep callback that enumerates them all.
+  This is the single biggest item blocking the heap-rewrite work.
+- **`stub_registry.cpp:54-62` — `wrap_stub` lambda captures raw `Entry*`.**
+  Currently safe (deque keeps element addresses stable, `Entry::hits` is
+  atomic). Fragile: if the container ever changes or a non-atomic field is
+  added, races appear. Document the invariant or move to an arena.
+- **`class_loader.cpp:146-149` — `find_or_stub` mutates `m_classes`.** Today
+  every load happens before `VM::run()` so it's race-free, but no assertion
+  enforces that. If concurrent class loading ever ships, this is a data race.
+- **`interpreter.cpp:700-780` — `BALOAD`/`CALOAD` dispatch alias style.**
+  Both opcodes alias to the same dispatch label but the handlers differ in
+  fall-through behaviour; the dispatch-table-vs-label mismatch is easy to
+  break on refactor. Either explicit per-opcode entries or a shared handler
+  with a type tag.
 
 ## Performance notes & possible enhancements
 
