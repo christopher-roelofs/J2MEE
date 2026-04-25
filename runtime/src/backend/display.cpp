@@ -243,16 +243,68 @@ bool Display::flush() {
     const int strip_vis = m_overlay.visible_strip_height();
     const int combined_w = m_logical_w;
     const int combined_h = m_logical_h + strip_vis;
+
+    // Desktop: when the keypad toggles, resize the window proportionally so
+    // the game stays at the same on-screen size and the bottom edge "pulls
+    // up" against the game. Skipped on Android / Emscripten where the window
+    // is platform-fixed.
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+    if (combined_h != m_cached_total_h && m_cached_total_h > 0) {
+        double scale = (double)win_h / (double)m_cached_total_h;
+        int new_h = (int)(combined_h * scale);
+        int new_w = (int)(m_logical_w * scale);
+        if (new_h > 0 && new_w > 0)
+            SDL_SetWindowSize(m_window, new_w, new_h);
+        m_cached_total_h = combined_h;
+        SDL_GetWindowSize(m_window, &win_w, &win_h);
+    }
+#else
+    m_cached_total_h = combined_h;
+#endif
+
+    // Scale + layout. On a resizable host the desktop branch above made
+    // win_h match `combined_h` already, so scaling against either is the
+    // same. On a fixed-size host (Android / web canvas) we deliberately
+    // scale against `m_logical_h + full_strip_h` so the game's pixel
+    // position never moves when the keypad toggles — only the keypad area
+    // appears/disappears. Otherwise the game would grow into the keypad's
+    // old space and "drop down" (its bottom edge extending further).
+    const int full_strip_h = m_overlay.strip_height();
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+    const int scale_h = m_logical_h + full_strip_h;
+#else
+    const int scale_h = combined_h;
+#endif
     double sx = (double)win_w / combined_w;
-    double sy = (double)win_h / combined_h;
+    double sy = (double)win_h / scale_h;
     double s  = sx < sy ? sx : sy;
     int content_w = (int)(combined_w * s);
-    int content_h = (int)(combined_h * s);
-    int ox = (win_w - content_w) / 2;
-    int oy = (win_h - content_h) / 2;
-    SDL_Rect game_dst{ ox, oy, content_w, (int)(m_logical_h * s) };
-    SDL_Rect kp_dst  { ox, oy + game_dst.h, content_w,
-                       content_h - game_dst.h };
+    int game_h_px = (int)(m_logical_h * s);
+    int kp_h_px   = (int)(strip_vis * s);
+    int ox        = (win_w - content_w) / 2;
+    // Keypad pinned to the bottom of the (logical) full stack — its top
+    // sits where the game ends, regardless of whether the keypad is
+    // currently visible. Game origin is the bottom of the window minus the
+    // full stack so it stays fixed across toggles.
+    int full_stack_h = (int)((m_logical_h + full_strip_h) * s);
+    int game_y = win_h - full_stack_h;
+    if (game_y < 0) game_y = 0;
+    SDL_Rect game_dst{ ox, game_y, content_w, game_h_px };
+    SDL_Rect kp_dst {
+        ox,
+        game_y + game_h_px,
+        content_w,
+        kp_h_px            // 0 when hidden — RenderCopy with a zero-h rect is a no-op
+    };
+
+    // Releases that were deferred last frame (because their press was
+    // still in m_pending_keys when keyup arrived) are promoted now so the
+    // upcoming deliver_key_events sees them after the press has been
+    // visible for one tick.
+    if (!m_deferred_releases.empty()) {
+        for (int code : m_deferred_releases) m_pending_releases.push_back(code);
+        m_deferred_releases.clear();
+    }
 
     // Poll events
     SDL_Event ev;
@@ -326,8 +378,16 @@ bool Display::flush() {
             // Release any held overlay key first. We synthesise the release
             // regardless of where the finger lifted — games expect a matching
             // keyReleased for every keyPressed. Diagonals hold 2 codes.
-            for (int code : m_overlay_held)
-                m_pending_releases.push_back(code);
+            // Same one-frame defer as enqueue_release(): if the matching
+            // press is still queued, sit on the release for one flush.
+            for (int code : m_overlay_held) {
+                bool press_pending = false;
+                for (int p : m_pending_keys) {
+                    if (p == code) { press_pending = true; break; }
+                }
+                if (press_pending) m_deferred_releases.push_back(code);
+                else               m_pending_releases.push_back(code);
+            }
             m_overlay_held.clear();
             if (m_pointer_down) {
                 // Map the release into game-local coords via the game
@@ -511,8 +571,17 @@ void Display::enqueue_release(SDL_Keycode sym) {
                 midp = static_cast<int>(sym - SDLK_KP_0 + SDLK_0);
             break;
     }
-    if (midp != 0)
-        m_pending_releases.push_back(midp);
+    if (midp != 0) {
+        // If the matching press hasn't been delivered yet (still in the
+        // pending queue this same flush), defer the release one frame so
+        // held-mask polling code sees the bit for at least one tick.
+        bool press_pending = false;
+        for (int code : m_pending_keys) {
+            if (code == midp) { press_pending = true; break; }
+        }
+        if (press_pending) m_deferred_releases.push_back(midp);
+        else               m_pending_releases.push_back(midp);
+    }
 }
 
 // ─── Headless scripted input ─────────────────────────────────────────────────

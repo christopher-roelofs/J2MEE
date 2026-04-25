@@ -22,6 +22,7 @@
 
 #include "m3g_core.h"
 #include "../vm/vm.hpp"
+#include "../backend/display.hpp"
 #include "natives.hpp"
 
 #include <cstdio>
@@ -106,6 +107,12 @@ ObjRef ref_for_handle_or_wrap(VM& v, uintptr_t h) {
     ObjRef jref = v.heap().alloc_object(jcls, 0);
     g_m3g_handles[jref] = h;
     g_m3g_rev[h] = jref;
+    // Pin the M3G object so it survives release-by-parent. Asphalt 3D
+    // crashed in m3gInvalidateTransformable because it held a Java handle
+    // for a Mesh-owned VertexBuffer / Node and the Mesh got refcounted
+    // away mid-frame, freeing the underlying object while our reverse map
+    // still pointed at it.
+    m3gAddRef((M3GObject)h);
     return jref;
 }
 
@@ -152,25 +159,30 @@ static ObjRef m3g_loader_load(VM& v, const uint8_t* data, size_t len) {
     M3GLoader loader = m3gCreateLoader(itf);
     if (!loader) return v.heap().alloc_ref_array(0, arr_klass);
 
-    // Feed bytes in one chunk. m3gDecodeData returns bytes consumed; loop
-    // until all consumed or zero-progress (malformed / truncated stream).
-    M3Gsizei offset = 0;
-    while (offset < (M3Gsizei)len) {
-        M3Gsizei n = m3gDecodeData(loader, (M3Gsizei)len - offset, data + offset);
-        if (n <= 0) break;
-        offset += n;
-    }
+    // Feed the entire blob in one shot. m3gDecodeData buffers internally
+    // and returns "bytes still required for next progress" — 0 means the
+    // whole file has been consumed (state = LOADSTATE_DONE), NOT an error.
+    m3gDecodeData(loader, (M3Gsizei)len, data);
 
     M3Gint count = m3gGetLoadedObjects(loader, nullptr);
+    if (std::getenv("J2ME_TRACE_M3G"))
+        std::fprintf(stderr, "[m3g] decode → %d unreferenced objects\n", count);
     if (count <= 0) return v.heap().alloc_ref_array(0, arr_klass);
 
     std::vector<M3Gulong> refs((size_t)count);
     m3gGetLoadedObjects(loader, refs.data());
-    m3gImportObjects(loader, count, refs.data());
+    // Pin each loaded object so it survives loader destruction. Do NOT call
+    // m3gImportObjects — that's for *external* refs (objects decoded by
+    // another loader / created in Java) and it resets the loader when
+    // state == LOADSTATE_DONE, dropping every object we just decoded.
+    for (M3Gint i = 0; i < count; ++i)
+        m3gAddRef((M3GObject)(uintptr_t)refs[i]);
 
     ObjRef arr = v.heap().alloc_ref_array(count, arr_klass);
     HeapObject* arr_obj = v.heap().deref(arr);
     if (!arr_obj) return v.heap().alloc_ref_array(0, arr_klass);
+    if (std::getenv("J2ME_TRACE_M3G"))
+        std::fprintf(stderr, "[m3g] Loader.load result: %d objects\n", count);
     for (M3Gint i = 0; i < count; ++i) {
         auto obj = (M3GObject)(uintptr_t)refs[i];
         M3GClass cls = m3gGetClass(obj);
@@ -178,6 +190,12 @@ static ObjRef m3g_loader_load(VM& v, const uint8_t* data, size_t len) {
         ObjRef jref = v.heap().alloc_object(jcls, 0);
         store_handle(jref, (uintptr_t)obj);
         arr_obj->array_slots()[i] = Slot::from_ref(jref);
+        if (std::getenv("J2ME_TRACE_M3G")) {
+            int children = (cls == M3G_CLASS_GROUP || cls == M3G_CLASS_WORLD)
+                ? m3gGetChildCount((M3GGroup)obj) : -1;
+            std::fprintf(stderr, "[m3g]   [%d] cls=%s ref=%u children=%d\n",
+                i, m3g_java_class_for(cls), jref, children);
+        }
     }
     return arr;
 }
@@ -204,33 +222,54 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
             f.push_ref(g3d);
         });
 
+    auto bind_screen_target = []() {
+        // Route M3G into the SDL screen surface so its output composites with
+        // our 2D pipeline. Without this M3G renders into the default GL
+        // backbuffer that SDL_Renderer never presents — visible as ghosting
+        // because the 2D layer paints over partial GL output each frame.
+        if (!g_render_context) ensure_render_context();
+        if (!g_render_context) return;
+        Display& d = Display::instance();
+        if (!d.is_open()) d.open(d.width(), d.height());
+        SDL_Surface* surf = d.screen();
+        if (!surf || !surf->pixels) return;
+        // ARGB8888 surface — in little-endian memory order that's BGRA bytes,
+        // matching M3G_BGRA8.
+        m3gBindMemoryTarget(g_render_context,
+                            surf->pixels,
+                            (M3Guint)surf->w,
+                            (M3Guint)surf->h,
+                            M3G_BGRA8,
+                            (M3Guint)(surf->pitch / 4),
+                            0);
+    };
+
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "bindTarget", "(Ljava/lang/Object;)V",
-        [](VM&, Frame&, std::span<Slot>) {
+        [bind_screen_target](VM&, Frame&, std::span<Slot>) {
             M3G_TRACE("Graphics3D.bindTarget(Object)");
-            // Target binding requires routing the SDL framebuffer / GLES
-            // surface to M3G. Our backend's beginRenderFunc hooks GL_MakeCurrent
-            // already; we'll thread a real userTarget id once we have render.
             j2me_m3g_make_current();
+            bind_screen_target();
         });
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "bindTarget", "(Ljava/lang/Object;ZI)V",
-        [](VM&, Frame&, std::span<Slot>) {
+        [bind_screen_target](VM&, Frame&, std::span<Slot>) {
             M3G_TRACE("Graphics3D.bindTarget(Object,Z,I)");
             j2me_m3g_make_current();
+            bind_screen_target();
         });
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "releaseTarget", "()V",
         [](VM&, Frame&, std::span<Slot>) {
-            // m3gReleaseTarget needs a render context but the Java side often
-            // calls this after bindTarget without holding our handle. With the
-            // singleton ctx it's safe.
+            // m3gReleaseTarget commits the GL output back to the bound memory
+            // target (our screen surface), then unbinds.
             if (g_render_context) m3gReleaseTarget(g_render_context);
         });
 
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "render", "(Ljavax/microedition/m3g/World;)V",
         [](VM&, Frame&, std::span<Slot> args) {
+            M3G_TRACE("Graphics3D.render(World)");
             if (!g_render_context) return;
             M3GWorld w = handle_for<M3GWorld>(args[1].as_ref());
             if (w) m3gRenderWorld(g_render_context, w);
@@ -733,21 +772,21 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
         });
     vm.register_native("javax/microedition/m3g/Group",
         "getChild", "(I)Ljavax/microedition/m3g/Node;",
-        [](VM&, Frame& f, std::span<Slot> args) {
-            // M3G returns the underlying handle but Java needs an ObjRef. We
-            // don't currently round-trip Node ObjRefs, so return null.
-            (void)args;
-            f.push_ref(NULL_REF);
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            M3GGroup g = handle_for<M3GGroup>(args[0].as_ref());
+            if (!g) { f.push_ref(NULL_REF); return; }
+            M3GNode n = m3gGetChild(g, args[1].as_int());
+            f.push_ref(ref_for_handle_or_wrap(v, (uintptr_t)n));
         });
 
     // ── Object3D additions ──────────────────────────────────────────────────
     vm.register_native("javax/microedition/m3g/Object3D",
         "find", "(I)Ljavax/microedition/m3g/Object3D;",
-        [](VM&, Frame& f, std::span<Slot> args) {
-            // m3gFind walks a scene tree by user ID. We return null since
-            // we don't round-trip Object3D ObjRefs from the C handle.
-            (void)args;
-            f.push_ref(NULL_REF);
+        [](VM& v, Frame& f, std::span<Slot> args) {
+            M3GObject o = handle_for<M3GObject>(args[0].as_ref());
+            if (!o) { f.push_ref(NULL_REF); return; }
+            M3GObject found = m3gFind(o, args[1].as_int());
+            f.push_ref(ref_for_handle_or_wrap(v, (uintptr_t)found));
         });
 
     // ── Mesh.getVertexBuffer ────────────────────────────────────────────────
@@ -809,6 +848,7 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
     vm.register_native("javax/microedition/m3g/Graphics3D",
         "clear", "(Ljavax/microedition/m3g/Background;)V",
         [](VM&, Frame&, std::span<Slot> args) {
+            M3G_TRACE("Graphics3D.clear");
             if (!g_render_context) return;
             M3GBackground b = handle_for<M3GBackground>(args[1].as_ref());
             m3gClear(g_render_context, b);
@@ -826,6 +866,7 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
         "render",
         "(Ljavax/microedition/m3g/Node;Ljavax/microedition/m3g/Transform;)V",
         [](VM&, Frame&, std::span<Slot> args) {
+            M3G_TRACE("Graphics3D.render(Node,Transform)");
             if (!g_render_context) return;
             M3GNode n = handle_for<M3GNode>(args[1].as_ref());
             if (!n) return;
@@ -837,6 +878,7 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
         "render",
         "(Ljavax/microedition/m3g/VertexBuffer;Ljavax/microedition/m3g/IndexBuffer;Ljavax/microedition/m3g/Appearance;Ljavax/microedition/m3g/Transform;)V",
         [](VM&, Frame&, std::span<Slot> args) {
+            M3G_TRACE("Graphics3D.render(VB,IB,Appearance,Transform)");
             if (!g_render_context) return;
             M3GVertexBuffer vb = handle_for<M3GVertexBuffer>(args[1].as_ref());
             M3GIndexBuffer ib = handle_for<M3GIndexBuffer>(args[2].as_ref());
@@ -1022,6 +1064,11 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
             const uint8_t* data = arr->array_bytes() + offset;
             size_t len = arr->array_length() > offset
                        ? (size_t)arr->array_length() - (size_t)offset : 0;
+            if (std::getenv("J2ME_TRACE_M3G") && len >= 16) {
+                std::fprintf(stderr, "[m3g] Loader.load len=%zu first16=", len);
+                for (int i = 0; i < 16; ++i) std::fprintf(stderr, "%02x", data[i]);
+                std::fprintf(stderr, "\n");
+            }
             f.push_ref(m3g_loader_load(v, data, len));
         });
 
@@ -1425,6 +1472,26 @@ void register_m3g_natives(VM& vm, const JarFile& jar) {
             int h   = args[3].as_int();
             M3GImage img = m3gCreateImage(itf, (M3GImageFormat)fmt, w, h, 0);
             if (img) store_handle(args[0].as_ref(), (uintptr_t)img);
+        });
+
+    // ── Image2D.set(int x, int y, int width, int height, byte[] image) ─────
+    // Updates a sub-rectangle of a mutable Image2D. Asphalt 3D streams car /
+    // track texture data via this — without it textures stay zero-filled and
+    // M3G eventually trips an INVALID_OPERATION when trying to render.
+    vm.register_native("javax/microedition/m3g/Image2D",
+        "set", "(IIII[B)V",
+        [](VM& v, Frame&, std::span<Slot> args) {
+            M3GImage img = handle_for<M3GImage>(args[0].as_ref());
+            if (!img) return;
+            int x = args[1].as_int();
+            int y = args[2].as_int();
+            int w = args[3].as_int();
+            int h = args[4].as_int();
+            ObjRef arr = args[5].as_ref();
+            if (arr == NULL_REF || w <= 0 || h <= 0) return;
+            HeapObject* a = v.heap().deref(arr);
+            if (!a) return;
+            m3gSetSubImage(img, x, y, w, h, a->array_length(), a->array_bytes());
         });
 
     // ── Mesh.getIndexBuffer / World.getBackground ──────────────────────────

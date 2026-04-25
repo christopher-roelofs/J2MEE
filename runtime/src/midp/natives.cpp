@@ -3664,7 +3664,14 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             int32_t id = args[1].as_int();
             auto it = g_record_stores.find(name);
             if (it == g_record_stores.end() || id < 1 || id > (int32_t)it->second.size()) {
-                f.push_ref(NULL_REF); return;
+                // Spec: throw InvalidRecordIDException when no record matches.
+                // Returning null trips MIDP code that legitimately catches this
+                // exception to fall back to defaults (e.g. Asphalt 3D's settings
+                // load NPE'd at g.c@734 trying to baload a null result).
+                ClassDef* exk = v.loader().find_or_stub(
+                    "javax/microedition/rms/InvalidRecordIDException");
+                ObjRef ex = v.heap().alloc_object(exk, 0);
+                throw JvmException{ex, "InvalidRecordIDException", {}};
             }
             const auto& bytes = it->second[id - 1];
             ObjRef arr = v.heap().alloc_prim_array(ArrayType::Byte,
@@ -3687,10 +3694,13 @@ vm.register_native("java/lang/String", "valueOf", "([C)Ljava/lang/String;",
             int32_t offset = args[3].as_int();
             auto it = g_record_stores.find(name);
             if (it == g_record_stores.end() ||
-                id < 1 || id > (int32_t)it->second.size() ||
-                buf_ref == NULL_REF) {
-                f.push_int(0); return;
+                id < 1 || id > (int32_t)it->second.size()) {
+                ClassDef* exk = v.loader().find_or_stub(
+                    "javax/microedition/rms/InvalidRecordIDException");
+                ObjRef ex = v.heap().alloc_object(exk, 0);
+                throw JvmException{ex, "InvalidRecordIDException", {}};
             }
+            if (buf_ref == NULL_REF) { f.push_int(0); return; }
             const auto& bytes = it->second[id - 1];
             HeapObject* buf = v.heap().deref(buf_ref);
             if (!buf || offset < 0) { f.push_int(0); return; }

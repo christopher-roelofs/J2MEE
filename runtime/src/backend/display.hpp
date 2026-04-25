@@ -122,6 +122,12 @@ private:
     int m_key_states = 0;
     std::vector<int> m_pending_keys;
     std::vector<int> m_pending_releases;
+    // Releases that arrived in the same flush() as their press. Held back
+    // one frame so the press is visible to held-mask polling code at least
+    // once before the release clears it. GoF's intro scene reads the held
+    // mask via GameCanvas snapshotting, so press+release in one tick was
+    // collapsing to "no key" before this defer.
+    std::vector<int> m_deferred_releases;
     std::vector<PointerEvent> m_pending_pointers;
     bool m_pointer_down = false;
     double m_mouse_scale = 1.0;  // multiply SDL mouse coords by this before window-to-logical mapping
