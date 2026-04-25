@@ -21,6 +21,10 @@ launcher/build/
 games/
 explore/
 
+# ─── Per-game user state (RMS save data, freej2me runtime config + log) ─────
+rms/
+freej2me_system/
+
 # ─── Accidentally-extracted JAR contents at the repo / runtime roots ─────────
 /META-INF/
 runtime/META-INF/

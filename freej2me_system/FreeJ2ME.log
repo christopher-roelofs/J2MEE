@@ -1,6 +1,0 @@
-[INFO] Loading MIDlet: Age of Empires 2 | Main Class: AgeOfEmpires.AgeOfEmpires
-[INFO] javax.microedition.midlet.MIDlet: Create MIDlet
-[INFO] javax.microedition.midlet.MIDlet: getAppProperty: Default-Language
-[INFO] javax.microedition.lcdui.Canvas: Create Canvas:240, 320
-[INFO] javax.microedition.midlet.MIDlet: getAppProperty: MIDlet-Version
-[INFO] javax.microedition.midlet.MIDlet: getAppProperty: Default-Language
