@@ -1,9 +1,15 @@
 # ─── Build outputs ───────────────────────────────────────────────────────────
 runtime/build/
+runtime/build-prof/
 runtime/build-release/
 runtime/build-web/
 runtime/bios/
 runtime/tools/__pycache__/
+runtime/android/.gradle/
+runtime/android/app/build/
+runtime/android/app/.cxx/
+runtime/android/build/
+runtime/android/local.properties
 launcher/.gradle/
 launcher/build/
 *.o
@@ -32,4 +38,3 @@ runtime/META-INF/
 .idea/
 .vscode/
 *.swp
-runtime/build-prof/
